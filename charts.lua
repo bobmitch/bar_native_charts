@@ -678,14 +678,14 @@ local function loadConfig()
     -- Try to load config file
     if not VFS.FileExists(CONFIG_FILE) then
         Spring.Echo("BAR Charts: No saved config found, using defaults")
-        return {} -- Return empty table instead of false
+        return {} -- Return an empty table
     end
     
     local success, config = pcall(VFS.Include, CONFIG_FILE)
     
     if success and config and config.version == "1.0" then
         chartsEnabled = config.enabled ~= nil and config.enabled or true
-        return config.charts or {} -- Ensure charts sub-table exists
+        return config.charts or {} -- Ensure the charts sub-table is returned
     else
         Spring.Echo("BAR Charts: Failed to load config, using defaults")
         return {} -- Return empty table on failure
@@ -748,15 +748,18 @@ function widget:Initialize()
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP", "🔧", 50, vsy - 640, "multi", {}, true)
     charts.allyBuildPower:rebuildMultiTeamSeries()
     
-    -- Apply saved config safely
-    for id, config in pairs(savedChartConfig) do
-        if charts[id] and type(config) == "table" then
-            charts[id].x = config.x or charts[id].x
-            charts[id].y = config.y or charts[id].y
-            charts[id].scale = config.scale or charts[id].scale
-            charts[id].visible = config.visible ~= nil and config.visible or charts[id].visible
-            charts[id].enabled = config.enabled ~= nil and config.enabled or charts[id].enabled
+    if savedChartConfig then
+        for id, config in pairs(savedChartConfig) do
+            -- Ensure 'config' is actually a table before accessing its keys
+            if charts[id] and type(config) == "table" then
+                charts[id].x = config.x or charts[id].x
+                charts[id].y = config.y or charts[id].y
+                charts[id].scale = config.scale or charts[id].scale
+                charts[id].visible = config.visible ~= nil and config.visible or charts[id].visible
+                charts[id].enabled = config.enabled ~= nil and config.enabled or charts[id].enabled
+            end
         end
+        Spring.Echo("BAR Charts: Loaded saved positions and settings")
     end
     
     Spring.Echo("BAR Charts: Initialized - F9 to Toggle, Drag to Move")
