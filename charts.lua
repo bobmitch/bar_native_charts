@@ -678,19 +678,17 @@ local function loadConfig()
     -- Try to load config file
     if not VFS.FileExists(CONFIG_FILE) then
         Spring.Echo("BAR Charts: No saved config found, using defaults")
-        return false
+        return {} -- Return empty table instead of false
     end
     
     local success, config = pcall(VFS.Include, CONFIG_FILE)
     
     if success and config and config.version == "1.0" then
         chartsEnabled = config.enabled ~= nil and config.enabled or true
-        
-        -- Will apply to charts after they're created
-        return config.charts
+        return config.charts or {} -- Ensure charts sub-table exists
     else
         Spring.Echo("BAR Charts: Failed to load config, using defaults")
-        return false
+        return {} -- Return empty table on failure
     end
 end
 
@@ -709,178 +707,59 @@ function widget:Initialize()
         return
     end
     
-    -- Load saved config
-    savedChartConfig = loadConfig()
+    -- Load saved config (ensure it returns a table)
+    savedChartConfig = loadConfig() or {}
     
     -- Initialize ally team tracking
     initAllyTeams()
     
-    -- Create charts matching streaming system
-    
-    -- Metal Income/Usage (dual series)
-    charts.metal = Chart.new(
-        "chart-metal",
-        "METAL",
-        "⚙",
-        420, vsy - 250,
-        "dual",
-        {
-            {
-                label = "Income",
-                color = COLOR.accent,
-                getValue = function()
-                    return myTeamStats.metalIncome
-                end
-            },
-            {
-                label = "Usage",
-                color = COLOR.accent2,
-                getValue = function()
-                    return myTeamStats.metalUsage
-                end
-            }
-        },
-        false
-    )
-    
-    -- Energy Income/Usage (dual series)
-    charts.energy = Chart.new(
-        "chart-energy",
-        "ENERGY",
-        "⚡",
-        750, vsy - 250,
-        "dual",
-        {
-            {
-                label = "Income",
-                color = COLOR.accent,
-                getValue = function()
-                    return myTeamStats.energyIncome
-                end
-            },
-            {
-                label = "Usage",
-                color = COLOR.accent2,
-                getValue = function()
-                    return myTeamStats.energyUsage
-                end
-            }
-        },
-        false
-    )
-    
-    -- Damage Dealt/Taken (dual series)
-    charts.damage = Chart.new(
-        "chart-damage",
-        "DAMAGE",
-        "✕",
-        420, vsy - 470,
-        "dual",
-        {
-            {
-                label = "Dealt",
-                color = COLOR.success,
-                getValue = function()
-                    return myTeamStats.damageDealt
-                end
-            },
-            {
-                label = "Taken",
-                color = COLOR.danger,
-                getValue = function()
-                    return myTeamStats.damageTaken
-                end
-            }
-        },
-        false
-    )
-    
-    -- Army Value (single series)
-    charts.army = Chart.new(
-        "chart-army",
-        "ARMY VALUE",
-        "⚙",
-        750, vsy - 470,
-        "single",
-        {
-            {
-                label = "Value",
-                color = COLOR.accent,
-                getValue = function()
-                    return myTeamStats.armyValue
-                end
-            }
-        },
-        false
-    )
-    
-    -- K/D Ratio (single series)
-    charts.kd = Chart.new(
-        "chart-kd",
-        "K/D RATIO",
-        "✕",
-        1080, vsy - 250,
-        "ratio",
-        {
-            {
-                label = "Ratio",
-                color = COLOR.success,
-                getValue = function()
-                    local k = myTeamStats.kills
-                    local d = myTeamStats.losses
-                    if d == 0 then
-                        return k > 0 and math.min(5, k) or 0
-                    else
-                        return math.min(5, k / d)
-                    end
-                end
-            }
-        },
-        false
-    )
-    
-    -- ========== NEW: MULTI-TEAM COMPARISON CHARTS ==========
-    
-    -- Ally Army Value Comparison (multi-team)
-    charts.allyArmy = Chart.new(
-        "chart-ally-army",
-        "TEAM ARMY VALUES",
-        "⚙",
-        100, vsy - 250,
-        "multi",
-        {},  -- Series will be populated dynamically
-        true  -- multiTeam flag
-    )
+    -- Column 1: Resources (Right Side)
+    charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 220, "dual", {
+        { label = "Income", color = COLOR.accent, getValue = function() return myTeamStats.metalIncome end },
+        { label = "Usage", color = COLOR.accent2, getValue = function() return myTeamStats.metalUsage end }
+    }, false)
+
+    charts.energy = Chart.new("chart-energy", "ENERGY", "⚡", vsx - 350, vsy - 430, "dual", {
+        { label = "Income", color = COLOR.accent, getValue = function() return myTeamStats.energyIncome end },
+        { label = "Usage", color = COLOR.accent2, getValue = function() return myTeamStats.energyUsage end }
+    }, false)
+
+    -- Column 2: Combat & Value (Center-Right)
+    charts.damage = Chart.new("chart-damage", "DAMAGE", "✕", vsx - 680, vsy - 220, "dual", {
+        { label = "Dealt", color = COLOR.success, getValue = function() return myTeamStats.damageDealt end },
+        { label = "Taken", color = COLOR.danger, getValue = function() return myTeamStats.damageTaken end }
+    }, false)
+
+    charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙", vsx - 680, vsy - 430, "single", {
+        { label = "Value", color = COLOR.accent, getValue = function() return myTeamStats.armyValue end }
+    }, false)
+
+    -- Column 3: Stats & Comparison (Left Side)
+    charts.kd = Chart.new("chart-kd", "K/D RATIO", "✕", 50, vsy - 220, "ratio", {
+        { label = "Ratio", color = COLOR.success, getValue = function() 
+            local k, d = myTeamStats.kills, myTeamStats.losses
+            return d == 0 and (k > 0 and 5 or 0) or math.min(5, k / d)
+        end }
+    }, false)
+
+    charts.allyArmy = Chart.new("chart-ally-army", "TEAM ARMY", "⚙", 50, vsy - 430, "multi", {}, true)
     charts.allyArmy:rebuildMultiTeamSeries()
-    
-    -- Ally Build Power Comparison (multi-team)
-    charts.allyBuildPower = Chart.new(
-        "chart-ally-buildpower",
-        "TEAM BUILD POWER",
-        "🔧",
-        100, vsy - 470,
-        "multi",
-        {},  -- Series will be populated dynamically
-        true  -- multiTeam flag
-    )
+
+    charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP", "🔧", 50, vsy - 640, "multi", {}, true)
     charts.allyBuildPower:rebuildMultiTeamSeries()
     
-    -- Apply saved config to charts
-    if savedChartConfig then
-        for id, config in pairs(savedChartConfig) do
-            if charts[id] then
-                charts[id].x = config.x or charts[id].x
-                charts[id].y = config.y or charts[id].y
-                charts[id].scale = config.scale or charts[id].scale
-                charts[id].visible = config.visible ~= nil and config.visible or charts[id].visible
-                charts[id].enabled = config.enabled ~= nil and config.enabled or charts[id].enabled
-            end
+    -- Apply saved config safely
+    for id, config in pairs(savedChartConfig) do
+        if charts[id] and type(config) == "table" then
+            charts[id].x = config.x or charts[id].x
+            charts[id].y = config.y or charts[id].y
+            charts[id].scale = config.scale or charts[id].scale
+            charts[id].visible = config.visible ~= nil and config.visible or charts[id].visible
+            charts[id].enabled = config.enabled ~= nil and config.enabled or charts[id].enabled
         end
-        Spring.Echo("BAR Charts: Loaded saved positions and settings")
     end
     
-    Spring.Echo("BAR Charts: Initialized - Press F9 to toggle")
-    Spring.Echo("BAR Charts: Tracking " .. (#Spring.GetTeamList(allyTeamID) or 0) .. " allied teams")
+    Spring.Echo("BAR Charts: Initialized - F9 to Toggle, Drag to Move")
 end
 
 -------------------------------------------------------------------------------
