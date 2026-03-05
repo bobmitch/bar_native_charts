@@ -607,36 +607,42 @@ local myTeamStats = {
 -- Ally team stats storage
 -- Structure: allyTeams[teamID] = {metalIncome, energyIncome, armyValue, buildPower, playerName, color}
 local function initAllyTeams()
-    allyTeams = {}
+    -- Get the ID first
+    local currentAllyID = Spring.GetMyAllyTeamID()
+    if not currentAllyID then return end
     
-    if not allyTeamID then return end
+    allyTeamID = currentAllyID
     
+    -- ONLY clear the table once we are sure we have data to put back in it
+    local newAllyTeams = {}
     local teamList = Spring.GetTeamList(allyTeamID)
-    if not teamList then return end
     
-    for _, tid in ipairs(teamList) do
-        local r, g, b = Spring.GetTeamColor(tid)
-        local playerName = "Team " .. tid
-        
-        -- Try to get player name
-        local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
-        if isAI then
-            local _, name = Spring.GetAIInfo(tid)
-            playerName = name or playerName
-        elseif leaderID then
-            local name = Spring.GetPlayerInfo(leaderID)
-            playerName = name or playerName
+    if teamList then
+        for _, tid in ipairs(teamList) do
+            local r, g, b = Spring.GetTeamColor(tid)
+            local playerName = "Team " .. tid
+            local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
+            
+            if isAI then
+                local _, name = Spring.GetAIInfo(tid)
+                playerName = name or playerName
+            elseif leaderID then
+                local name = Spring.GetPlayerInfo(leaderID)
+                playerName = name or playerName
+            end
+            
+            newAllyTeams[tid] = {
+                teamID = tid,
+                playerName = playerName,
+                color = {r or 1, g or 1, b or 1, 1},
+                metalIncome = 0,
+                energyIncome = 0,
+                armyValue = 0,
+                buildPower = 0,
+            }
         end
-        
-        allyTeams[tid] = {
-            teamID = tid,
-            playerName = playerName,
-            color = {r or 1, g or 1, b or 1, 1},
-            metalIncome = 0,
-            energyIncome = 0,
-            armyValue = 0,
-            buildPower = 0,
-        }
+        -- Atomic swap: allyTeams is only updated if the collection succeeded
+        allyTeams = newAllyTeams
     end
 end
 
@@ -675,21 +681,20 @@ local function saveConfig()
 end
 
 local function loadConfig()
-    -- Try to load config file
     if not VFS.FileExists(CONFIG_FILE) then
-        Spring.Echo("BAR Charts: No saved config found, using defaults")
-        return {} -- Return an empty table
+        return {} -- Return empty table instead of false
     end
     
     local success, config = pcall(VFS.Include, CONFIG_FILE)
     
-    if success and config and config.version == "1.0" then
+    -- Check if the file loaded and contains the expected 'charts' table
+    if success and type(config) == "table" and type(config.charts) == "table" then
         chartsEnabled = config.enabled ~= nil and config.enabled or true
-        return config.charts or {} -- Ensure the charts sub-table is returned
-    else
-        Spring.Echo("BAR Charts: Failed to load config, using defaults")
-        return {} -- Return empty table on failure
+        return config.charts
     end
+    
+    Spring.Echo("BAR Charts: Config file was corrupt or empty, using defaults")
+    return {} -- Return empty table as a safety fallback
 end
 
 local savedChartConfig = nil
@@ -699,6 +704,8 @@ local savedChartConfig = nil
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
+    -- 1. Refresh screen geometry
+    vsx, vsy = Spring.GetViewGeometry()
     teamID = Spring.GetMyTeamID()
     allyTeamID = Spring.GetMyAllyTeamID()
     
@@ -707,62 +714,64 @@ function widget:Initialize()
         return
     end
     
-    -- Load saved config (ensure it returns a table)
-    savedChartConfig = loadConfig() or {}
-    
-    -- Initialize ally team tracking
+    -- 2. Initialize ally team tracking
     initAllyTeams()
     
-    -- Column 1: Resources (Right Side)
-    charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 220, "dual", {
+    -- 3. Define Charts (Standardizing the table 'charts')
+    charts = {} 
+
+    -- Resource Column (Right)
+    charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, 250, "dual", {
         { label = "Income", color = COLOR.accent, getValue = function() return myTeamStats.metalIncome end },
         { label = "Usage", color = COLOR.accent2, getValue = function() return myTeamStats.metalUsage end }
     }, false)
 
-    charts.energy = Chart.new("chart-energy", "ENERGY", "⚡", vsx - 350, vsy - 430, "dual", {
+    charts.energy = Chart.new("chart-energy", "ENERGY", "⚡", vsx - 350, 50, "dual", {
         { label = "Income", color = COLOR.accent, getValue = function() return myTeamStats.energyIncome end },
         { label = "Usage", color = COLOR.accent2, getValue = function() return myTeamStats.energyUsage end }
     }, false)
 
-    -- Column 2: Combat & Value (Center-Right)
-    charts.damage = Chart.new("chart-damage", "DAMAGE", "✕", vsx - 680, vsy - 220, "dual", {
+    -- Combat Column (Middle)
+    charts.damage = Chart.new("chart-damage", "DAMAGE", "✕", vsx - 680, 250, "dual", {
         { label = "Dealt", color = COLOR.success, getValue = function() return myTeamStats.damageDealt end },
         { label = "Taken", color = COLOR.danger, getValue = function() return myTeamStats.damageTaken end }
     }, false)
 
-    charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙", vsx - 680, vsy - 430, "single", {
+    charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙", vsx - 680, 50, "single", {
         { label = "Value", color = COLOR.accent, getValue = function() return myTeamStats.armyValue end }
     }, false)
 
-    -- Column 3: Stats & Comparison (Left Side)
-    charts.kd = Chart.new("chart-kd", "K/D RATIO", "✕", 50, vsy - 220, "ratio", {
+    -- Stats Column (Left)
+    charts.kd = Chart.new("chart-kd", "K/D RATIO", "✕", 50, 450, "ratio", {
         { label = "Ratio", color = COLOR.success, getValue = function() 
             local k, d = myTeamStats.kills, myTeamStats.losses
             return d == 0 and (k > 0 and 5 or 0) or math.min(5, k / d)
         end }
     }, false)
 
-    charts.allyArmy = Chart.new("chart-ally-army", "TEAM ARMY", "⚙", 50, vsy - 430, "multi", {}, true)
+    charts.allyArmy = Chart.new("chart-ally-army", "TEAM ARMY", "⚙", 50, 250, "multi", {}, true)
     charts.allyArmy:rebuildMultiTeamSeries()
 
-    charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP", "🔧", 50, vsy - 640, "multi", {}, true)
+    charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP", "🔧", 50, 50, "multi", {}, true)
     charts.allyBuildPower:rebuildMultiTeamSeries()
     
-    if savedChartConfig then
-        for id, config in pairs(savedChartConfig) do
-            -- Ensure 'config' is actually a table before accessing its keys
-            if charts[id] and type(config) == "table" then
-                charts[id].x = config.x or charts[id].x
-                charts[id].y = config.y or charts[id].y
-                charts[id].scale = config.scale or charts[id].scale
-                charts[id].visible = config.visible ~= nil and config.visible or charts[id].visible
-                charts[id].enabled = config.enabled ~= nil and config.enabled or charts[id].enabled
-            end
+    -- 4. THE ULTIMATE FIX FOR LINE 312
+    -- We define a local variable and force it to be a table NO MATTER WHAT.
+    local rawConfig = loadConfig() 
+    local safeConfig = (type(rawConfig) == "table") and rawConfig or {}
+
+    -- We iterate over 'safeConfig', which is guaranteed to be a table by the line above.
+    for id, config in pairs(safeConfig) do
+        if charts[id] and type(config) == "table" then
+            charts[id].x = config.x or charts[id].x
+            charts[id].y = config.y or charts[id].y
+            charts[id].scale = config.scale or charts[id].scale
+            charts[id].visible = (config.visible ~= nil) and config.visible or charts[id].visible
+            charts[id].enabled = (config.enabled ~= nil) and config.enabled or charts[id].enabled
         end
-        Spring.Echo("BAR Charts: Loaded saved positions and settings")
     end
     
-    Spring.Echo("BAR Charts: Initialized - F9 to Toggle, Drag to Move")
+    Spring.Echo("BAR Charts: Loaded successfully.")
 end
 
 -------------------------------------------------------------------------------
@@ -823,37 +832,38 @@ function widget:Update(dt)
         myTeamStats.armyValue = totalValue
         
         -- ========== ALLY TEAM STATS ==========
-        
-        for tid, teamData in pairs(allyTeams) do
-            -- Get resource stats for this team
-            local tm_inc, tm_use = Spring.GetTeamResourceStats(tid, "metal")
-            local te_inc, te_use = Spring.GetTeamResourceStats(tid, "energy")
-            
-            teamData.metalIncome = tm_inc or 0
-            teamData.energyIncome = te_inc or 0
-            
-            -- Calculate army value for this team
-            local teamUnits = Spring.GetTeamUnits(tid)
-            local teamArmyValue = 0
-            local teamBuildPower = 0
-            
-            for _, unitID in ipairs(teamUnits) do
-                local unitDefID = Spring.GetUnitDefID(unitID)
-                if unitDefID then
-                    local ud = UnitDefs[unitDefID]
-                    if ud then
-                        teamArmyValue = teamArmyValue + (ud.metalCost or 0)
-                        
-                        -- Calculate build power (sum of builder speeds)
-                        if ud.isBuilder then
-                            teamBuildPower = teamBuildPower + (ud.buildSpeed or 0)
+        if type(allyTeams) == "table" then
+            for tid, teamData in pairs(allyTeams) do
+                -- Get resource stats for this team
+                local tm_inc, tm_use = Spring.GetTeamResourceStats(tid, "metal")
+                local te_inc, te_use = Spring.GetTeamResourceStats(tid, "energy")
+                
+                teamData.metalIncome = tm_inc or 0
+                teamData.energyIncome = te_inc or 0
+                
+                -- Calculate army value for this team
+                local teamUnits = Spring.GetTeamUnits(tid)
+                local teamArmyValue = 0
+                local teamBuildPower = 0
+                
+                for _, unitID in ipairs(teamUnits) do
+                    local unitDefID = Spring.GetUnitDefID(unitID)
+                    if unitDefID then
+                        local ud = UnitDefs[unitDefID]
+                        if ud then
+                            teamArmyValue = teamArmyValue + (ud.metalCost or 0)
+                            
+                            -- Calculate build power (sum of builder speeds)
+                            if ud.isBuilder then
+                                teamBuildPower = teamBuildPower + (ud.buildSpeed or 0)
+                            end
                         end
                     end
                 end
+                
+                teamData.armyValue = teamArmyValue
+                teamData.buildPower = teamBuildPower
             end
-            
-            teamData.armyValue = teamArmyValue
-            teamData.buildPower = teamBuildPower
         end
         
         -- Add data points to all charts
