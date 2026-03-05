@@ -682,19 +682,29 @@ end
 
 local function loadConfig()
     if not VFS.FileExists(CONFIG_FILE) then
-        return {} -- Return empty table instead of false
+        Spring.Echo("BAR Charts: No config file found")
+        return {}
     end
+
+    local success, result = pcall(VFS.Include, CONFIG_FILE)
     
-    local success, config = pcall(VFS.Include, CONFIG_FILE)
-    
-    -- Check if the file loaded and contains the expected 'charts' table
-    if success and type(config) == "table" and type(config.charts) == "table" then
-        chartsEnabled = config.enabled ~= nil and config.enabled or true
-        return config.charts
+    if not success then
+        Spring.Echo("BAR Charts: Failed to load config: " .. tostring(result))
+        return {}
     end
-    
-    Spring.Echo("BAR Charts: Config file was corrupt or empty, using defaults")
-    return {} -- Return empty table as a safety fallback
+
+    if type(result) ~= "table" then
+        Spring.Echo("BAR Charts: Config root is not a table")
+        return {}
+    end
+
+    if type(result.charts) ~= "table" then
+        Spring.Echo("BAR Charts: Missing or invalid 'charts' table in config")
+        return {}
+    end
+
+    chartsEnabled = result.enabled ~= nil and result.enabled or true
+    return result.charts
 end
 
 local savedChartConfig = nil
@@ -757,17 +767,17 @@ function widget:Initialize()
     
     -- 4. THE ULTIMATE FIX FOR LINE 312
     -- We define a local variable and force it to be a table NO MATTER WHAT.
-    local rawConfig = loadConfig() 
-    local safeConfig = (type(rawConfig) == "table") and rawConfig or {}
+    local configData = loadConfig() or {}
+    local chartConfigs = type(configData) == "table" and configData or {}
 
-    -- We iterate over 'safeConfig', which is guaranteed to be a table by the line above.
-    for id, config in pairs(safeConfig) do
-        if charts[id] and type(config) == "table" then
-            charts[id].x = config.x or charts[id].x
-            charts[id].y = config.y or charts[id].y
-            charts[id].scale = config.scale or charts[id].scale
-            charts[id].visible = (config.visible ~= nil) and config.visible or charts[id].visible
-            charts[id].enabled = (config.enabled ~= nil) and config.enabled or charts[id].enabled
+    for id, cfg in pairs(chartConfigs) do
+        local chart = charts[id]
+        if chart and type(cfg) == "table" then
+            chart.x      = cfg.x      or chart.x
+            chart.y      = cfg.y      or chart.y
+            chart.scale  = cfg.scale  or chart.scale
+            chart.visible = (cfg.visible ~= nil) and cfg.visible or chart.visible
+            chart.enabled = (cfg.enabled ~= nil) and cfg.enabled or chart.enabled
         end
     end
     
