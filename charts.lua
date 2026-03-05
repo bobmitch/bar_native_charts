@@ -492,71 +492,69 @@ function Chart:draw()
     -- Draw each series
     for seriesIdx, s in ipairs(self.series) do
         local data = self.displayData[seriesIdx]
-        if #data < 2 then goto continue end
-        
-        local color = s.color
-        
-        -- Draw line
-        gl.Color(color[1], color[2], color[3], 1.0)
-        gl.LineWidth(2.0)
-        gl.BeginEnd(GL.LINE_STRIP, function()
-            for i, value in ipairs(data) do
-                if value and not (value ~= value) then
-                    gl.Vertex(toX(i, #data), toY(value))
-                end
-            end
-        end)
-        
-        -- Draw fill (semi-transparent)
-        gl.Color(color[1], color[2], color[3], 0.15)
-        gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-            for i, value in ipairs(data) do
-                if value and not (value ~= value) then
-                    local x = toX(i, #data)
-                    gl.Vertex(x, cY)
-                    gl.Vertex(x, toY(value))
-                end
-            end
-        end)
-        
-        -- Draw current value indicator
-        if #data > 0 then
-            local lastValue = data[#data]
-            if lastValue and not (lastValue ~= lastValue) then
-                gl.Color(color[1], color[2], color[3], 0.8)
-                gl.PointSize(6)
-                gl.BeginEnd(GL.POINTS, function()
-                    gl.Vertex(toX(#data, #data), toY(lastValue))
-                end)
-                
-                -- Value label on right edge
-                gl.Color(color[1], color[2], color[3], 1.0)
-                local valueText
-                
-                if self.chartType == "multi" then
-                    -- Multi-team: show abbreviated name + value
-                    local shortName = s.label
-                    if #shortName > 8 then
-                        shortName = string.sub(shortName, 1, 6) .. ".."
+        if #data >= 2 then
+            local color = s.color
+            
+            -- Draw line
+            gl.Color(color[1], color[2], color[3], 1.0)
+            gl.LineWidth(2.0)
+            gl.BeginEnd(GL.LINE_STRIP, function()
+                for i, value in ipairs(data) do
+                    if value and not (value ~= value) then
+                        gl.Vertex(toX(i, #data), toY(value))
                     end
-                    valueText = shortName .. " " .. formatNumber(lastValue)
-                elseif self.chartType == "dual" then
-                    valueText = s.label .. " " .. formatNumber(lastValue)
-                else
-                    valueText = formatNumber(lastValue)
                 end
-                
-                -- Offset labels vertically for multi-series to prevent overlap
-                local labelOffset = 0
-                if self.chartType == "multi" or self.chartType == "dual" then
-                    labelOffset = (seriesIdx - 1) * 13
+            end)
+            
+            -- Draw fill (semi-transparent)
+            gl.Color(color[1], color[2], color[3], 0.15)
+            gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+                for i, value in ipairs(data) do
+                    if value and not (value ~= value) then
+                        local x = toX(i, #data)
+                        gl.Vertex(x, cY)
+                        gl.Vertex(x, toY(value))
+                    end
                 end
-                
-                gl.Text(valueText, cX + cW + 2, toY(lastValue) - 4 + labelOffset, 9, "o")
+            end)
+            
+            -- Draw current value indicator
+            if #data > 0 then
+                local lastValue = data[#data]
+                if lastValue and not (lastValue ~= lastValue) then
+                    gl.Color(color[1], color[2], color[3], 0.8)
+                    gl.PointSize(6)
+                    gl.BeginEnd(GL.POINTS, function()
+                        gl.Vertex(toX(#data, #data), toY(lastValue))
+                    end)
+                    
+                    -- Value label on right edge
+                    gl.Color(color[1], color[2], color[3], 1.0)
+                    local valueText
+                    
+                    if self.chartType == "multi" then
+                        -- Multi-team: show abbreviated name + value
+                        local shortName = s.label
+                        if #shortName > 8 then
+                            shortName = string.sub(shortName, 1, 6) .. ".."
+                        end
+                        valueText = shortName .. " " .. formatNumber(lastValue)
+                    elseif self.chartType == "dual" then
+                        valueText = s.label .. " " .. formatNumber(lastValue)
+                    else
+                        valueText = formatNumber(lastValue)
+                    end
+                    
+                    -- Offset labels vertically for multi-series to prevent overlap
+                    local labelOffset = 0
+                    if self.chartType == "multi" or self.chartType == "dual" then
+                        labelOffset = (seriesIdx - 1) * 13
+                    end
+                    
+                    gl.Text(valueText, cX + cW + 2, toY(lastValue) - 4 + labelOffset, 9, "o")
+                end
             end
         end
-        
-        ::continue::
     end
     
     -- Draw header
