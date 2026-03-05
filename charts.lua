@@ -682,29 +682,26 @@ end
 
 local function loadConfig()
     if not VFS.FileExists(CONFIG_FILE) then
-        Spring.Echo("BAR Charts: No config file found")
         return {}
     end
 
-    local success, result = pcall(VFS.Include, CONFIG_FILE)
-    
-    if not success then
-        Spring.Echo("BAR Charts: Failed to load config: " .. tostring(result))
+    local fileContent = VFS.LoadFile(CONFIG_FILE)
+    if not fileContent then return {} end
+
+    local chunk, err = loadstring(fileContent)
+    if not chunk then
+        Spring.Echo("BAR Charts: Parse error: " .. tostring(err))
         return {}
     end
 
-    if type(result) ~= "table" then
-        Spring.Echo("BAR Charts: Config root is not a table")
-        return {}
-    end
-
-    if type(result.charts) ~= "table" then
-        Spring.Echo("BAR Charts: Missing or invalid 'charts' table in config")
+    local success, result = pcall(chunk)
+    if not success or type(result) ~= "table" then
+        Spring.Echo("BAR Charts: Invalid config")
         return {}
     end
 
     chartsEnabled = result.enabled ~= nil and result.enabled or true
-    return result.charts
+    return result.charts or {}
 end
 
 local savedChartConfig = nil
