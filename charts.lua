@@ -1091,8 +1091,10 @@ function widget:MouseMove(mx, my, dx, dy)
     local anyHovered = false
     for _, chart in pairs(charts) do
         chart.isHovered = chart:isMouseOver(mx, my)
-        if chart.isHovered then anyHovered = true
-    end
+        if chart.isHovered then 
+            anyHovered = true 
+        end -- Correctly closing the 'if chart.isHovered'
+    end -- Correctly closing the 'for' loop
     
     return anyHovered
 end
