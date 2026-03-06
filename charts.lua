@@ -1130,7 +1130,7 @@ function widget:Update(dt)
 
         for _, chart in pairs(charts) do
             if chart.id == "chart-ally-army" then
-                Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
+                -- Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
             end
             chart:addDataPoint()
         end
