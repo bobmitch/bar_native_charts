@@ -1068,17 +1068,8 @@ function widget:Update(dt)
                 seedBuildPower()
                 seedUnitCount()
 
-                for tid, teamData in pairs(allyTeams) do
-                    Spring.Echo("Seeded tid=" .. tostring(tid) .. " armyValue=" .. tostring(teamData.armyValue))
-                end
-                Spring.Echo("allyArmy series count=" .. #charts.allyArmy.series)
-                for i, s in ipairs(charts.allyArmy.series) do
-                    Spring.Echo("  series[" .. i .. "] label=" .. tostring(s.label) .. " value=" .. tostring(s.getValue()))
-                end
-
                 chartsReady    = true
                 lastUpdateTime = -UPDATE_INTERVAL
-                Spring.Echo("BAR Charts: Team data ready, tracking " .. #Spring.GetTeamList(allyTeamID) .. " teams")
             end
         end
         return
