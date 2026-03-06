@@ -856,8 +856,8 @@ end
 local function saveConfig()
     local config = { version = "1.0", enabled = chartsEnabled, charts = {}, cards = {} }
 
-    for id, chart in pairs(charts) do
-        config.charts[id] = {
+    for _, chart in pairs(charts) do
+        config.charts[chart.id] = {
             x       = chart.x,
             y       = chart.y,
             scale   = chart.scale,
