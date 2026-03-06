@@ -19,7 +19,7 @@
     - F9: Toggle all charts on/off
     - Click+Drag: Move charts
     - Mouse Wheel over chart: Scale size
-    - Double-click: Toggle individual chart
+    - Right-click: Toggle individual chart
     
     Installation:
     Place in: /LuaUI/Widgets/
@@ -73,48 +73,40 @@ end
 local vsx, vsy = Spring.GetViewGeometry()
 local CONFIG_FILE = "bar_charts_config.lua"
 
--- Global enable/disable
 local chartsEnabled = true
+local chartsReady   = false
 
-local chartsReady = false
-
--- Chart styling (matching streaming system)
 local COLOR = {
-    bg          = {0.031, 0.047, 0.078, 0.72},  -- rgba(8,12,20,0.72)
-    border      = {0.353, 0.706, 1.000, 0.18},  -- rgba(90,180,255,0.18)
-    borderHot   = {0.353, 0.706, 1.000, 0.55},  -- rgba(90,180,255,0.55)
-    grid        = {0.353, 0.706, 1.000, 0.08},  -- grid lines
-    gridBase    = {0.353, 0.706, 1.000, 0.22},  -- baseline grid
-    text        = {0.863, 0.912, 0.973, 1.00},  -- rgba(220,233,248,1)
-    muted       = {0.627, 0.745, 0.863, 0.55},  -- rgba(160,190,220,0.55)
-    accent      = {0.290, 0.706, 1.000, 1.00},  -- #4ab4ff
-    accent2     = {1.000, 0.420, 0.208, 1.00},  -- #ff6b35
-    danger      = {1.000, 0.231, 0.361, 1.00},  -- #ff3b5c
-    success     = {0.188, 0.941, 0.627, 1.00},  -- #30f0a0
-    gold        = {0.941, 0.753, 0.251, 1.00},  -- #f0c040
+    bg          = {0.031, 0.047, 0.078, 0.72},
+    border      = {0.353, 0.706, 1.000, 0.18},
+    borderHot   = {0.353, 0.706, 1.000, 0.55},
+    grid        = {0.353, 0.706, 1.000, 0.08},
+    gridBase    = {0.353, 0.706, 1.000, 0.22},
+    text        = {0.863, 0.912, 0.973, 1.00},
+    muted       = {0.627, 0.745, 0.863, 0.55},
+    accent      = {0.290, 0.706, 1.000, 1.00},
+    accent2     = {1.000, 0.420, 0.208, 1.00},
+    danger      = {1.000, 0.231, 0.361, 1.00},
+    success     = {0.188, 0.941, 0.627, 1.00},
+    gold        = {0.941, 0.753, 0.251, 1.00},
 }
 
--- Animation settings
-local ANIM_DURATION = 0.4  -- seconds for lerp animation
-local HISTORY_SIZE = 60    -- number of data points to keep
-local UPDATE_INTERVAL = 10 -- update every 10 seconds (matches FullStatsUpdate)
+local ANIM_DURATION   = 0.4
+local HISTORY_SIZE    = 60
+local UPDATE_INTERVAL = 10
 
--- Chart dimensions
-local CHART_WIDTH = 300
+local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
-local PADDING = {left = 40, right = 15, top = 15, bottom = 25}
-
+local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
 
--- Easing function for smooth animations
 local function easeOutCubic(t)
     return 1 - math.pow(1 - t, 3)
 end
 
--- Format numbers for display
 local function formatNumber(n)
     if n >= 1000000 then
         return string.format("%.1fM", n / 1000000)
@@ -125,7 +117,6 @@ local function formatNumber(n)
     end
 end
 
--- Format Y-axis labels
 local function formatYAxis(n, chartType)
     if chartType == "ratio" then
         return string.format("%.1f", n)
@@ -134,14 +125,6 @@ local function formatYAxis(n, chartType)
     end
 end
 
--- Clamp value between min and max
-local function clamp(val, min, max)
-    if val < min then return min end
-    if val > max then return max end
-    return val
-end
-
--- Draw rounded rectangle (approximate with line segments)
 local function drawRoundedRect(x, y, w, h, r, filled)
     if filled then
         gl.BeginEnd(GL.QUADS, function()
@@ -149,19 +132,17 @@ local function drawRoundedRect(x, y, w, h, r, filled)
             gl.Vertex(x + w - r, y)
             gl.Vertex(x + w - r, y + h)
             gl.Vertex(x + r, y + h)
-            
+
             gl.Vertex(x, y + r)
             gl.Vertex(x + w, y + r)
             gl.Vertex(x + w, y + h - r)
             gl.Vertex(x, y + h - r)
         end)
-        
-        -- Corners (approximate)
+
         local segments = 6
         for i = 0, segments do
             local angle = (math.pi / 2) * (i / segments)
-            
-            -- Top-left
+
             gl.BeginEnd(GL.TRIANGLES, function()
                 gl.Vertex(x + r, y + r)
                 local x1 = x + r - r * math.cos(angle)
@@ -172,8 +153,7 @@ local function drawRoundedRect(x, y, w, h, r, filled)
                 local y2 = y + r - r * math.sin(angle)
                 if i < segments then gl.Vertex(x2, y2) end
             end)
-            
-            -- Top-right
+
             gl.BeginEnd(GL.TRIANGLES, function()
                 gl.Vertex(x + w - r, y + r)
                 angle = (math.pi / 2) * (i / segments)
@@ -185,8 +165,7 @@ local function drawRoundedRect(x, y, w, h, r, filled)
                 local y2 = y + r - r * math.cos(angle)
                 if i < segments then gl.Vertex(x2, y2) end
             end)
-            
-            -- Bottom-right
+
             gl.BeginEnd(GL.TRIANGLES, function()
                 gl.Vertex(x + w - r, y + h - r)
                 angle = (math.pi / 2) * (i / segments)
@@ -198,8 +177,7 @@ local function drawRoundedRect(x, y, w, h, r, filled)
                 local y2 = y + h - r + r * math.sin(angle)
                 if i < segments then gl.Vertex(x2, y2) end
             end)
-            
-            -- Bottom-left
+
             gl.BeginEnd(GL.TRIANGLES, function()
                 gl.Vertex(x + r, y + h - r)
                 angle = (math.pi / 2) * (i / segments)
@@ -213,36 +191,27 @@ local function drawRoundedRect(x, y, w, h, r, filled)
             end)
         end
     else
-        -- Outline only
         gl.BeginEnd(GL.LINE_LOOP, function()
-            -- Top edge
             gl.Vertex(x + r, y)
             gl.Vertex(x + w - r, y)
-            -- Top-right corner
             for i = 0, 6 do
                 local angle = (math.pi / 2) * (i / 6)
                 gl.Vertex(x + w - r + r * math.sin(angle), y + r - r * math.cos(angle))
             end
-            -- Right edge
             gl.Vertex(x + w, y + r)
             gl.Vertex(x + w, y + h - r)
-            -- Bottom-right corner
             for i = 0, 6 do
                 local angle = (math.pi / 2) * (i / 6)
                 gl.Vertex(x + w - r + r * math.cos(angle), y + h - r + r * math.sin(angle))
             end
-            -- Bottom edge
             gl.Vertex(x + w - r, y + h)
             gl.Vertex(x + r, y + h)
-            -- Bottom-left corner
             for i = 0, 6 do
                 local angle = (math.pi / 2) * (i / 6)
                 gl.Vertex(x + r - r * math.sin(angle), y + h - r + r * math.cos(angle))
             end
-            -- Left edge
             gl.Vertex(x, y + h - r)
             gl.Vertex(x, y + r)
-            -- Top-left corner
             for i = 0, 6 do
                 local angle = (math.pi / 2) * (i / 6)
                 gl.Vertex(x + r - r * math.cos(angle), y + r - r * math.sin(angle))
@@ -260,64 +229,55 @@ Chart.__index = Chart
 
 function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     local self = setmetatable({}, Chart)
-    
-    self.id = id
-    self.label = label
-    self.icon = icon
-    self.x = x
-    self.y = y
-    self.width = CHART_WIDTH
-    self.height = CHART_HEIGHT
-    self.scale = 1.0
-    self.enabled = true
-    self.visible = true
-    
-    self.chartType = chartType  -- "single", "dual", or "multi"
-    self.series = series        -- Array of series configs
-    self.multiTeam = multiTeam or false  -- If true, generates series from allyTeams
-    
-    -- Data storage
-    self.history = {}  -- Historical data points
-    for i = 1, #series do
-        self.history[i] = {}
-    end
-    
-    -- Animation state
-    self.displayData = {}  -- Smoothly interpolated display values
-    for i = 1, #series do
-        self.displayData[i] = {}
-    end
-    
+
+    self.id        = id
+    self.label     = label
+    self.icon      = icon
+    self.x         = x
+    self.y         = y
+    self.width     = CHART_WIDTH
+    self.height    = CHART_HEIGHT
+    self.scale     = 1.0
+    self.enabled   = true
+    self.visible   = true
+    self.chartType = chartType
+    self.series    = series
+    self.multiTeam = multiTeam or false
+
+    self.history = {}
+    for i = 1, #series do self.history[i] = {} end
+
+    self.displayData = {}
+    for i = 1, #series do self.displayData[i] = {} end
+
     self.animProgress = 1.0
     self.animStartTime = 0
-    self.prevData = {}
+    self.prevData   = {}
     self.targetData = {}
-    
-    -- Interaction state
+
     self.isDragging = false
     self.dragStartX = 0
     self.dragStartY = 0
-    self.isHovered = false
-    
+    self.isHovered  = false
+
     return self
 end
 
--- Special method for multi-team charts to rebuild series from current ally teams
 function Chart:rebuildMultiTeamSeries()
     if not self.multiTeam then return end
 
-    self.history = {}
+    self.history     = {}
     self.displayData = {}
-    self.series = {}
+    self.series      = {}
 
     local idx = 1
     if type(allyTeams) == "table" then
-        for tid, teamData in pairs(allyTeams) do  -- changed teamID -> tid
+        for tid, teamData in pairs(allyTeams) do
             local seriesConfig = {
-                label = teamData.playerName,
-                color = teamData.color,
-                teamID = tid,
-                getValue = nil
+                label   = teamData.playerName,
+                color   = teamData.color,
+                teamID  = tid,
+                getValue = nil,
             }
 
             if self.id == "chart-ally-army" then
@@ -338,8 +298,8 @@ function Chart:rebuildMultiTeamSeries()
                 end
             end
 
-            self.series[idx] = seriesConfig
-            self.history[idx] = {}
+            self.series[idx]      = seriesConfig
+            self.history[idx]     = {}
             self.displayData[idx] = {}
             idx = idx + 1
         end
@@ -347,35 +307,22 @@ function Chart:rebuildMultiTeamSeries()
 end
 
 function Chart:addDataPoint()
-    local now = Spring.GetGameSeconds()
-    
-    -- Collect new data from all series
     for i, s in ipairs(self.series) do
         local value = s.getValue()
-        
-        -- Add to history
         table.insert(self.history[i], value)
         if #self.history[i] > HISTORY_SIZE then
             table.remove(self.history[i], 1)
         end
     end
-    
-    -- Start animation
-    self.animProgress = 0.0
+
+    self.animProgress  = 0.0
     self.animStartTime = os.clock()
-    
-    -- Copy current display as prev, target as new history
+
     for i = 1, #self.series do
-        self.prevData[i] = {}
+        self.prevData[i]   = {}
         self.targetData[i] = {}
-        
-        for j, v in ipairs(self.displayData[i]) do
-            self.prevData[i][j] = v
-        end
-        
-        for j, v in ipairs(self.history[i]) do
-            self.targetData[i][j] = v
-        end
+        for j, v in ipairs(self.displayData[i]) do self.prevData[i][j]   = v end
+        for j, v in ipairs(self.history[i])     do self.targetData[i][j] = v end
     end
 end
 
@@ -384,13 +331,13 @@ function Chart:update(dt)
         local elapsed = os.clock() - self.animStartTime
         self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
         local ease = easeOutCubic(self.animProgress)
-        
+
         for i = 1, #self.series do
-            local prev = self.prevData[i] or {}
+            local prev   = self.prevData[i]   or {}
             local target = self.targetData[i] or {}
             for j = 1, math.max(#prev, #target) do
-                local fromVal = prev[j] or target[j] or 0
-                local toVal = target[j] or fromVal
+                local fromVal = prev[j]   or target[j] or 0
+                local toVal   = target[j] or fromVal
                 self.displayData[i][j] = fromVal + (toVal - fromVal) * ease
             end
         end
@@ -399,106 +346,81 @@ end
 
 function Chart:draw()
     if not self.enabled or not self.visible then return end
-    
+
     gl.PushMatrix()
     gl.Translate(self.x, self.y, 0)
     gl.Scale(self.scale, self.scale, 1)
-    
-    local w = self.width
-    local h = self.height
+
+    local w   = self.width
+    local h   = self.height
     local pad = PADDING
-    local cX = pad.left
-    local cY = pad.bottom
-    local cW = w - pad.left - pad.right
-    local cH = h - pad.top - pad.bottom
-    
-    -- Background
+    local cX  = pad.left
+    local cY  = pad.bottom
+    local cW  = w - pad.left - pad.right
+    local cH  = h - pad.top  - pad.bottom
+
     gl.Color(COLOR.bg)
     drawRoundedRect(0, 0, w, h, 4, true)
-    
-    -- Border (highlighted if hovered)
-    if self.isHovered then
-        gl.Color(COLOR.borderHot)
-    else
-        gl.Color(COLOR.border)
-    end
+
+    if self.isHovered then gl.Color(COLOR.borderHot) else gl.Color(COLOR.border) end
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
-    
-    -- Check if we have data
+
     local hasData = false
     for i = 1, #self.series do
-        if #self.displayData[i] >= 2 then
-            hasData = true
-            break
-        end
+        if #self.displayData[i] >= 2 then hasData = true; break end
     end
-    
+
     if not hasData then
         self:drawNoData(cX, cY, cW, cH)
         self:drawHeader(w, h)
         gl.PopMatrix()
         return
     end
-    
-    -- Calculate Y range across all series
+
     local allValues = {}
     for i = 1, #self.series do
         for _, v in ipairs(self.displayData[i]) do
-            if v and not (v ~= v) then  -- Check for valid number (not NaN)
-                table.insert(allValues, v)
-            end
+            if v and not (v ~= v) then table.insert(allValues, v) end
         end
     end
-    
-    local minV = math.min(unpack(allValues))
-    local maxV = math.max(unpack(allValues))
-    local span = maxV - minV
+
+    local minV    = math.min(unpack(allValues))
+    local maxV    = math.max(unpack(allValues))
+    local span    = maxV - minV
     local rangePad = span > 0 and span * 0.12 or math.max(maxV * 0.1, 100)
     minV = math.max(0, minV - rangePad)
     maxV = maxV + rangePad
     local range = maxV - minV
     if range == 0 then range = 1 end
-    
-    -- Draw gridlines and Y labels
-    gl.Color(COLOR.muted)
+
     for i = 0, 4 do
-        local v = minV + (range * i / 4)
+        local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
-        
-        -- Grid line
-        if i == 0 then
-            gl.Color(COLOR.gridBase)
-        else
-            gl.Color(COLOR.grid)
-        end
+
+        if i == 0 then gl.Color(COLOR.gridBase) else gl.Color(COLOR.grid) end
         gl.BeginEnd(GL.LINES, function()
-            gl.Vertex(cX, yPos)
+            gl.Vertex(cX,      yPos)
             gl.Vertex(cX + cW, yPos)
         end)
-        
-        -- Y-axis label
+
         gl.Color(COLOR.muted)
-        local labelText = formatYAxis(v, self.chartType == "ratio" and "ratio" or "normal")
-        gl.Text(labelText, cX - 5, yPos - 4, 9, "ro")
+        gl.Text(formatYAxis(v, self.chartType == "ratio" and "ratio" or "normal"), cX - 5, yPos - 4, 9, "ro")
     end
-    
-    -- Helper functions for coordinate conversion
+
     local function toX(idx, total)
         return cX + ((idx - 1) / (total - 1)) * cW
     end
-    
+
     local function toY(value)
         return cY + ((value - minV) / range) * cH
     end
-    
-    -- Draw each series
+
     for seriesIdx, s in ipairs(self.series) do
         local data = self.displayData[seriesIdx]
         if #data >= 2 then
             local color = s.color
-            
-            -- Draw line
+
             gl.Color(color[1], color[2], color[3], 1.0)
             gl.LineWidth(2.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
@@ -508,8 +430,7 @@ function Chart:draw()
                     end
                 end
             end)
-            
-            -- Draw fill (semi-transparent)
+
             gl.Color(color[1], color[2], color[3], 0.15)
             gl.BeginEnd(GL.TRIANGLE_STRIP, function()
                 for i, value in ipairs(data) do
@@ -520,8 +441,7 @@ function Chart:draw()
                     end
                 end
             end)
-            
-            -- Draw current value indicator
+
             if #data > 0 then
                 local lastValue = data[#data]
                 if lastValue and not (lastValue ~= lastValue) then
@@ -530,46 +450,37 @@ function Chart:draw()
                     gl.BeginEnd(GL.POINTS, function()
                         gl.Vertex(toX(#data, #data), toY(lastValue))
                     end)
-                    
-                    -- Value label on right edge
+
                     gl.Color(color[1], color[2], color[3], 1.0)
                     local valueText
-                    
                     if self.chartType == "multi" then
-                        -- Multi-team: show abbreviated name + value
                         local shortName = s.label
-                        if #shortName > 8 then
-                            shortName = string.sub(shortName, 1, 6) .. ".."
-                        end
+                        if #shortName > 8 then shortName = string.sub(shortName, 1, 6) .. ".." end
                         valueText = shortName .. " " .. formatNumber(lastValue)
                     elseif self.chartType == "dual" then
                         valueText = s.label .. " " .. formatNumber(lastValue)
                     else
                         valueText = formatNumber(lastValue)
                     end
-                    
-                    -- Offset labels vertically for multi-series to prevent overlap
+
                     local labelOffset = 0
                     if self.chartType == "multi" or self.chartType == "dual" then
                         labelOffset = (seriesIdx - 1) * 13
                     end
-                    
+
                     gl.Text(valueText, cX + cW + 2, toY(lastValue) - 4 + labelOffset, 9, "o")
                 end
             end
         end
     end
-    
-    -- Draw header
+
     self:drawHeader(w, h)
-    
     gl.PopMatrix()
 end
 
 function Chart:drawHeader(w, h)
     gl.Color(COLOR.muted)
-    local headerText = self.icon .. "  " .. self.label
-    gl.Text(headerText, PADDING.left + 2, h - PADDING.top - 10, 10, "o")
+    gl.Text(self.icon .. "  " .. self.label, PADDING.left + 2, h - PADDING.top - 10, 10, "o")
 end
 
 function Chart:drawNoData(cX, cY, cW, cH)
@@ -578,37 +489,147 @@ function Chart:drawNoData(cX, cY, cW, cH)
 end
 
 function Chart:isMouseOver(mx, my)
-    local x1 = self.x
-    local y1 = self.y
-    local x2 = self.x + self.width * self.scale
-    local y2 = self.y + self.height * self.scale
-    return mx >= x1 and mx <= x2 and my >= y1 and my <= y2
+    return mx >= self.x
+       and mx <= self.x + self.width  * self.scale
+       and my >= self.y
+       and my <= self.y + self.height * self.scale
 end
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
 -------------------------------------------------------------------------------
 
-local charts = {}
+local charts        = {}
 local lastUpdateTime = 0
-local teamID = nil
-local allyTeamID = nil
-local allyTeams = {}  -- Track all ally team stats
+local teamID        = nil
+local allyTeamID    = nil
+local allyTeams     = {}
 
 local myTeamStats = {
-    metalIncome = 0,
-    metalUsage = 0,
+    metalIncome  = 0,
+    metalUsage   = 0,
     energyIncome = 0,
-    energyUsage = 0,
-    damageDealt = 0,
-    damageTaken = 0,
-    armyValue = 0,
-    kills = 0,
-    losses = 0,
+    energyUsage  = 0,
+    damageDealt  = 0,
+    damageTaken  = 0,
+    armyValue    = 0,   -- maintained by unit callbacks
+    kills        = 0,
+    losses       = 0,
 }
 
--- Ally team stats storage
--- Structure: allyTeams[teamID] = {metalIncome, energyIncome, armyValue, buildPower, playerName, color}
+-------------------------------------------------------------------------------
+-- ARMY VALUE HELPERS  (callback-driven, no per-tick iteration)
+-------------------------------------------------------------------------------
+
+local function unitMetalCost(unitDefID)
+    if not unitDefID then return 0 end
+    local ud = UnitDefs[unitDefID]
+    return ud and (ud.metalCost or 0) or 0
+end
+
+-- Seed army values by iterating units ONCE (called only at chartsReady time)
+local function seedArmyValues()
+    myTeamStats.armyValue = 0
+    local myUnits = Spring.GetTeamUnits(teamID) or {}
+    for _, uid in ipairs(myUnits) do
+        myTeamStats.armyValue = myTeamStats.armyValue + unitMetalCost(Spring.GetUnitDefID(uid))
+    end
+
+    for tid, teamData in pairs(allyTeams) do
+        teamData.armyValue = 0
+        local tUnits = Spring.GetTeamUnits(tid) or {}
+        for _, uid in ipairs(tUnits) do
+            teamData.armyValue = teamData.armyValue + unitMetalCost(Spring.GetUnitDefID(uid))
+        end
+    end
+end
+
+-- Also seed build power once at start (still needs iteration, but only once)
+local function seedBuildPower()
+    for tid, teamData in pairs(allyTeams) do
+        teamData.buildPower = 0
+        local tUnits = Spring.GetTeamUnits(tid) or {}
+        for _, uid in ipairs(tUnits) do
+            local ud = UnitDefs[Spring.GetUnitDefID(uid) or 0]
+            if ud and ud.isBuilder then
+                teamData.buildPower = teamData.buildPower + (ud.buildSpeed or 0)
+            end
+        end
+    end
+end
+
+-------------------------------------------------------------------------------
+-- UNIT EVENT CALLBACKS  (army value maintenance)
+-------------------------------------------------------------------------------
+
+function widget:UnitFinished(unitID, unitDefID, unitTeam)
+    local cost = unitMetalCost(unitDefID)
+    if unitTeam == teamID then
+        myTeamStats.armyValue = myTeamStats.armyValue + cost
+    elseif allyTeams[unitTeam] then
+        allyTeams[unitTeam].armyValue = allyTeams[unitTeam].armyValue + cost
+    end
+
+    -- Build power: add if builder
+    local ud = UnitDefs[unitDefID]
+    if ud and ud.isBuilder and allyTeams[unitTeam] then
+        allyTeams[unitTeam].buildPower = allyTeams[unitTeam].buildPower + (ud.buildSpeed or 0)
+    end
+end
+
+function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
+    local cost = unitMetalCost(unitDefID)
+    if unitTeam == teamID then
+        myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
+    elseif allyTeams[unitTeam] then
+        allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
+    end
+
+    -- Build power: subtract if builder
+    local ud = UnitDefs[unitDefID]
+    if ud and ud.isBuilder and allyTeams[unitTeam] then
+        allyTeams[unitTeam].buildPower = math.max(0, allyTeams[unitTeam].buildPower - (ud.buildSpeed or 0))
+    end
+end
+
+function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
+    local cost = unitMetalCost(unitDefID)
+
+    -- Remove from old team
+    if oldTeam == teamID then
+        myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
+    elseif allyTeams[oldTeam] then
+        allyTeams[oldTeam].armyValue = math.max(0, allyTeams[oldTeam].armyValue - cost)
+    end
+
+    -- Add to new team
+    if newTeam == teamID then
+        myTeamStats.armyValue = myTeamStats.armyValue + cost
+    elseif allyTeams[newTeam] then
+        allyTeams[newTeam].armyValue = allyTeams[newTeam].armyValue + cost
+    end
+
+    -- Build power transfer
+    local ud = UnitDefs[unitDefID]
+    if ud and ud.isBuilder then
+        local bp = ud.buildSpeed or 0
+        if allyTeams[oldTeam] then
+            allyTeams[oldTeam].buildPower = math.max(0, allyTeams[oldTeam].buildPower - bp)
+        end
+        if allyTeams[newTeam] then
+            allyTeams[newTeam].buildPower = allyTeams[newTeam].buildPower + bp
+        end
+    end
+end
+
+function widget:UnitCaptured(unitID, unitDefID, oldTeam, newTeam)
+    widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
+end
+
+-------------------------------------------------------------------------------
+-- ALLY TEAM INIT
+-------------------------------------------------------------------------------
+
 local function initAllyTeams()
     local currentAllyID = Spring.GetMyAllyTeamID()
     if not currentAllyID then return false end
@@ -620,7 +641,7 @@ local function initAllyTeams()
     local newAllyTeams = {}
 
     for _, tid in ipairs(teamList) do
-        local r, g, b = Spring.GetTeamColor(tid)
+        local r, g, b   = Spring.GetTeamColor(tid)
         local playerName = "Team " .. tid
         local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
 
@@ -633,13 +654,13 @@ local function initAllyTeams()
         end
 
         newAllyTeams[tid] = {
-            teamID = tid,
-            playerName = playerName,
-            color = {r or 1, g or 1, b or 1, 1},
-            metalIncome = 0,
+            teamID       = tid,
+            playerName   = playerName,
+            color        = {r or 1, g or 1, b or 1, 1},
+            metalIncome  = 0,
             energyIncome = 0,
-            armyValue = 0,
-            buildPower = 0,
+            armyValue    = 0,
+            buildPower   = 0,
         }
     end
 
@@ -648,32 +669,25 @@ local function initAllyTeams()
 end
 
 -------------------------------------------------------------------------------
--- CONFIG SAVE/LOAD
+-- CONFIG SAVE / LOAD
 -------------------------------------------------------------------------------
 
 local function saveConfig()
-    local config = {
-        version = "1.0",
-        enabled = chartsEnabled,
-        charts = {}
-    }
-    
+    local config = { version = "1.0", enabled = chartsEnabled, charts = {} }
+
     for id, chart in pairs(charts) do
         config.charts[id] = {
-            x = chart.x,
-            y = chart.y,
-            scale = chart.scale,
+            x       = chart.x,
+            y       = chart.y,
+            scale   = chart.scale,
             visible = chart.visible,
             enabled = chart.enabled,
         }
     end
-    
-    local configStr = "return " .. serializeTable(config, 0)
-    
-    -- Write to VFS
+
     local file = io.open(CONFIG_FILE, "w")
     if file then
-        file:write(configStr)
+        file:write("return " .. serializeTable(config, 0))
         file:close()
         Spring.Echo("BAR Charts: Config saved to " .. CONFIG_FILE)
     else
@@ -682,9 +696,7 @@ local function saveConfig()
 end
 
 local function loadConfig()
-    if not VFS.FileExists(CONFIG_FILE) then
-        return {}
-    end
+    if not VFS.FileExists(CONFIG_FILE) then return {} end
 
     local fileContent = VFS.LoadFile(CONFIG_FILE)
     if not fileContent then return {} end
@@ -695,8 +707,8 @@ local function loadConfig()
         return {}
     end
 
-    local success, result = pcall(chunk)
-    if not success or type(result) ~= "table" then
+    local ok, result = pcall(chunk)
+    if not ok or type(result) ~= "table" then
         Spring.Echo("BAR Charts: Invalid config")
         return {}
     end
@@ -713,44 +725,43 @@ local savedChartConfig = nil
 
 function widget:Initialize()
     Spring.Echo("BAR Charts: Initialize START")
-    vsx, vsy = Spring.GetViewGeometry()
-    teamID = Spring.GetMyTeamID()
-    allyTeamID = Spring.GetMyAllyTeamID()
-    chartsReady = false
+    vsx, vsy     = Spring.GetViewGeometry()
+    teamID       = Spring.GetMyTeamID()
+    allyTeamID   = Spring.GetMyAllyTeamID()
+    chartsReady  = false
 
-    -- Define charts (multi-team series built later once ready)
     charts = {}
 
-     charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 230, "dual", {
+    charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 230, "dual", {
         { label = "Income", color = COLOR.accent,  getValue = function() return myTeamStats.metalIncome end },
-        { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.metalUsage  end }
+        { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.metalUsage  end },
     }, false)
 
     charts.energy = Chart.new("chart-energy", "ENERGY", "⚡", vsx - 660, vsy - 230, "dual", {
         { label = "Income", color = COLOR.accent,  getValue = function() return myTeamStats.energyIncome end },
-        { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.energyUsage  end }
+        { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.energyUsage  end },
     }, false)
 
     charts.damage = Chart.new("chart-damage", "DAMAGE", "✕", vsx - 970, vsy - 230, "dual", {
         { label = "Dealt", color = COLOR.success, getValue = function() return myTeamStats.damageDealt end },
-        { label = "Taken", color = COLOR.danger,  getValue = function() return myTeamStats.damageTaken end }
+        { label = "Taken", color = COLOR.danger,  getValue = function() return myTeamStats.damageTaken end },
     }, false)
 
     charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙", vsx - 350, vsy - 430, "single", {
-        { label = "Value", color = COLOR.accent, getValue = function() return myTeamStats.armyValue end }
+        { label = "Value", color = COLOR.accent, getValue = function() return myTeamStats.armyValue end },
     }, false)
 
     charts.kd = Chart.new("chart-kd", "K/D RATIO", "✕", vsx - 660, vsy - 430, "ratio", {
         { label = "Ratio", color = COLOR.success, getValue = function()
             local k, d = myTeamStats.kills, myTeamStats.losses
             return d == 0 and (k > 0 and 5 or 0) or math.min(5, k / d)
-        end }
+        end },
     }, false)
 
-    charts.allyArmy = Chart.new("chart-ally-army", "TEAM ARMY", "⚙", vsx - 970, vsy - 430, "multi", {}, true)
-    charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP", "🔧", vsx - 1280, vsy - 230, "multi", {}, true)
+    charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",  vsx - 970, vsy - 430, "multi", {}, true)
+    charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧", vsx - 1280, vsy - 230, "multi", {}, true)
 
-    -- Load saved positions (safe even before ready)
+    -- Apply saved config (positions, visibility, scale)
     local configData = loadConfig() or {}
     for id, cfg in pairs(type(configData) == "table" and configData or {}) do
         local chart = charts[id]
@@ -771,32 +782,29 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Update(dt)
-    -- Keep retrying until we have team data
+    -- Retry until ally team data is available
     if not chartsReady then
         local gameTime = Spring.GetGameSeconds()
         if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
             lastUpdateTime = gameTime
-            -- Also refresh teamID here in case it wasn't available at Initialize
             teamID = teamID or Spring.GetMyTeamID()
             if initAllyTeams() then
-                Spring.Echo("BAR Charts: allyTeams count check:")
-                local count = 0
-                for tid, _ in pairs(allyTeams) do
-                    count = count + 1
-                    Spring.Echo("  tid=" .. tostring(tid))
-                end
-                Spring.Echo("  total=" .. count)
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
-                chartsReady = true
-                lastUpdateTime = -UPDATE_INTERVAL  -- force immediate collection next frame
+
+                -- Seed army values and build power from current units (one-time iteration)
+                seedArmyValues()
+                seedBuildPower()
+
+                chartsReady    = true
+                lastUpdateTime = -UPDATE_INTERVAL  -- force immediate stat collection
                 Spring.Echo("BAR Charts: Team data ready, tracking " .. #Spring.GetTeamList(allyTeamID) .. " teams")
             end
         end
         return
     end
 
-    -- Update chart animations
+    -- Animate charts every frame
     for _, chart in pairs(charts) do
         chart:update(dt)
     end
@@ -806,16 +814,14 @@ function widget:Update(dt)
     if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
         lastUpdateTime = gameTime
 
-        -- Safety check - bail out if we somehow lost teamID
         if not teamID then
             teamID = Spring.GetMyTeamID()
             if not teamID then return end
         end
 
-        -- MY TEAM STATS
+        -- My team resource stats
         local m_inc, m_use = Spring.GetTeamResourceStats(teamID, "metal")
         local e_inc, e_use = Spring.GetTeamResourceStats(teamID, "energy")
-
         myTeamStats.metalIncome  = m_inc or 0
         myTeamStats.metalUsage   = m_use or 0
         myTeamStats.energyIncome = e_inc or 0
@@ -833,51 +839,19 @@ function widget:Update(dt)
             myTeamStats.losses = u_died   or 0
         end
 
-        local units = Spring.GetTeamUnits(teamID) or {}
-        local totalValue = 0
-        for _, unitID in ipairs(units) do
-            local unitDefID = Spring.GetUnitDefID(unitID)
-            if unitDefID then
-                local ud = UnitDefs[unitDefID]
-                if ud then
-                    totalValue = totalValue + (ud.metalCost or 0)
-                end
-            end
-        end
-        myTeamStats.armyValue = totalValue
-
-        -- ALLY TEAM STATS
+        -- Ally team resource stats only (army value maintained by callbacks)
         if type(allyTeams) == "table" then
             for tid, teamData in pairs(allyTeams) do
                 local tm_inc, tm_use = Spring.GetTeamResourceStats(tid, "metal")
                 local te_inc, te_use = Spring.GetTeamResourceStats(tid, "energy")
-
                 teamData.metalIncome  = tm_inc or 0
                 teamData.energyIncome = te_inc or 0
-
-                local teamUnits = Spring.GetTeamUnits(tid) or {}
-                local teamArmyValue = 0
-                local teamBuildPower = 0
-
-                for _, unitID in ipairs(teamUnits) do
-                    local unitDefID = Spring.GetUnitDefID(unitID)
-                    if unitDefID then
-                        local ud = UnitDefs[unitDefID]
-                        if ud then
-                            teamArmyValue = teamArmyValue + (ud.metalCost or 0)
-                            if ud.isBuilder then
-                                teamBuildPower = teamBuildPower + (ud.buildSpeed or 0)
-                            end
-                        end
-                    end
-                end
-
-                teamData.armyValue  = teamArmyValue
-                teamData.buildPower = teamBuildPower
+                -- NOTE: armyValue and buildPower are NOT updated here,
+                -- they are maintained incrementally by unit event callbacks.
             end
         end
 
-        -- Add data points to all charts
+        -- Snapshot data into all charts
         for _, chart in pairs(charts) do
             chart:addDataPoint()
         end
@@ -885,30 +859,34 @@ function widget:Update(dt)
 end
 
 -------------------------------------------------------------------------------
--- RENDERING
+-- GAME START
 -------------------------------------------------------------------------------
 
 function widget:GameStart()
-    -- Reset ready state so Update() will re-fetch team info fresh
-    chartsReady = false
+    chartsReady    = false
     lastUpdateTime = 0
+    -- Reset army values so seeding starts clean
+    myTeamStats.armyValue = 0
+    for tid, teamData in pairs(allyTeams) do
+        teamData.armyValue  = 0
+        teamData.buildPower = 0
+    end
     Spring.Echo("BAR Charts: Game started, waiting for team data...")
 end
 
+-------------------------------------------------------------------------------
+-- RENDERING
+-------------------------------------------------------------------------------
+
 function widget:DrawScreen()
     if not chartsEnabled then return end
-    
+
     gl.PushMatrix()
-    
-    -- Draw all charts
     for _, chart in pairs(charts) do
         chart:draw()
     end
-    
-    -- Draw toggle hint
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
     gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
-    
     gl.PopMatrix()
 end
 
@@ -927,11 +905,9 @@ end
 
 function widget:MousePress(mx, my, button)
     if not chartsEnabled then return false end
-    
-    Spring.Echo("Click at: " .. mx .. ", " .. my .. " (flipped)")
+
     if button == 1 then
         for _, chart in pairs(charts) do
-            Spring.Echo("Chart " .. chart.id .. " bounds: " .. chart.x .. "," .. chart.y .. " to " .. (chart.x+chart.width) .. "," .. (chart.y+chart.height))
             if chart:isMouseOver(mx, my) then
                 chart.isDragging = true
                 chart.dragStartX = mx - chart.x
@@ -939,7 +915,7 @@ function widget:MousePress(mx, my, button)
                 return true
             end
         end
-    elseif button == 3 then  -- Right click (double-click to toggle)
+    elseif button == 3 then
         for _, chart in pairs(charts) do
             if chart:isMouseOver(mx, my) then
                 chart.visible = not chart.visible
@@ -947,13 +923,13 @@ function widget:MousePress(mx, my, button)
             end
         end
     end
-    
+
     return false
 end
 
 function widget:MouseRelease(mx, my, button)
     if not chartsEnabled then return false end
-    
+
     if button == 1 then
         for _, chart in pairs(charts) do
             if chart.isDragging then
@@ -962,14 +938,13 @@ function widget:MouseRelease(mx, my, button)
             end
         end
     end
-    
+
     return false
 end
 
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
-    
-    -- Handle dragging
+
     for _, chart in pairs(charts) do
         if chart.isDragging then
             chart.x = mx - chart.dragStartX
@@ -977,50 +952,37 @@ function widget:MouseMove(mx, my, dx, dy)
             return true
         end
     end
-    
-    -- Update hover state
+
     local anyHovered = false
     for _, chart in pairs(charts) do
         chart.isHovered = chart:isMouseOver(mx, my)
-        if chart.isHovered then 
-            anyHovered = true 
-        end -- Correctly closing the 'if chart.isHovered'
-    end -- Correctly closing the 'for' loop
-    
+        if chart.isHovered then anyHovered = true end
+    end
     return anyHovered
 end
 
 function widget:MouseWheel(up, value)
     if not chartsEnabled then return false end
-    
+
     local mx, my = Spring.GetMouseState()
-    
     for _, chart in pairs(charts) do
         if chart:isMouseOver(mx, my) then
-            if up then
-                chart.scale = math.min(2.0, chart.scale + 0.1)
-            else
-                chart.scale = math.max(0.5, chart.scale - 0.1)
-            end
+            chart.scale = up and math.min(2.0, chart.scale + 0.1)
+                             or  math.max(0.5, chart.scale - 0.1)
             return true
         end
     end
-    
+
     return false
 end
 
 function widget:ViewResize()
     local oldVsx, oldVsy = vsx, vsy
     vsx, vsy = Spring.GetViewGeometry()
-    
-    -- Only adjust positions if no saved config exists
-    -- Otherwise positions are already set from saved config
+
     if not savedChartConfig then
-        -- Calculate ratio for proportional repositioning
         local ratioX = vsx / oldVsx
         local ratioY = vsy / oldVsy
-        
-        -- Reposition charts proportionally
         for _, chart in pairs(charts) do
             chart.x = chart.x * ratioX
             chart.y = chart.y * ratioY
@@ -1034,7 +996,6 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Configuration saved manually")
         return true
     elseif command == "barcharts reset" then
-        -- Delete config file
         os.remove(CONFIG_FILE)
         Spring.Echo("BAR Charts: Configuration reset - restart widget to apply")
         return true
@@ -1043,7 +1004,6 @@ function widget:TextCommand(command)
 end
 
 function widget:Shutdown()
-    -- Auto-save config on shutdown
     saveConfig()
     Spring.Echo("BAR Charts: Shutdown")
 end
