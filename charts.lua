@@ -12,6 +12,7 @@
     - Damage Dealt/Taken chart
     - Army Value chart
     - K/D Ratio chart
+    - Build Efficiency chart (NEW)
     - Team Army Values chart (multi-team)
     - Team Build Power chart (multi-team)
     - Numeric stat cards (Army Value, Units, Kills, Losses, DMG Dealt/Taken, Metal Lost)
@@ -135,6 +136,9 @@ local myTeamStats = {
     kills        = 0,
     losses       = 0,
     metalLost    = 0,
+    buildEfficiency     = 0,
+    unitsMetalCompleted = 0,
+    lastUnitsMetalCompleted = 0,
 }
 
 -------------------------------------------------------------------------------
@@ -156,8 +160,8 @@ local function formatNumber(n)
 end
 
 local function formatYAxis(n, chartType)
-    if chartType == "ratio" then
-        return string.format("%.1f", n)
+    if chartType == "ratio" or chartType == "percent" then
+        return string.format("%.0f%%", n)
     else
         return formatNumber(n)
     end
@@ -534,10 +538,18 @@ function Chart:draw()
 
     local minV    = math.min(unpack(allValues))
     local maxV    = math.max(unpack(allValues))
-    local span    = maxV - minV
-    local rangePad = span > 0 and span * 0.12 or math.max(maxV * 0.1, 100)
-    minV = math.max(0, minV - rangePad)
-    maxV = maxV + rangePad
+    
+    -- Special handling for percent charts
+    if self.chartType == "percent" then
+        minV = 0
+        maxV = math.max(100, maxV)
+    else
+        local span    = maxV - minV
+        local rangePad = span > 0 and span * 0.12 or math.max(maxV * 0.1, 100)
+        minV = math.max(0, minV - rangePad)
+        maxV = maxV + rangePad
+    end
+    
     local range = maxV - minV
     if range == 0 then range = 1 end
 
@@ -553,7 +565,7 @@ function Chart:draw()
         end)
 
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
-        gl.Text(formatYAxis(v, self.chartType == "ratio" and "ratio" or "normal"), cX - 5, yPos - 4, 9, "ro")
+        gl.Text(formatYAxis(v, self.chartType), cX - 5, yPos - 4, 9, "ro")
     end
 
     local function toX(idx, total)
@@ -601,7 +613,9 @@ function Chart:draw()
 
                     gl.Color(color[1], color[2], color[3], 1.0)
                     local valueText
-                    if self.chartType == "multi" then
+                    if self.chartType == "percent" then
+                        valueText = string.format("%.0f%%", lastValue)
+                    elseif self.chartType == "multi" then
                         local shortName = s.label
                         if #shortName > 8 then shortName = string.sub(shortName, 1, 6) .. ".." end
                         valueText = shortName .. " " .. formatNumber(lastValue)
@@ -644,7 +658,7 @@ function Chart:isMouseOver(mx, my)
 end
 
 -------------------------------------------------------------------------------
--- ARMY VALUE HELPERS  (callback-driven, no per-tick iteration)
+-- ARMY VALUE & BUILD POWER HELPERS
 -------------------------------------------------------------------------------
 
 local function unitMetalCost(unitDefID)
@@ -688,7 +702,6 @@ local function seedBuildPower()
     end
 end
 
--- Seed unit count
 local function seedUnitCount()
     local myUnits = Spring.GetTeamUnits(teamID) or {}
     myTeamStats.unitCount = #myUnits
@@ -703,6 +716,8 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     if unitTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
         myTeamStats.unitCount = myTeamStats.unitCount + 1
+        -- Track total metal value of units completed for build efficiency
+        myTeamStats.unitsMetalCompleted = myTeamStats.unitsMetalCompleted + cost
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = allyTeams[unitTeam].armyValue + cost
@@ -813,6 +828,28 @@ local function initAllyTeams()
 end
 
 -------------------------------------------------------------------------------
+-- BUILD POWER TRACKING
+-------------------------------------------------------------------------------
+
+local function getCurrentBuildPower()
+    local totalBuildPower = 0
+    if not teamID then return 0 end
+    
+    local myUnits = Spring.GetTeamUnits(teamID) or {}
+    for _, uid in ipairs(myUnits) do
+        local unitDefID = Spring.GetUnitDefID(uid)
+        if unitDefID then
+            local ud = UnitDefs[unitDefID]
+            if ud and ud.isBuilder then
+                totalBuildPower = totalBuildPower + (ud.buildSpeed or 0)
+            end
+        end
+    end
+    
+    return totalBuildPower
+end
+
+-------------------------------------------------------------------------------
 -- CONFIG SAVE / LOAD
 -------------------------------------------------------------------------------
 
@@ -915,17 +952,21 @@ function widget:Initialize()
         end },
     }, false)
 
-    charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",  vsx - 970, vsy - 430, "multi", {}, true)
+    -- NEW: Build Efficiency Chart
+    charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILD EFFICIENCY", "🔧", vsx - 970, vsy - 430, "percent", {
+        { label = "Efficiency", color = COLOR.success, getValue = function() 
+            return myTeamStats.buildEfficiency 
+        end },
+    }, false)
+
+    charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",  vsx - 1280, vsy - 430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧", vsx - 1280, vsy - 230, "multi", {}, true)
 
     -- ── NUMERIC STAT CARDS ───────────────────────────────────────────────────
-    -- Two columns of cards, right side, below the charts
-    -- Charts bottom edge is around vsy - 430 - CHART_HEIGHT(180) = vsy - 610
-    -- Place cards starting just below that with a small gap
-    local cardY    = vsy - 650   -- top card bottom edge, below charts
-    local cardStep = 80          -- CARD_HEIGHT(70) + 10px gap
-    local col1X    = vsx - 350   -- aligns with chart-metal left edge
-    local col2X    = vsx - 200   -- second column
+    local cardY    = vsy - 650
+    local cardStep = 80
+    local col1X    = vsx - 350
+    local col2X    = vsx - 200
 
     statCards["card-army-value"] = StatCard.new(
         "card-army-value", "ARMY VALUE", "⚙",
@@ -980,8 +1021,6 @@ function widget:Initialize()
 
     local chartCfg, cardCfg = loadConfig()
 
-    -- Charts are stored by short key (charts.metal) but config keys are the .id strings
-    -- Build a lookup from id -> chart object first
     local chartById = {}
     for _, chart in pairs(charts) do
         chartById[chart.id] = chart
@@ -1016,7 +1055,6 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Update(dt)
-    -- Retry until ally team data is available
     if not chartsReady then
         local gameTime = Spring.GetGameSeconds()
         if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
@@ -1046,7 +1084,6 @@ function widget:Update(dt)
         return
     end
 
-    -- Animate charts and cards every frame
     for _, chart in pairs(charts) do
         chart:update(dt)
     end
@@ -1054,7 +1091,6 @@ function widget:Update(dt)
         card:update(dt)
     end
 
-    -- Collect stats at regular intervals
     local gameTime = Spring.GetGameSeconds()
     if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
         lastUpdateTime = gameTime
@@ -1078,8 +1114,18 @@ function widget:Update(dt)
             myTeamStats.damageTaken = dmg_taken or 0
         end
 
-        -- Note: kills, losses, unitCount, armyValue, metalLost are maintained
-        -- incrementally by unit event callbacks — no poll needed here.
+        -- Calculate build efficiency
+        local currentBuildPower = getCurrentBuildPower()
+        local theoreticalMax = currentBuildPower * UPDATE_INTERVAL
+        local actualBuilt = myTeamStats.unitsMetalCompleted - myTeamStats.lastUnitsMetalCompleted
+        
+        if theoreticalMax > 0 then
+            myTeamStats.buildEfficiency = math.min(100, (actualBuilt / theoreticalMax) * 100)
+        else
+            myTeamStats.buildEfficiency = 0
+        end
+        
+        myTeamStats.lastUnitsMetalCompleted = myTeamStats.unitsMetalCompleted
 
         -- Ally team resource stats
         if type(allyTeams) == "table" then
@@ -1091,7 +1137,6 @@ function widget:Update(dt)
             end
         end
 
-        -- Push new data points into all charts
         for _, chart in pairs(charts) do
             if chart.id == "chart-ally-army" then
                 Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
@@ -1099,7 +1144,6 @@ function widget:Update(dt)
             chart:addDataPoint()
         end
 
-        -- Push new values into stat cards (triggers animation)
         for _, card in pairs(statCards) do
             card:setTarget(card.getValue())
         end
@@ -1120,6 +1164,9 @@ function widget:GameStart()
     myTeamStats.metalLost  = 0
     myTeamStats.damageDealt = 0
     myTeamStats.damageTaken = 0
+    myTeamStats.buildEfficiency = 0
+    myTeamStats.unitsMetalCompleted = 0
+    myTeamStats.lastUnitsMetalCompleted = 0
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue  = 0
         teamData.buildPower = 0
@@ -1159,7 +1206,6 @@ function widget:KeyPress(key, mods, isRepeat)
     return false
 end
 
--- Helper: check cards first, then charts (cards are smaller so check them first for precision)
 local function findHitElement(mx, my)
     for id, card in pairs(statCards) do
         if card:isMouseOver(mx, my) then return card, "card" end
