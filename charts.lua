@@ -99,6 +99,29 @@ local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
 local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 
+
+-------------------------------------------------------------------------------
+-- GLOBAL STATE
+-------------------------------------------------------------------------------
+
+local charts        = {}
+local lastUpdateTime = 0
+local teamID        = nil
+local allyTeamID    = nil
+local allyTeams     = {}
+
+local myTeamStats = {
+    metalIncome  = 0,
+    metalUsage   = 0,
+    energyIncome = 0,
+    energyUsage  = 0,
+    damageDealt  = 0,
+    damageTaken  = 0,
+    armyValue    = 0,   -- maintained by unit callbacks
+    kills        = 0,
+    losses       = 0,
+}
+
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
@@ -269,6 +292,14 @@ function Chart:rebuildMultiTeamSeries()
     self.history     = {}
     self.displayData = {}
     self.series      = {}
+
+    Spring.Echo("rebuild: allyTeams type=" .. type(allyTeams))
+    local c = 0
+    for tid, _ in pairs(allyTeams) do
+        c = c + 1
+        Spring.Echo("  rebuild sees tid=" .. tostring(tid))
+    end
+    Spring.Echo("  rebuild count=" .. c)
 
     local idx = 1
     if type(allyTeams) == "table" then
@@ -495,27 +526,7 @@ function Chart:isMouseOver(mx, my)
        and my <= self.y + self.height * self.scale
 end
 
--------------------------------------------------------------------------------
--- GLOBAL STATE
--------------------------------------------------------------------------------
 
-local charts        = {}
-local lastUpdateTime = 0
-local teamID        = nil
-local allyTeamID    = nil
-local allyTeams     = {}
-
-local myTeamStats = {
-    metalIncome  = 0,
-    metalUsage   = 0,
-    energyIncome = 0,
-    energyUsage  = 0,
-    damageDealt  = 0,
-    damageTaken  = 0,
-    armyValue    = 0,   -- maintained by unit callbacks
-    kills        = 0,
-    losses       = 0,
-}
 
 -------------------------------------------------------------------------------
 -- ARMY VALUE HELPERS  (callback-driven, no per-tick iteration)
@@ -532,14 +543,20 @@ local function seedArmyValues()
     myTeamStats.armyValue = 0
     local myUnits = Spring.GetTeamUnits(teamID) or {}
     for _, uid in ipairs(myUnits) do
-        myTeamStats.armyValue = myTeamStats.armyValue + unitMetalCost(Spring.GetUnitDefID(uid))
+        local cost = unitMetalCost(Spring.GetUnitDefID(uid))
+        myTeamStats.armyValue = myTeamStats.armyValue + cost
+        if allyTeams[teamID] then
+            allyTeams[teamID].armyValue = allyTeams[teamID].armyValue + cost
+        end
     end
 
     for tid, teamData in pairs(allyTeams) do
-        teamData.armyValue = 0
-        local tUnits = Spring.GetTeamUnits(tid) or {}
-        for _, uid in ipairs(tUnits) do
-            teamData.armyValue = teamData.armyValue + unitMetalCost(Spring.GetUnitDefID(uid))
+        if tid ~= teamID then  -- already handled above
+            teamData.armyValue = 0
+            local tUnits = Spring.GetTeamUnits(tid) or {}
+            for _, uid in ipairs(tUnits) do
+                teamData.armyValue = teamData.armyValue + unitMetalCost(Spring.GetUnitDefID(uid))
+            end
         end
     end
 end
@@ -566,11 +583,11 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
-    elseif allyTeams[unitTeam] then
+    end
+    if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = allyTeams[unitTeam].armyValue + cost
     end
 
-    -- Build power: add if builder
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder and allyTeams[unitTeam] then
         allyTeams[unitTeam].buildPower = allyTeams[unitTeam].buildPower + (ud.buildSpeed or 0)
@@ -581,11 +598,11 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
-    elseif allyTeams[unitTeam] then
+    end
+    if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
     end
 
-    -- Build power: subtract if builder
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder and allyTeams[unitTeam] then
         allyTeams[unitTeam].buildPower = math.max(0, allyTeams[unitTeam].buildPower - (ud.buildSpeed or 0))
@@ -796,6 +813,15 @@ function widget:Update(dt)
                 seedArmyValues()
                 seedBuildPower()
 
+                -- DEBUG
+                for tid, teamData in pairs(allyTeams) do
+                    Spring.Echo("Seeded tid=" .. tostring(tid) .. " armyValue=" .. tostring(teamData.armyValue))
+                end
+                Spring.Echo("allyArmy series count=" .. #charts.allyArmy.series)
+                for i, s in ipairs(charts.allyArmy.series) do
+                    Spring.Echo("  series[" .. i .. "] label=" .. tostring(s.label) .. " value=" .. tostring(s.getValue()))
+                end
+
                 chartsReady    = true
                 lastUpdateTime = -UPDATE_INTERVAL  -- force immediate stat collection
                 Spring.Echo("BAR Charts: Team data ready, tracking " .. #Spring.GetTeamList(allyTeamID) .. " teams")
@@ -853,6 +879,10 @@ function widget:Update(dt)
 
         -- Snapshot data into all charts
         for _, chart in pairs(charts) do
+            -- debug chart ally army value collection
+            if chart.id == "chart-ally-army" then
+                Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
+            end
             chart:addDataPoint()
         end
     end
