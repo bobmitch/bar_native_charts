@@ -1,8 +1,6 @@
-# BAR Stats Charts Widget v2.0
+# BAR Stats Charts Widget v0.2
 
 Real-time resource and combat statistics overlay for Beyond All Reason, with **automatic save/load** and **multi-team comparison charts**.
-
-## 🆕 What's New in v2.0
 
 ### Automatic Position/Scale Persistence
 - ✅ **Auto-save on exit** - Chart positions, scales, and visibility saved automatically
