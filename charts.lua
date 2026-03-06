@@ -3,7 +3,8 @@
     BAR CHARTS WIDGET
     
     In-game overlay charts matching the streaming system aesthetic.
-    Displays real-time resource and combat statistics as animated line charts.
+    Displays real-time resource and combat statistics as animated line charts,
+    plus compact numeric stat cards.
     
     Features:
     - Metal Income/Usage chart
@@ -11,15 +12,23 @@
     - Damage Dealt/Taken chart
     - Army Value chart
     - K/D Ratio chart
+    - Team Army Values chart (multi-team)
+    - Team Build Power chart (multi-team)
+    - Numeric stat cards (Army Value, Units, Kills, Losses, DMG Dealt/Taken, Metal Lost)
     - Smooth animations with lerp interpolation
-    - Draggable, scalable, toggleable widgets
+    - Draggable, scalable, toggleable charts AND cards
+    - Auto-save/load layout on exit/start
     - Cyber/tech aesthetic matching streaming overlay
     
     Controls:
     - F9: Toggle all charts on/off
-    - Click+Drag: Move charts
-    - Mouse Wheel over chart: Scale size
-    - Right-click: Toggle individual chart
+    - Click+Drag: Move charts/cards
+    - Mouse Wheel over chart/card: Scale size
+    - Right-click: Toggle individual chart/card visibility
+    
+    Commands:
+    - /barcharts save   : Save layout immediately
+    - /barcharts reset  : Delete config and restore defaults
     
     Installation:
     Place in: /LuaUI/Widgets/
@@ -30,7 +39,7 @@
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics overlay charts",
+        desc      = "Real-time resource and combat statistics overlay charts and cards",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -99,12 +108,16 @@ local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
 local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 
+-- Stat card dimensions
+local CARD_WIDTH  = 140
+local CARD_HEIGHT = 70
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
 -------------------------------------------------------------------------------
 
 local charts        = {}
+local statCards     = {}   -- NEW: numeric stat cards
 local lastUpdateTime = 0
 local teamID        = nil
 local allyTeamID    = nil
@@ -117,9 +130,11 @@ local myTeamStats = {
     energyUsage  = 0,
     damageDealt  = 0,
     damageTaken  = 0,
-    armyValue    = 0,   -- maintained by unit callbacks
+    armyValue    = 0,
+    unitCount    = 0,
     kills        = 0,
     losses       = 0,
+    metalLost    = 0,
 }
 
 -------------------------------------------------------------------------------
@@ -241,6 +256,106 @@ local function drawRoundedRect(x, y, w, h, r, filled)
             end
         end)
     end
+end
+
+-------------------------------------------------------------------------------
+-- STAT CARD CLASS  (NEW)
+-------------------------------------------------------------------------------
+
+local StatCard = {}
+StatCard.__index = StatCard
+
+function StatCard.new(id, label, icon, x, y, color, getValue)
+    local self = setmetatable({}, StatCard)
+
+    self.id         = id
+    self.label      = label
+    self.icon       = icon
+    self.x          = x
+    self.y          = y
+    self.scale      = 1.0
+    self.enabled    = true
+    self.visible    = true
+    self.color      = color  -- accent color for the value text
+    self.getValue   = getValue
+
+    self.displayValue = 0
+    self.prevValue    = 0
+    self.targetValue  = 0
+    self.animProgress = 1.0
+    self.animStart    = 0
+
+    self.isDragging = false
+    self.dragStartX = 0
+    self.dragStartY = 0
+    self.isHovered  = false
+
+    return self
+end
+
+function StatCard:setTarget(value)
+    self.prevValue    = self.displayValue
+    self.targetValue  = value
+    self.animProgress = 0.0
+    self.animStart    = os.clock()
+end
+
+function StatCard:update(dt)
+    if self.animProgress < 1.0 then
+        local elapsed = os.clock() - self.animStart
+        self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
+        local ease = easeOutCubic(self.animProgress)
+        self.displayValue = self.prevValue + (self.targetValue - self.prevValue) * ease
+    end
+end
+
+function StatCard:draw()
+    if not self.enabled or not self.visible then return end
+
+    local w = CARD_WIDTH
+    local h = CARD_HEIGHT
+    local c = self.color
+
+    gl.PushMatrix()
+    gl.Translate(self.x, self.y, 0)
+    gl.Scale(self.scale, self.scale, 1)
+
+    -- Background
+    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
+    drawRoundedRect(0, 0, w, h, 4, true)
+
+    -- Border (hot or normal)
+    local bc = self.isHovered and COLOR.borderHot or COLOR.border
+    gl.Color(bc[1], bc[2], bc[3], bc[4])
+    gl.LineWidth(1)
+    drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
+
+    -- Left accent bar
+    gl.Color(c[1], c[2], c[3], 0.7)
+    gl.BeginEnd(GL.QUADS, function()
+        gl.Vertex(0,   4)
+        gl.Vertex(3,   4)
+        gl.Vertex(3,   h - 4)
+        gl.Vertex(0,   h - 4)
+    end)
+
+    -- Icon + label (top)
+    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+    gl.Text(self.icon .. "  " .. self.label, 10, h - 18, 9, "o")
+
+    -- Value (large, centered vertically in lower 2/3)
+    gl.Color(c[1], c[2], c[3], 1.0)
+    local valueStr = formatNumber(math.floor(self.displayValue + 0.5))
+    gl.Text(valueStr, w / 2 + 5, 10, 20, "co")
+
+    gl.PopMatrix()
+end
+
+function StatCard:isMouseOver(mx, my)
+    return mx >= self.x
+       and mx <= self.x + CARD_WIDTH  * self.scale
+       and my >= self.y
+       and my <= self.y + CARD_HEIGHT * self.scale
 end
 
 -------------------------------------------------------------------------------
@@ -390,10 +505,11 @@ function Chart:draw()
     local cW  = w - pad.left - pad.right
     local cH  = h - pad.top  - pad.bottom
 
-    gl.Color(COLOR.bg)
+    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    if self.isHovered then gl.Color(COLOR.borderHot) else gl.Color(COLOR.border) end
+    local bc = self.isHovered and COLOR.borderHot or COLOR.border
+    gl.Color(bc[1], bc[2], bc[3], bc[4])
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
 
@@ -429,13 +545,14 @@ function Chart:draw()
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
 
-        if i == 0 then gl.Color(COLOR.gridBase) else gl.Color(COLOR.grid) end
+        local gc = (i == 0) and COLOR.gridBase or COLOR.grid
+        gl.Color(gc[1], gc[2], gc[3], gc[4])
         gl.BeginEnd(GL.LINES, function()
             gl.Vertex(cX,      yPos)
             gl.Vertex(cX + cW, yPos)
         end)
 
-        gl.Color(COLOR.muted)
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
         gl.Text(formatYAxis(v, self.chartType == "ratio" and "ratio" or "normal"), cX - 5, yPos - 4, 9, "ro")
     end
 
@@ -510,7 +627,7 @@ function Chart:draw()
 end
 
 function Chart:drawHeader(w, h)
-    gl.Color(COLOR.muted)
+    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, PADDING.left + 2, h - PADDING.top - 10, 10, "o")
 end
 
@@ -526,8 +643,6 @@ function Chart:isMouseOver(mx, my)
        and my <= self.y + self.height * self.scale
 end
 
-
-
 -------------------------------------------------------------------------------
 -- ARMY VALUE HELPERS  (callback-driven, no per-tick iteration)
 -------------------------------------------------------------------------------
@@ -538,7 +653,6 @@ local function unitMetalCost(unitDefID)
     return ud and (ud.metalCost or 0) or 0
 end
 
--- Seed army values by iterating units ONCE (called only at chartsReady time)
 local function seedArmyValues()
     myTeamStats.armyValue = 0
     local myUnits = Spring.GetTeamUnits(teamID) or {}
@@ -551,7 +665,7 @@ local function seedArmyValues()
     end
 
     for tid, teamData in pairs(allyTeams) do
-        if tid ~= teamID then  -- already handled above
+        if tid ~= teamID then
             teamData.armyValue = 0
             local tUnits = Spring.GetTeamUnits(tid) or {}
             for _, uid in ipairs(tUnits) do
@@ -561,7 +675,6 @@ local function seedArmyValues()
     end
 end
 
--- Also seed build power once at start (still needs iteration, but only once)
 local function seedBuildPower()
     for tid, teamData in pairs(allyTeams) do
         teamData.buildPower = 0
@@ -575,14 +688,21 @@ local function seedBuildPower()
     end
 end
 
+-- Seed unit count
+local function seedUnitCount()
+    local myUnits = Spring.GetTeamUnits(teamID) or {}
+    myTeamStats.unitCount = #myUnits
+end
+
 -------------------------------------------------------------------------------
--- UNIT EVENT CALLBACKS  (army value maintenance)
+-- UNIT EVENT CALLBACKS
 -------------------------------------------------------------------------------
 
 function widget:UnitFinished(unitID, unitDefID, unitTeam)
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
+        myTeamStats.unitCount = myTeamStats.unitCount + 1
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = allyTeams[unitTeam].armyValue + cost
@@ -594,13 +714,21 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     end
 end
 
-function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
+function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam)
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
+        myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
+        myTeamStats.losses    = myTeamStats.losses + 1
+        myTeamStats.metalLost = myTeamStats.metalLost + cost
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
+    end
+
+    -- Credit kill to attacker's team
+    if attackerTeam == teamID and attackerTeam ~= unitTeam then
+        myTeamStats.kills = myTeamStats.kills + 1
     end
 
     local ud = UnitDefs[unitDefID]
@@ -612,21 +740,20 @@ end
 function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     local cost = unitMetalCost(unitDefID)
 
-    -- Remove from old team
     if oldTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
+        myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
     elseif allyTeams[oldTeam] then
         allyTeams[oldTeam].armyValue = math.max(0, allyTeams[oldTeam].armyValue - cost)
     end
 
-    -- Add to new team
     if newTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
+        myTeamStats.unitCount = myTeamStats.unitCount + 1
     elseif allyTeams[newTeam] then
         allyTeams[newTeam].armyValue = allyTeams[newTeam].armyValue + cost
     end
 
-    -- Build power transfer
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder then
         local bp = ud.buildSpeed or 0
@@ -690,7 +817,7 @@ end
 -------------------------------------------------------------------------------
 
 local function saveConfig()
-    local config = { version = "1.0", enabled = chartsEnabled, charts = {} }
+    local config = { version = "1.0", enabled = chartsEnabled, charts = {}, cards = {} }
 
     for id, chart in pairs(charts) do
         config.charts[id] = {
@@ -699,6 +826,16 @@ local function saveConfig()
             scale   = chart.scale,
             visible = chart.visible,
             enabled = chart.enabled,
+        }
+    end
+
+    for id, card in pairs(statCards) do
+        config.cards[id] = {
+            x       = card.x,
+            y       = card.y,
+            scale   = card.scale,
+            visible = card.visible,
+            enabled = card.enabled,
         }
     end
 
@@ -713,25 +850,25 @@ local function saveConfig()
 end
 
 local function loadConfig()
-    if not VFS.FileExists(CONFIG_FILE) then return {} end
+    if not VFS.FileExists(CONFIG_FILE) then return {}, {} end
 
     local fileContent = VFS.LoadFile(CONFIG_FILE)
-    if not fileContent then return {} end
+    if not fileContent then return {}, {} end
 
     local chunk, err = loadstring(fileContent)
     if not chunk then
         Spring.Echo("BAR Charts: Parse error: " .. tostring(err))
-        return {}
+        return {}, {}
     end
 
     local ok, result = pcall(chunk)
     if not ok or type(result) ~= "table" then
         Spring.Echo("BAR Charts: Invalid config")
-        return {}
+        return {}, {}
     end
 
     if result.enabled ~= nil then chartsEnabled = result.enabled end
-    return result.charts or {}
+    return result.charts or {}, result.cards or {}
 end
 
 local savedChartConfig = nil
@@ -747,7 +884,10 @@ function widget:Initialize()
     allyTeamID   = Spring.GetMyAllyTeamID()
     chartsReady  = false
 
-    charts = {}
+    charts   = {}
+    statCards = {}
+
+    -- ── LINE CHARTS ──────────────────────────────────────────────────────────
 
     charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 230, "dual", {
         { label = "Income", color = COLOR.accent,  getValue = function() return myTeamStats.metalIncome end },
@@ -778,16 +918,93 @@ function widget:Initialize()
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",  vsx - 970, vsy - 430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧", vsx - 1280, vsy - 230, "multi", {}, true)
 
-    -- Apply saved config (positions, visibility, scale)
-    local configData = loadConfig() or {}
-    for id, cfg in pairs(type(configData) == "table" and configData or {}) do
-        local chart = charts[id]
+    -- ── NUMERIC STAT CARDS ───────────────────────────────────────────────────
+    -- Two columns of cards, right side, below the charts
+    -- Charts bottom edge is around vsy - 430 - CHART_HEIGHT(180) = vsy - 610
+    -- Place cards starting just below that with a small gap
+    local cardY    = vsy - 650   -- top card bottom edge, below charts
+    local cardStep = 80          -- CARD_HEIGHT(70) + 10px gap
+    local col1X    = vsx - 350   -- aligns with chart-metal left edge
+    local col2X    = vsx - 200   -- second column
+
+    statCards["card-army-value"] = StatCard.new(
+        "card-army-value", "ARMY VALUE", "⚙",
+        col1X, cardY,
+        COLOR.accent,
+        function() return myTeamStats.armyValue end
+    )
+
+    statCards["card-unit-count"] = StatCard.new(
+        "card-unit-count", "UNITS", "▣",
+        col2X, cardY,
+        COLOR.accent,
+        function() return myTeamStats.unitCount end
+    )
+
+    statCards["card-kills"] = StatCard.new(
+        "card-kills", "KILLS", "✕",
+        col1X, cardY - cardStep,
+        COLOR.success,
+        function() return myTeamStats.kills end
+    )
+
+    statCards["card-losses"] = StatCard.new(
+        "card-losses", "LOSSES", "↓",
+        col2X, cardY - cardStep,
+        COLOR.danger,
+        function() return myTeamStats.losses end
+    )
+
+    statCards["card-dmg-dealt"] = StatCard.new(
+        "card-dmg-dealt", "DMG DEALT", "▲",
+        col1X, cardY - cardStep * 2,
+        COLOR.success,
+        function() return myTeamStats.damageDealt end
+    )
+
+    statCards["card-dmg-taken"] = StatCard.new(
+        "card-dmg-taken", "DMG TAKEN", "▼",
+        col2X, cardY - cardStep * 2,
+        COLOR.danger,
+        function() return myTeamStats.damageTaken end
+    )
+
+    statCards["card-metal-lost"] = StatCard.new(
+        "card-metal-lost", "METAL LOST", "◆",
+        col1X, cardY - cardStep * 3,
+        COLOR.gold,
+        function() return myTeamStats.metalLost end
+    )
+
+    -- ── APPLY SAVED CONFIG ───────────────────────────────────────────────────
+
+    local chartCfg, cardCfg = loadConfig()
+
+    -- Charts are stored by short key (charts.metal) but config keys are the .id strings
+    -- Build a lookup from id -> chart object first
+    local chartById = {}
+    for _, chart in pairs(charts) do
+        chartById[chart.id] = chart
+    end
+    for id, cfg in pairs(type(chartCfg) == "table" and chartCfg or {}) do
+        local chart = chartById[id]
         if chart and type(cfg) == "table" then
             chart.x     = cfg.x     or chart.x
             chart.y     = cfg.y     or chart.y
             chart.scale = cfg.scale or chart.scale
             if cfg.visible ~= nil then chart.visible = cfg.visible end
             if cfg.enabled ~= nil then chart.enabled = cfg.enabled end
+        end
+    end
+
+    for id, cfg in pairs(type(cardCfg) == "table" and cardCfg or {}) do
+        local card = statCards[id]
+        if card and type(cfg) == "table" then
+            card.x     = cfg.x     or card.x
+            card.y     = cfg.y     or card.y
+            card.scale = cfg.scale or card.scale
+            if cfg.visible ~= nil then card.visible = cfg.visible end
+            if cfg.enabled ~= nil then card.enabled = cfg.enabled end
         end
     end
 
@@ -809,11 +1026,10 @@ function widget:Update(dt)
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
 
-                -- Seed army values and build power from current units (one-time iteration)
                 seedArmyValues()
                 seedBuildPower()
+                seedUnitCount()
 
-                -- DEBUG
                 for tid, teamData in pairs(allyTeams) do
                     Spring.Echo("Seeded tid=" .. tostring(tid) .. " armyValue=" .. tostring(teamData.armyValue))
                 end
@@ -823,16 +1039,19 @@ function widget:Update(dt)
                 end
 
                 chartsReady    = true
-                lastUpdateTime = -UPDATE_INTERVAL  -- force immediate stat collection
+                lastUpdateTime = -UPDATE_INTERVAL
                 Spring.Echo("BAR Charts: Team data ready, tracking " .. #Spring.GetTeamList(allyTeamID) .. " teams")
             end
         end
         return
     end
 
-    -- Animate charts every frame
+    -- Animate charts and cards every frame
     for _, chart in pairs(charts) do
         chart:update(dt)
+    end
+    for _, card in pairs(statCards) do
+        card:update(dt)
     end
 
     -- Collect stats at regular intervals
@@ -859,31 +1078,30 @@ function widget:Update(dt)
             myTeamStats.damageTaken = dmg_taken or 0
         end
 
-        if Spring.GetTeamUnitStats then
-            local u_killed, u_died = Spring.GetTeamUnitStats(teamID)
-            myTeamStats.kills  = u_killed or 0
-            myTeamStats.losses = u_died   or 0
-        end
+        -- Note: kills, losses, unitCount, armyValue, metalLost are maintained
+        -- incrementally by unit event callbacks — no poll needed here.
 
-        -- Ally team resource stats only (army value maintained by callbacks)
+        -- Ally team resource stats
         if type(allyTeams) == "table" then
             for tid, teamData in pairs(allyTeams) do
                 local tm_inc, tm_use = Spring.GetTeamResourceStats(tid, "metal")
                 local te_inc, te_use = Spring.GetTeamResourceStats(tid, "energy")
                 teamData.metalIncome  = tm_inc or 0
                 teamData.energyIncome = te_inc or 0
-                -- NOTE: armyValue and buildPower are NOT updated here,
-                -- they are maintained incrementally by unit event callbacks.
             end
         end
 
-        -- Snapshot data into all charts
+        -- Push new data points into all charts
         for _, chart in pairs(charts) do
-            -- debug chart ally army value collection
             if chart.id == "chart-ally-army" then
                 Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
             end
             chart:addDataPoint()
+        end
+
+        -- Push new values into stat cards (triggers animation)
+        for _, card in pairs(statCards) do
+            card:setTarget(card.getValue())
         end
     end
 end
@@ -895,8 +1113,13 @@ end
 function widget:GameStart()
     chartsReady    = false
     lastUpdateTime = 0
-    -- Reset army values so seeding starts clean
-    myTeamStats.armyValue = 0
+    myTeamStats.armyValue  = 0
+    myTeamStats.unitCount  = 0
+    myTeamStats.kills      = 0
+    myTeamStats.losses     = 0
+    myTeamStats.metalLost  = 0
+    myTeamStats.damageDealt = 0
+    myTeamStats.damageTaken = 0
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue  = 0
         teamData.buildPower = 0
@@ -911,13 +1134,16 @@ end
 function widget:DrawScreen()
     if not chartsEnabled then return end
 
-    gl.PushMatrix()
     for _, chart in pairs(charts) do
         chart:draw()
     end
+
+    for _, card in pairs(statCards) do
+        card:draw()
+    end
+
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
     gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
-    gl.PopMatrix()
 end
 
 -------------------------------------------------------------------------------
@@ -925,7 +1151,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:KeyPress(key, mods, isRepeat)
-    if key == Spring.GetKeyCode("f9") then  -- F9
+    if key == Spring.GetKeyCode("f9") then
         chartsEnabled = not chartsEnabled
         Spring.Echo("BAR Charts: " .. (chartsEnabled and "Enabled" or "Disabled"))
         return true
@@ -933,25 +1159,31 @@ function widget:KeyPress(key, mods, isRepeat)
     return false
 end
 
+-- Helper: check cards first, then charts (cards are smaller so check them first for precision)
+local function findHitElement(mx, my)
+    for id, card in pairs(statCards) do
+        if card:isMouseOver(mx, my) then return card, "card" end
+    end
+    for id, chart in pairs(charts) do
+        if chart:isMouseOver(mx, my) then return chart, "chart" end
+    end
+    return nil, nil
+end
+
 function widget:MousePress(mx, my, button)
     if not chartsEnabled then return false end
 
+    local elem, kind = findHitElement(mx, my)
+    if not elem then return false end
+
     if button == 1 then
-        for _, chart in pairs(charts) do
-            if chart:isMouseOver(mx, my) then
-                chart.isDragging = true
-                chart.dragStartX = mx - chart.x
-                chart.dragStartY = my - chart.y
-                return true
-            end
-        end
+        elem.isDragging = true
+        elem.dragStartX = mx - elem.x
+        elem.dragStartY = my - elem.y
+        return true
     elseif button == 3 then
-        for _, chart in pairs(charts) do
-            if chart:isMouseOver(mx, my) then
-                chart.visible = not chart.visible
-                return true
-            end
-        end
+        elem.visible = not elem.visible
+        return true
     end
 
     return false
@@ -961,11 +1193,11 @@ function widget:MouseRelease(mx, my, button)
     if not chartsEnabled then return false end
 
     if button == 1 then
+        for _, card in pairs(statCards) do
+            if card.isDragging then card.isDragging = false; return true end
+        end
         for _, chart in pairs(charts) do
-            if chart.isDragging then
-                chart.isDragging = false
-                return true
-            end
+            if chart.isDragging then chart.isDragging = false; return true end
         end
     end
 
@@ -974,6 +1206,14 @@ end
 
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
+
+    for _, card in pairs(statCards) do
+        if card.isDragging then
+            card.x = mx - card.dragStartX
+            card.y = my - card.dragStartY
+            return true
+        end
+    end
 
     for _, chart in pairs(charts) do
         if chart.isDragging then
@@ -984,10 +1224,15 @@ function widget:MouseMove(mx, my, dx, dy)
     end
 
     local anyHovered = false
+    for _, card in pairs(statCards) do
+        card.isHovered = card:isMouseOver(mx, my)
+        if card.isHovered then anyHovered = true end
+    end
     for _, chart in pairs(charts) do
         chart.isHovered = chart:isMouseOver(mx, my)
         if chart.isHovered then anyHovered = true end
     end
+
     return anyHovered
 end
 
@@ -995,6 +1240,15 @@ function widget:MouseWheel(up, value)
     if not chartsEnabled then return false end
 
     local mx, my = Spring.GetMouseState()
+
+    for _, card in pairs(statCards) do
+        if card:isMouseOver(mx, my) then
+            card.scale = up and math.min(2.0, card.scale + 0.1)
+                            or  math.max(0.5, card.scale - 0.1)
+            return true
+        end
+    end
+
     for _, chart in pairs(charts) do
         if chart:isMouseOver(mx, my) then
             chart.scale = up and math.min(2.0, chart.scale + 0.1)
@@ -1017,6 +1271,10 @@ function widget:ViewResize()
             chart.x = chart.x * ratioX
             chart.y = chart.y * ratioY
         end
+        for _, card in pairs(statCards) do
+            card.x = card.x * ratioX
+            card.y = card.y * ratioY
+        end
     end
 end
 
@@ -1028,6 +1286,21 @@ function widget:TextCommand(command)
     elseif command == "barcharts reset" then
         os.remove(CONFIG_FILE)
         Spring.Echo("BAR Charts: Configuration reset - restart widget to apply")
+        return true
+    elseif command == "barcharts debug" then
+        Spring.Echo("=== BAR Charts Debug ===")
+        Spring.Echo("vsx=" .. tostring(vsx) .. " vsy=" .. tostring(vsy))
+        Spring.Echo("chartsEnabled=" .. tostring(chartsEnabled) .. " chartsReady=" .. tostring(chartsReady))
+        Spring.Echo("-- CARDS --")
+        for id, card in pairs(statCards) do
+            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s enabled=%s",
+                id, card.x, card.y, card.scale, tostring(card.visible), tostring(card.enabled)))
+        end
+        Spring.Echo("-- CHARTS --")
+        for _, chart in pairs(charts) do
+            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s",
+                chart.id, chart.x, chart.y, chart.scale, tostring(chart.visible)))
+        end
         return true
     end
     return false
