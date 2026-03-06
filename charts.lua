@@ -925,7 +925,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:KeyPress(key, mods, isRepeat)
-    if key == 0x120 then  -- F9
+    if key == Spring.GetKeyCode("f9") then  -- F9
         chartsEnabled = not chartsEnabled
         Spring.Echo("BAR Charts: " .. (chartsEnabled and "Enabled" or "Disabled"))
         return true
