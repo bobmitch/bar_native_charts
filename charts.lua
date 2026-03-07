@@ -87,12 +87,7 @@ local COLOR = {
     gold        = {0.941, 0.753, 0.251, 1.00},
 }
 
--- Conversion factor: buildspeed units → equivalent metal/s for chart overlay.
--- 300 buildspeed ≈ 20 metal/s  →  ratio = 15 buildspeed per metal/s.
--- This is an approximation — actual cost depends on what is being built —
--- but it lets buildpower and metal usage share a single axis for trend comparison.
-local BUILDSPEED_TO_METAL = 15
-
+local ANIM_DURATION   = 0.4
 local HISTORY_SIZE    = 60
 local UPDATE_INTERVAL = 10
 
@@ -103,6 +98,9 @@ local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH  = 140
 local CARD_HEIGHT = 70
 
+-- How often (seconds) to rebuild display lists during animation
+-- Lower = smoother animation but more rebuilds; 0.05 = 20fps rebuild during lerp
+local ANIM_REBUILD_INTERVAL = 0.05
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
@@ -118,22 +116,30 @@ local allyTeams  = {}
 -- Master display list handles
 local masterDisplayList   = nil   -- Compiled list of ALL chart+card draw calls
 local masterDirty         = true  -- Needs rebuild?
+local masterLastRebuild   = 0     -- Time of last rebuild (for anim throttle)
 local hoverDisplayList    = nil   -- Cheap per-frame hover border overlay
 
 local myTeamStats = {
-    metalIncome  = 0, metalUsage   = 0,
-    energyIncome = 0, energyUsage  = 0,
-    damageDealt  = 0, damageTaken  = 0,
-    armyValue    = 0, unitCount    = 0,
-    kills        = 0, losses       = 0,
-    metalLost    = 0,
-
-    totalBuildSpeed          = 0,   -- running total, maintained via unit events
+    metalIncome      = 0, metalUsage   = 0,
+    energyIncome     = 0, energyUsage  = 0,
+    damageDealt      = 0, damageTaken  = 0,
+    armyValue        = 0, unitCount    = 0,
+    kills            = 0, losses       = 0,
+    metalLost        = 0,
+    buildEfficiency  = 0,   -- 0–100 % of total build speed currently active
 }
+
+-- unitID → buildSpeed for every builder unit we own.
+-- Maintained incrementally via unit events; used to compute buildEfficiency.
+local builderUnits = {}
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
+
+local function easeOutCubic(t)
+    return 1 - math.pow(1 - t, 3)
+end
 
 local function formatNumber(n)
     if n >= 1000000 then return string.format("%.1fM", n / 1000000)
@@ -251,7 +257,8 @@ local function rebuildMasterList()
         gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
     end)
 
-    masterDirty = false
+    masterDirty       = false
+    masterLastRebuild = os.clock()
 end
 
 -- Rebuild the hover overlay list (just hot borders, no fills — very cheap)
@@ -305,6 +312,10 @@ function StatCard.new(id, label, icon, x, y, color, getValue)
     self.color        = color
     self.getValue     = getValue
     self.displayValue = 0
+    self.prevValue    = 0
+    self.targetValue  = 0
+    self.animProgress = 1.0
+    self.animStart    = 0
     self.isDragging   = false
     self.dragStartX   = 0
     self.dragStartY   = 0
@@ -312,9 +323,22 @@ function StatCard.new(id, label, icon, x, y, color, getValue)
     return self
 end
 
-function StatCard:setValue(value)
-    self.displayValue = value
-    masterDirty = true
+function StatCard:setTarget(value)
+    self.prevValue    = self.displayValue
+    self.targetValue  = value
+    self.animProgress = 0.0
+    self.animStart    = os.clock()
+    masterDirty       = true   -- will need a list rebuild
+end
+
+function StatCard:update(dt)
+    if self.animProgress < 1.0 then
+        local elapsed     = os.clock() - self.animStart
+        self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
+        local ease        = easeOutCubic(self.animProgress)
+        self.displayValue = self.prevValue + (self.targetValue - self.prevValue) * ease
+        masterDirty       = true
+    end
 end
 
 -- This is called INSIDE gl.CreateList — no conditional branches on isHovered here
@@ -378,6 +402,12 @@ function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     self.multiTeam   = multiTeam or false
     self.history     = {}
     for i = 1, #series do self.history[i] = {} end
+    self.displayData = {}
+    for i = 1, #series do self.displayData[i] = {} end
+    self.animProgress  = 1.0
+    self.animStartTime = 0
+    self.prevData      = {}
+    self.targetData    = {}
     self.isDragging    = false
     self.dragStartX    = 0
     self.dragStartY    = 0
@@ -388,6 +418,7 @@ end
 function Chart:rebuildMultiTeamSeries()
     if not self.multiTeam then return end
     self.history     = {}
+    self.displayData = {}
     self.series      = {}
     local idx = 1
     if type(allyTeams) == "table" then
@@ -415,8 +446,9 @@ function Chart:rebuildMultiTeamSeries()
                     return allyTeams[tid] and allyTeams[tid].energyIncome or 0
                 end
             end
-            self.series[idx]  = seriesConfig
-            self.history[idx] = {}
+            self.series[idx]      = seriesConfig
+            self.history[idx]     = {}
+            self.displayData[idx] = {}
             idx = idx + 1
         end
     end
@@ -430,7 +462,33 @@ function Chart:addDataPoint()
             table.remove(self.history[i], 1)
         end
     end
+    self.animProgress  = 0.0
+    self.animStartTime = os.clock()
+    for i = 1, #self.series do
+        self.prevData[i]   = {}
+        self.targetData[i] = {}
+        for j, v in ipairs(self.displayData[i]) do self.prevData[i][j]   = v end
+        for j, v in ipairs(self.history[i])     do self.targetData[i][j] = v end
+    end
     masterDirty = true
+end
+
+function Chart:update(dt)
+    if self.animProgress < 1.0 then
+        local elapsed     = os.clock() - self.animStartTime
+        self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
+        local ease        = easeOutCubic(self.animProgress)
+        for i = 1, #self.series do
+            local prev   = self.prevData[i]   or {}
+            local target = self.targetData[i] or {}
+            for j = 1, math.max(#prev, #target) do
+                local fromVal = prev[j]   or target[j] or 0
+                local toVal   = target[j] or fromVal
+                self.displayData[i][j] = fromVal + (toVal - fromVal) * ease
+            end
+        end
+        masterDirty = true
+    end
 end
 
 -- Called only inside gl.CreateList — no hover logic here
@@ -458,7 +516,7 @@ function Chart:drawToList()
 
     local hasData = false
     for i = 1, #self.series do
-        if #self.history[i] >= 2 then hasData = true; break end
+        if #self.displayData[i] >= 2 then hasData = true; break end
     end
 
     if not hasData then
@@ -472,7 +530,7 @@ function Chart:drawToList()
 
     local allValues = {}
     for i = 1, #self.series do
-        for _, v in ipairs(self.history[i]) do
+        for _, v in ipairs(self.displayData[i]) do
             if v and not (v ~= v) then table.insert(allValues, v) end
         end
     end
@@ -542,7 +600,7 @@ function Chart:drawToList()
 
     -- Series lines + fills
     for seriesIdx, s in ipairs(self.series) do
-        local data = self.history[seriesIdx]
+        local data = self.displayData[seriesIdx]
         if #data >= 2 then
             local color = s.color
 
@@ -646,7 +704,7 @@ local function seedArmyValues()
 end
 
 local function seedBuildPower()
-    myTeamStats.totalBuildSpeed = 0
+    builderUnits = {}
     for tid, teamData in pairs(allyTeams) do
         teamData.buildPower = 0
         local tUnits = Spring.GetTeamUnits(tid) or {}
@@ -656,7 +714,7 @@ local function seedBuildPower()
                 local bp = ud.buildSpeed or 0
                 teamData.buildPower = teamData.buildPower + bp
                 if tid == teamID then
-                    myTeamStats.totalBuildSpeed = myTeamStats.totalBuildSpeed + bp
+                    builderUnits[uid] = bp
                 end
             end
         end
@@ -677,9 +735,9 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     local ud   = UnitDefs[unitDefID]
     local bp   = (ud and ud.isBuilder) and (ud.buildSpeed or 0) or 0
     if unitTeam == teamID then
-        myTeamStats.armyValue      = myTeamStats.armyValue + cost
-        myTeamStats.unitCount      = myTeamStats.unitCount + 1
-        myTeamStats.totalBuildSpeed = myTeamStats.totalBuildSpeed + bp
+        myTeamStats.armyValue = myTeamStats.armyValue + cost
+        myTeamStats.unitCount = myTeamStats.unitCount + 1
+        if bp > 0 then builderUnits[unitID] = bp end
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue  = allyTeams[unitTeam].armyValue + cost
@@ -699,6 +757,7 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
         myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
         myTeamStats.metalLost = myTeamStats.metalLost + cost
+        builderUnits[unitID] = nil
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
@@ -706,9 +765,6 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder then
         local bp = ud.buildSpeed or 0
-        if unitTeam == teamID then
-            myTeamStats.totalBuildSpeed = math.max(0, myTeamStats.totalBuildSpeed - bp)
-        end
         if allyTeams[unitTeam] then
             allyTeams[unitTeam].buildPower = math.max(0, allyTeams[unitTeam].buildPower - bp)
         end
@@ -720,6 +776,7 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     if oldTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
         myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
+        builderUnits[unitID] = nil
     elseif allyTeams[oldTeam] then
         allyTeams[oldTeam].armyValue = math.max(0, allyTeams[oldTeam].armyValue - cost)
     end
@@ -732,11 +789,7 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder then
         local bp = ud.buildSpeed or 0
-        if oldTeam == teamID then
-            myTeamStats.totalBuildSpeed = math.max(0, myTeamStats.totalBuildSpeed - bp)
-        elseif newTeam == teamID then
-            myTeamStats.totalBuildSpeed = myTeamStats.totalBuildSpeed + bp
-        end
+        if newTeam == teamID then builderUnits[unitID] = bp end
         if allyTeams[oldTeam] then allyTeams[oldTeam].buildPower = math.max(0, allyTeams[oldTeam].buildPower - bp) end
         if allyTeams[newTeam] then allyTeams[newTeam].buildPower = allyTeams[newTeam].buildPower + bp end
     end
@@ -781,28 +834,6 @@ local function initAllyTeams()
     allyTeams = newAllyTeams
     return true
 end
-
--------------------------------------------------------------------------------
--- BUILD CAPACITY HELPER
--------------------------------------------------------------------------------
-
--- Returns the total metal/s all builder units could consume if fully tasked
--- and fully supplied. This is the theoretical ceiling regardless of whether
--- builders currently have orders or whether metal income is sufficient.
--- buildSpeed in UnitDefs is already denominated in metal/s.
--- Build power is tracked via Spring.GetTeamResources "pull" and "expense":
---   pull    = metal/s currently being requested by ALL builders with active orders
---   expense = metal/s actually being delivered to those builders
---
--- "pull" is the team-level aggregate in one API call — no unit iteration needed.
--- It naturally reflects active build demand: idle builders (no orders) contribute
--- zero pull, busy builders contribute their full demand.
---
--- This gives us two clean metrics from a single call:
---   pull              = build power currently in use (metal/s demand)
---   expense / pull    = metal supply efficiency (are you stalling?)
---
-
 
 -------------------------------------------------------------------------------
 -- CONFIG SAVE / LOAD
@@ -893,12 +924,9 @@ function widget:Initialize()
         end },
     })
 
-    charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILD POWER vs METAL USE", "🔧", vsx - 970, vsy - 430, "dual", {
-        { label = "Metal Used",  color = COLOR.accent2, getValue = function()
-            return myTeamStats.metalUsage
-        end },
-        { label = "BP equiv.",   color = COLOR.gold,    getValue = function()
-            return myTeamStats.totalBuildSpeed / BUILDSPEED_TO_METAL
+    charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILDER EFFICIENCY", "🔧", vsx - 970, vsy - 430, "percent", {
+        { label = "Efficiency", color = COLOR.gold, getValue = function()
+            return myTeamStats.buildEfficiency
         end },
     })
 
@@ -979,9 +1007,28 @@ function widget:Update(dt)
         return
     end
 
-    -- Rebuild display list immediately when dirty
+    -- Animate all charts/cards — they set masterDirty if still in motion
+    local anyAnimating = false
+    for _, chart in pairs(charts) do
+        chart:update(dt)
+        if chart.animProgress < 1.0 then anyAnimating = true end
+    end
+    for _, card in pairs(statCards) do
+        card:update(dt)
+        if card.animProgress < 1.0 then anyAnimating = true end
+    end
+
+    -- Throttle display list rebuilds during animation to ~20fps
     if masterDirty then
-        rebuildMasterList()
+        local now = os.clock()
+        if anyAnimating then
+            if now - masterLastRebuild >= ANIM_REBUILD_INTERVAL then
+                rebuildMasterList()
+            end
+        else
+            -- Not animating: rebuild immediately (data just changed)
+            rebuildMasterList()
+        end
     end
 
     -- Periodic data fetch (every 10s)
@@ -1010,6 +1057,21 @@ function widget:Update(dt)
         myTeamStats.energyIncome = e_income  or 0
         myTeamStats.energyUsage  = e_expense or 0
 
+        -- Compute builder efficiency: sum buildSpeed of currently-building units
+        -- divided by total buildSpeed of all builder units we own.
+        -- Spring.GetUnitIsBuilding returns a unitDefID (truthy) when building, nil when idle.
+        do
+            local totalBP  = 0
+            local activeBP = 0
+            for uid, bp in pairs(builderUnits) do
+                totalBP = totalBP + bp
+                if Spring.GetUnitIsBuilding(uid) then
+                    activeBP = activeBP + bp
+                end
+            end
+            myTeamStats.buildEfficiency = totalBP > 0 and (activeBP / totalBP * 100) or 0
+        end
+
         if Spring.GetTeamDamageStats then
             local dmg_dealt, dmg_taken = Spring.GetTeamDamageStats(teamID)
             myTeamStats.damageDealt = dmg_dealt or 0
@@ -1034,9 +1096,9 @@ function widget:Update(dt)
         end
 
         for _, chart in pairs(charts) do chart:addDataPoint() end
-        for _, card  in pairs(statCards) do card:setValue(card.getValue()) end
+        for _, card  in pairs(statCards) do card:setTarget(card.getValue()) end
 
-        masterDirty = true
+        masterDirty = true  -- force immediate rebuild (no animation yet)
     end
 end
 
@@ -1050,8 +1112,8 @@ function widget:GameStart()
     myTeamStats.armyValue      = 0; myTeamStats.unitCount      = 0
     myTeamStats.kills          = 0; myTeamStats.losses         = 0
     myTeamStats.metalLost      = 0; myTeamStats.damageDealt     = 0
-    myTeamStats.damageTaken    = 0
-    myTeamStats.totalBuildSpeed = 0
+    myTeamStats.damageTaken    = 0; myTeamStats.buildEfficiency = 0
+    builderUnits = {}
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue = 0; teamData.buildPower = 0
     end
@@ -1242,30 +1304,24 @@ function widget:TextCommand(command)
         end
         return true
     elseif command == "barcharts bp" then
-        -- Raw build efficiency diagnostic — type /barcharts bp in-game while building
-        Spring.Echo("=== Build Efficiency Diagnostic ===")
-        local m_level, m_storage, m_pull, m_income, m_expense, m_share = Spring.GetTeamResources(teamID, "metal")
-        Spring.Echo(string.format("  GetTeamResources metal: level=%.1f storage=%.1f pull=%.3f income=%.3f expense=%.3f share=%.3f",
-            m_level or -1, m_storage or -1, m_pull or -1, m_income or -1, m_expense or -1, m_share or -1))
-        local unitCount = 0
+        -- Builder efficiency diagnostic — type /barcharts bp in-game while building
+        Spring.Echo("=== Builder Efficiency Diagnostic ===")
+        local totalBP  = 0
+        local activeBP = 0
         local builderCount = 0
-        local totalBuildSpeed = 0
-        local myUnits = Spring.GetTeamUnits(teamID) or {}
-        unitCount = #myUnits
-        for _, uid in ipairs(myUnits) do
-            local udid = Spring.GetUnitDefID(uid)
-            if udid then
-                local ud = UnitDefs[udid]
-                if ud and ud.isBuilder then
-                    builderCount = builderCount + 1
-                    totalBuildSpeed = totalBuildSpeed + (ud.buildSpeed or 0)
-                    Spring.Echo(string.format("    builder: %s  buildSpeed=%.1f  isBuilder=%s",
-                        ud.name or "?", ud.buildSpeed or 0, tostring(ud.isBuilder)))
-                end
-            end
+        for uid, bp in pairs(builderUnits) do
+            builderCount = builderCount + 1
+            totalBP = totalBP + bp
+            local isBuilding = Spring.GetUnitIsBuilding(uid)
+            if isBuilding then activeBP = activeBP + bp end
+            local ud = UnitDefs[Spring.GetUnitDefID(uid) or 0]
+            Spring.Echo(string.format("    uid=%d  name=%s  bp=%.1f  building=%s",
+                uid, ud and ud.name or "?", bp, tostring(isBuilding ~= nil)))
         end
-        Spring.Echo(string.format("  units=%d  builders=%d  totalBuildSpeed(UnitDefs)=%.1f", unitCount, builderCount, totalBuildSpeed))
-        Spring.Echo(string.format("  totalBuildSpeed(running)=%.1f", myTeamStats.totalBuildSpeed))
+        local eff = totalBP > 0 and (activeBP / totalBP * 100) or 0
+        Spring.Echo(string.format("  builders=%d  totalBP=%.1f  activeBP=%.1f  efficiency=%.1f%%",
+            builderCount, totalBP, activeBP, eff))
+        Spring.Echo(string.format("  myTeamStats.buildEfficiency=%.1f%%", myTeamStats.buildEfficiency))
         return true
     end
     return false
