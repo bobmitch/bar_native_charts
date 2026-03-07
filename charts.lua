@@ -133,6 +133,13 @@ local myTeamStats = {
 -- Maintained incrementally via unit events; used to compute buildEfficiency.
 local builderUnits = {}
 
+-- Per-tick accumulators for builder efficiency.
+-- Every GameFrame we add (activeBP / totalBP) as a fractional sample so that
+-- the graph point reflects average efficiency over the full update interval
+-- rather than a single spot-check at collection time.
+local beff_activeTicks = 0   -- sum of (activeBP / totalBP) samples
+local beff_sampleCount = 0   -- number of ticks sampled
+
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
@@ -1057,20 +1064,15 @@ function widget:Update(dt)
         myTeamStats.energyIncome = e_income  or 0
         myTeamStats.energyUsage  = e_expense or 0
 
-        -- Compute builder efficiency: sum buildSpeed of currently-building units
-        -- divided by total buildSpeed of all builder units we own.
-        -- Spring.GetUnitIsBuilding returns a unitDefID (truthy) when building, nil when idle.
-        do
-            local totalBP  = 0
-            local activeBP = 0
-            for uid, bp in pairs(builderUnits) do
-                totalBP = totalBP + bp
-                if Spring.GetUnitIsBuilding(uid) then
-                    activeBP = activeBP + bp
-                end
-            end
-            myTeamStats.buildEfficiency = totalBP > 0 and (activeBP / totalBP * 100) or 0
-        end
+        -- Builder efficiency: average of per-tick samples accumulated since last
+        -- graph update via widget:GameFrame(). Each tick contributes activeBP/totalBP
+        -- so the result is weighted by build speed and averaged over real play time,
+        -- not a single spot-check. Reset accumulators after consuming.
+        myTeamStats.buildEfficiency = beff_sampleCount > 0
+            and (beff_activeTicks / beff_sampleCount * 100)
+            or  0
+        beff_activeTicks = 0
+        beff_sampleCount = 0
 
         if Spring.GetTeamDamageStats then
             local dmg_dealt, dmg_taken = Spring.GetTeamDamageStats(teamID)
@@ -1103,6 +1105,32 @@ function widget:Update(dt)
 end
 
 -------------------------------------------------------------------------------
+-- PER-TICK BUILDER EFFICIENCY SAMPLING
+-------------------------------------------------------------------------------
+
+-- Called every simulation tick (30 Hz). We compute activeBP/totalBP for this
+-- tick and accumulate it so widget:Update can average over the full interval.
+-- Keeping the math minimal: one pass over builderUnits (typically <20 entries),
+-- two divisions, two additions — negligible cost even at 30 Hz.
+function widget:GameFrame(frame)
+    if not chartsReady then return end
+
+    local totalBP  = 0
+    local activeBP = 0
+    for uid, bp in pairs(builderUnits) do
+        totalBP = totalBP + bp
+        if Spring.GetUnitIsBuilding(uid) then
+            activeBP = activeBP + bp
+        end
+    end
+
+    if totalBP > 0 then
+        beff_activeTicks = beff_activeTicks + (activeBP / totalBP)
+        beff_sampleCount = beff_sampleCount + 1
+    end
+end
+
+-------------------------------------------------------------------------------
 -- GAME START
 -------------------------------------------------------------------------------
 
@@ -1113,7 +1141,9 @@ function widget:GameStart()
     myTeamStats.kills          = 0; myTeamStats.losses         = 0
     myTeamStats.metalLost      = 0; myTeamStats.damageDealt     = 0
     myTeamStats.damageTaken    = 0; myTeamStats.buildEfficiency = 0
-    builderUnits = {}
+    builderUnits     = {}
+    beff_activeTicks = 0
+    beff_sampleCount = 0
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue = 0; teamData.buildPower = 0
     end
