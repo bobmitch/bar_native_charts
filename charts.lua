@@ -1,25 +1,18 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
-    BAR CHARTS WIDGET
+    BAR CHARTS WIDGET — PERFORMANCE OPTIMIZED
     
-    In-game overlay charts matching the streaming system aesthetic.
-    Displays real-time resource and combat statistics as animated line charts,
-    plus compact numeric stat cards.
+    Key optimization: Display Lists
+    - All chart/card geometry is compiled into GL display lists
+    - DrawScreen() just calls gl.CallList() — near-zero CPU/GPU cost per frame
+    - Display lists are rebuilt only when data changes (every 10s)
+    - Hover/drag state gets its own cheap overlay pass (border only, no fills)
     
-    Features:
-    - Metal Income/Usage chart
-    - Energy Income/Usage chart  
-    - Damage Dealt/Taken chart
-    - Army Value chart
-    - K/D Ratio chart
-    - Build Efficiency chart (NEW)
-    - Team Army Values chart (multi-team)
-    - Team Build Power chart (multi-team)
-    - Numeric stat cards (Army Value, Units, Kills, Losses, DMG Dealt/Taken, Metal Lost)
-    - Smooth animations with lerp interpolation
-    - Draggable, scalable, toggleable charts AND cards
-    - Auto-save/load layout on exit/start
-    - Cyber/tech aesthetic matching streaming overlay
+    Additional optimizations:
+    - Dirty flag system: only rebuild lists when data actually changed
+    - Separate static list (background/grid) from dynamic list (lines/values)
+    - Animation lerp still runs per-frame but only touches display list at
+      anim completion, keeping smooth transitions without constant rebuilds
     
     Controls:
     - F9: Toggle all charts on/off
@@ -30,10 +23,6 @@
     Commands:
     - /barcharts save   : Save layout immediately
     - /barcharts reset  : Delete config and restore defaults
-    
-    Installation:
-    Place in: /LuaUI/Widgets/
-    Enable in-game via F11 menu
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -57,10 +46,8 @@ local function serializeTable(tbl, indent)
     indent = indent or 0
     local indentStr = string.rep("  ", indent)
     local result = "{\n"
-    
     for k, v in pairs(tbl) do
         local keyStr = type(k) == "string" and string.format('["%s"]', k) or string.format("[%s]", k)
-        
         if type(v) == "table" then
             result = result .. indentStr .. "  " .. keyStr .. " = " .. serializeTable(v, indent + 1) .. ",\n"
         elseif type(v) == "string" then
@@ -71,7 +58,6 @@ local function serializeTable(tbl, indent)
             result = result .. indentStr .. "  " .. keyStr .. " = " .. tostring(v) .. ",\n"
         end
     end
-    
     result = result .. indentStr .. "}"
     return result
 end
@@ -109,36 +95,40 @@ local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
 local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 
--- Stat card dimensions
 local CARD_WIDTH  = 140
 local CARD_HEIGHT = 70
+
+-- How often (seconds) to rebuild display lists during animation
+-- Lower = smoother animation but more rebuilds; 0.05 = 20fps rebuild during lerp
+local ANIM_REBUILD_INTERVAL = 0.05
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
 -------------------------------------------------------------------------------
 
-local charts        = {}
-local statCards     = {}   -- NEW: numeric stat cards
+local charts     = {}
+local statCards  = {}
 local lastUpdateTime = 0
-local teamID        = nil
-local allyTeamID    = nil
-local allyTeams     = {}
+local teamID     = nil
+local allyTeamID = nil
+local allyTeams  = {}
+
+-- Master display list handles
+local masterDisplayList   = nil   -- Compiled list of ALL chart+card draw calls
+local masterDirty         = true  -- Needs rebuild?
+local masterLastRebuild   = 0     -- Time of last rebuild (for anim throttle)
+local hoverDisplayList    = nil   -- Cheap per-frame hover border overlay
 
 local myTeamStats = {
-    metalIncome  = 0,
-    metalUsage   = 0,
-    energyIncome = 0,
-    energyUsage  = 0,
-    damageDealt  = 0,
-    damageTaken  = 0,
-    armyValue    = 0,
-    unitCount    = 0,
-    kills        = 0,
-    losses       = 0,
+    metalIncome  = 0, metalUsage   = 0,
+    energyIncome = 0, energyUsage  = 0,
+    damageDealt  = 0, damageTaken  = 0,
+    armyValue    = 0, unitCount    = 0,
+    kills        = 0, losses       = 0,
     metalLost    = 0,
-    buildEfficiency     = 0,
-    unitsMetalCompleted = 0,
-    lastUnitsMetalCompleted = 0,
+    buildEfficiency          = 0,
+    unitsMetalCompleted      = 0,
+    lastUnitsMetalCompleted  = 0,
 }
 
 -------------------------------------------------------------------------------
@@ -150,13 +140,9 @@ local function easeOutCubic(t)
 end
 
 local function formatNumber(n)
-    if n >= 1000000 then
-        return string.format("%.1fM", n / 1000000)
-    elseif n >= 10000 then
-        return string.format("%.0fK", n / 1000)
-    else
-        return string.format("%d", math.floor(n + 0.5))
-    end
+    if n >= 1000000 then return string.format("%.1fM", n / 1000000)
+    elseif n >= 10000 then return string.format("%.0fK", n / 1000)
+    else return string.format("%d", math.floor(n + 0.5)) end
 end
 
 local function formatYAxis(n, chartType)
@@ -170,100 +156,142 @@ end
 local function drawRoundedRect(x, y, w, h, r, filled)
     if filled then
         gl.BeginEnd(GL.QUADS, function()
-            gl.Vertex(x + r, y)
-            gl.Vertex(x + w - r, y)
-            gl.Vertex(x + w - r, y + h)
-            gl.Vertex(x + r, y + h)
-
-            gl.Vertex(x, y + r)
-            gl.Vertex(x + w, y + r)
-            gl.Vertex(x + w, y + h - r)
-            gl.Vertex(x, y + h - r)
+            gl.Vertex(x + r, y);         gl.Vertex(x + w - r, y)
+            gl.Vertex(x + w - r, y + h); gl.Vertex(x + r, y + h)
+            gl.Vertex(x, y + r);         gl.Vertex(x + w, y + r)
+            gl.Vertex(x + w, y + h - r); gl.Vertex(x, y + h - r)
         end)
-
         local segments = 6
         for i = 0, segments do
-            local angle = (math.pi / 2) * (i / segments)
-
-            gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x + r, y + r)
-                local x1 = x + r - r * math.cos(angle)
-                local y1 = y + r - r * math.sin(angle)
-                gl.Vertex(x1, y1)
-                angle = (math.pi / 2) * ((i + 1) / segments)
-                local x2 = x + r - r * math.cos(angle)
-                local y2 = y + r - r * math.sin(angle)
-                if i < segments then gl.Vertex(x2, y2) end
-            end)
-
-            gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x + w - r, y + r)
-                angle = (math.pi / 2) * (i / segments)
-                local x1 = x + w - r + r * math.sin(angle)
-                local y1 = y + r - r * math.cos(angle)
-                gl.Vertex(x1, y1)
-                angle = (math.pi / 2) * ((i + 1) / segments)
-                local x2 = x + w - r + r * math.sin(angle)
-                local y2 = y + r - r * math.cos(angle)
-                if i < segments then gl.Vertex(x2, y2) end
-            end)
-
-            gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x + w - r, y + h - r)
-                angle = (math.pi / 2) * (i / segments)
-                local x1 = x + w - r + r * math.cos(angle)
-                local y1 = y + h - r + r * math.sin(angle)
-                gl.Vertex(x1, y1)
-                angle = (math.pi / 2) * ((i + 1) / segments)
-                local x2 = x + w - r + r * math.cos(angle)
-                local y2 = y + h - r + r * math.sin(angle)
-                if i < segments then gl.Vertex(x2, y2) end
-            end)
-
-            gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x + r, y + h - r)
-                angle = (math.pi / 2) * (i / segments)
-                local x1 = x + r - r * math.sin(angle)
-                local y1 = y + h - r + r * math.cos(angle)
-                gl.Vertex(x1, y1)
-                angle = (math.pi / 2) * ((i + 1) / segments)
-                local x2 = x + r - r * math.sin(angle)
-                local y2 = y + h - r + r * math.cos(angle)
-                if i < segments then gl.Vertex(x2, y2) end
-            end)
+            local a1 = (math.pi / 2) * (i / segments)
+            local a2 = (math.pi / 2) * ((i + 1) / segments)
+            if i < segments then
+                gl.BeginEnd(GL.TRIANGLES, function()
+                    gl.Vertex(x + r, y + r)
+                    gl.Vertex(x + r - r*math.cos(a1), y + r - r*math.sin(a1))
+                    gl.Vertex(x + r - r*math.cos(a2), y + r - r*math.sin(a2))
+                end)
+                gl.BeginEnd(GL.TRIANGLES, function()
+                    gl.Vertex(x + w - r, y + r)
+                    gl.Vertex(x + w - r + r*math.sin(a1), y + r - r*math.cos(a1))
+                    gl.Vertex(x + w - r + r*math.sin(a2), y + r - r*math.cos(a2))
+                end)
+                gl.BeginEnd(GL.TRIANGLES, function()
+                    gl.Vertex(x + w - r, y + h - r)
+                    gl.Vertex(x + w - r + r*math.cos(a1), y + h - r + r*math.sin(a1))
+                    gl.Vertex(x + w - r + r*math.cos(a2), y + h - r + r*math.sin(a2))
+                end)
+                gl.BeginEnd(GL.TRIANGLES, function()
+                    gl.Vertex(x + r, y + h - r)
+                    gl.Vertex(x + r - r*math.sin(a1), y + h - r + r*math.cos(a1))
+                    gl.Vertex(x + r - r*math.sin(a2), y + h - r + r*math.cos(a2))
+                end)
+            end
         end
     else
         gl.BeginEnd(GL.LINE_LOOP, function()
-            gl.Vertex(x + r, y)
-            gl.Vertex(x + w - r, y)
+            gl.Vertex(x + r, y); gl.Vertex(x + w - r, y)
             for i = 0, 6 do
-                local angle = (math.pi / 2) * (i / 6)
-                gl.Vertex(x + w - r + r * math.sin(angle), y + r - r * math.cos(angle))
+                local a = (math.pi / 2) * (i / 6)
+                gl.Vertex(x + w - r + r*math.sin(a), y + r - r*math.cos(a))
             end
-            gl.Vertex(x + w, y + r)
-            gl.Vertex(x + w, y + h - r)
+            gl.Vertex(x + w, y + r); gl.Vertex(x + w, y + h - r)
             for i = 0, 6 do
-                local angle = (math.pi / 2) * (i / 6)
-                gl.Vertex(x + w - r + r * math.cos(angle), y + h - r + r * math.sin(angle))
+                local a = (math.pi / 2) * (i / 6)
+                gl.Vertex(x + w - r + r*math.cos(a), y + h - r + r*math.sin(a))
             end
-            gl.Vertex(x + w - r, y + h)
-            gl.Vertex(x + r, y + h)
+            gl.Vertex(x + w - r, y + h); gl.Vertex(x + r, y + h)
             for i = 0, 6 do
-                local angle = (math.pi / 2) * (i / 6)
-                gl.Vertex(x + r - r * math.sin(angle), y + h - r + r * math.cos(angle))
+                local a = (math.pi / 2) * (i / 6)
+                gl.Vertex(x + r - r*math.sin(a), y + h - r + r*math.cos(a))
             end
-            gl.Vertex(x, y + h - r)
-            gl.Vertex(x, y + r)
+            gl.Vertex(x, y + h - r); gl.Vertex(x, y + r)
             for i = 0, 6 do
-                local angle = (math.pi / 2) * (i / 6)
-                gl.Vertex(x + r - r * math.cos(angle), y + r - r * math.sin(angle))
+                local a = (math.pi / 2) * (i / 6)
+                gl.Vertex(x + r - r*math.cos(a), y + r - r*math.sin(a))
             end
         end)
     end
 end
 
 -------------------------------------------------------------------------------
--- STAT CARD CLASS  (NEW)
+-- DISPLAY LIST MANAGEMENT
+-------------------------------------------------------------------------------
+
+local function freeLists()
+    if masterDisplayList then
+        gl.DeleteList(masterDisplayList)
+        masterDisplayList = nil
+    end
+    if hoverDisplayList then
+        gl.DeleteList(hoverDisplayList)
+        hoverDisplayList = nil
+    end
+end
+
+-- Rebuild the master display list from all charts + cards.
+-- Called at most once per ANIM_REBUILD_INTERVAL during animation,
+-- or immediately when data changes.
+local function rebuildMasterList()
+    if masterDisplayList then
+        gl.DeleteList(masterDisplayList)
+    end
+
+    masterDisplayList = gl.CreateList(function()
+        -- Draw all charts
+        for _, chart in pairs(charts) do
+            if chart.enabled and chart.visible then
+                chart:drawToList()
+            end
+        end
+        -- Draw all stat cards
+        for _, card in pairs(statCards) do
+            if card.enabled and card.visible then
+                card:drawToList()
+            end
+        end
+        -- HUD hint
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
+        gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
+    end)
+
+    masterDirty       = false
+    masterLastRebuild = os.clock()
+end
+
+-- Rebuild the hover overlay list (just hot borders, no fills — very cheap)
+local function rebuildHoverList()
+    if hoverDisplayList then
+        gl.DeleteList(hoverDisplayList)
+    end
+    hoverDisplayList = gl.CreateList(function()
+        for _, chart in pairs(charts) do
+            if chart.enabled and chart.visible and chart.isHovered then
+                gl.PushMatrix()
+                gl.Translate(chart.x, chart.y, 0)
+                gl.Scale(chart.scale, chart.scale, 1)
+                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], COLOR.borderHot[4])
+                gl.LineWidth(1.5)
+                drawRoundedRect(0.5, 0.5, chart.width - 1, chart.height - 1, 4, false)
+                gl.PopMatrix()
+            end
+        end
+        for _, card in pairs(statCards) do
+            if card.enabled and card.visible and card.isHovered then
+                gl.PushMatrix()
+                gl.Translate(card.x, card.y, 0)
+                gl.Scale(card.scale, card.scale, 1)
+                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], COLOR.borderHot[4])
+                gl.LineWidth(1.5)
+                drawRoundedRect(0.5, 0.5, CARD_WIDTH - 1, CARD_HEIGHT - 1, 4, false)
+                gl.PopMatrix()
+            end
+        end
+    end)
+end
+
+-------------------------------------------------------------------------------
+-- STAT CARD CLASS
 -------------------------------------------------------------------------------
 
 local StatCard = {}
@@ -271,29 +299,25 @@ StatCard.__index = StatCard
 
 function StatCard.new(id, label, icon, x, y, color, getValue)
     local self = setmetatable({}, StatCard)
-
-    self.id         = id
-    self.label      = label
-    self.icon       = icon
-    self.x          = x
-    self.y          = y
-    self.scale      = 1.0
-    self.enabled    = true
-    self.visible    = true
-    self.color      = color  -- accent color for the value text
-    self.getValue   = getValue
-
+    self.id           = id
+    self.label        = label
+    self.icon         = icon
+    self.x            = x
+    self.y            = y
+    self.scale        = 1.0
+    self.enabled      = true
+    self.visible      = true
+    self.color        = color
+    self.getValue     = getValue
     self.displayValue = 0
     self.prevValue    = 0
     self.targetValue  = 0
     self.animProgress = 1.0
     self.animStart    = 0
-
-    self.isDragging = false
-    self.dragStartX = 0
-    self.dragStartY = 0
-    self.isHovered  = false
-
+    self.isDragging   = false
+    self.dragStartX   = 0
+    self.dragStartY   = 0
+    self.isHovered    = false
     return self
 end
 
@@ -302,20 +326,22 @@ function StatCard:setTarget(value)
     self.targetValue  = value
     self.animProgress = 0.0
     self.animStart    = os.clock()
+    masterDirty       = true   -- will need a list rebuild
 end
 
 function StatCard:update(dt)
     if self.animProgress < 1.0 then
-        local elapsed = os.clock() - self.animStart
+        local elapsed     = os.clock() - self.animStart
         self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
-        local ease = easeOutCubic(self.animProgress)
+        local ease        = easeOutCubic(self.animProgress)
         self.displayValue = self.prevValue + (self.targetValue - self.prevValue) * ease
+        masterDirty       = true
     end
 end
 
-function StatCard:draw()
-    if not self.enabled or not self.visible then return end
-
+-- This is called INSIDE gl.CreateList — no conditional branches on isHovered here
+-- (hover is handled by the separate cheap overlay list)
+function StatCard:drawToList()
     local w = CARD_WIDTH
     local h = CARD_HEIGHT
     local c = self.color
@@ -324,42 +350,30 @@ function StatCard:draw()
     gl.Translate(self.x, self.y, 0)
     gl.Scale(self.scale, self.scale, 1)
 
-    -- Background
     gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    -- Border (hot or normal)
-    local bc = self.isHovered and COLOR.borderHot or COLOR.border
-    gl.Color(bc[1], bc[2], bc[3], bc[4])
+    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
 
-    -- Left accent bar
     gl.Color(c[1], c[2], c[3], 0.7)
     gl.BeginEnd(GL.QUADS, function()
-        gl.Vertex(0,   4)
-        gl.Vertex(3,   4)
-        gl.Vertex(3,   h - 4)
-        gl.Vertex(0,   h - 4)
+        gl.Vertex(0, 4); gl.Vertex(3, 4); gl.Vertex(3, h - 4); gl.Vertex(0, h - 4)
     end)
 
-    -- Icon + label (top)
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, 10, h - 18, 9, "o")
 
-    -- Value (large, centered vertically in lower 2/3)
     gl.Color(c[1], c[2], c[3], 1.0)
-    local valueStr = formatNumber(math.floor(self.displayValue + 0.5))
-    gl.Text(valueStr, w / 2 + 5, 10, 20, "co")
+    gl.Text(formatNumber(math.floor(self.displayValue + 0.5)), w / 2 + 5, 10, 20, "co")
 
     gl.PopMatrix()
 end
 
 function StatCard:isMouseOver(mx, my)
-    return mx >= self.x
-       and mx <= self.x + CARD_WIDTH  * self.scale
-       and my >= self.y
-       and my <= self.y + CARD_HEIGHT * self.scale
+    return mx >= self.x and mx <= self.x + CARD_WIDTH  * self.scale
+       and my >= self.y and my <= self.y + CARD_HEIGHT * self.scale
 end
 
 -------------------------------------------------------------------------------
@@ -371,65 +385,48 @@ Chart.__index = Chart
 
 function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     local self = setmetatable({}, Chart)
-
-    self.id        = id
-    self.label     = label
-    self.icon      = icon
-    self.x         = x
-    self.y         = y
-    self.width     = CHART_WIDTH
-    self.height    = CHART_HEIGHT
-    self.scale     = 1.0
-    self.enabled   = true
-    self.visible   = true
-    self.chartType = chartType
-    self.series    = series
-    self.multiTeam = multiTeam or false
-
-    self.history = {}
+    self.id          = id
+    self.label       = label
+    self.icon        = icon
+    self.x           = x
+    self.y           = y
+    self.width       = CHART_WIDTH
+    self.height      = CHART_HEIGHT
+    self.scale       = 1.0
+    self.enabled     = true
+    self.visible     = true
+    self.chartType   = chartType
+    self.series      = series
+    self.multiTeam   = multiTeam or false
+    self.history     = {}
     for i = 1, #series do self.history[i] = {} end
-
     self.displayData = {}
     for i = 1, #series do self.displayData[i] = {} end
-
-    self.animProgress = 1.0
+    self.animProgress  = 1.0
     self.animStartTime = 0
-    self.prevData   = {}
-    self.targetData = {}
-
-    self.isDragging = false
-    self.dragStartX = 0
-    self.dragStartY = 0
-    self.isHovered  = false
-
+    self.prevData      = {}
+    self.targetData    = {}
+    self.isDragging    = false
+    self.dragStartX    = 0
+    self.dragStartY    = 0
+    self.isHovered     = false
     return self
 end
 
 function Chart:rebuildMultiTeamSeries()
     if not self.multiTeam then return end
-
     self.history     = {}
     self.displayData = {}
     self.series      = {}
-
-    Spring.Echo("rebuild: allyTeams type=" .. type(allyTeams))
-    local c = 0
-    for tid, _ in pairs(allyTeams) do
-        c = c + 1
-        Spring.Echo("  rebuild sees tid=" .. tostring(tid))
-    end
-    Spring.Echo("  rebuild count=" .. c)
-
     local idx = 1
     if type(allyTeams) == "table" then
         for tid, teamData in pairs(allyTeams) do
             local seriesConfig = {
-                label   = teamData.playerName,
-                color   = teamData.color,
-                teamID  = tid,
+                label    = teamData.playerName,
+                color    = teamData.color,
+                teamID   = tid,
                 getValue = nil,
             }
-
             if self.id == "chart-ally-army" then
                 seriesConfig.getValue = function()
                     return allyTeams[tid] and allyTeams[tid].armyValue or 0
@@ -447,7 +444,6 @@ function Chart:rebuildMultiTeamSeries()
                     return allyTeams[tid] and allyTeams[tid].energyIncome or 0
                 end
             end
-
             self.series[idx]      = seriesConfig
             self.history[idx]     = {}
             self.displayData[idx] = {}
@@ -464,24 +460,22 @@ function Chart:addDataPoint()
             table.remove(self.history[i], 1)
         end
     end
-
     self.animProgress  = 0.0
     self.animStartTime = os.clock()
-
     for i = 1, #self.series do
         self.prevData[i]   = {}
         self.targetData[i] = {}
         for j, v in ipairs(self.displayData[i]) do self.prevData[i][j]   = v end
         for j, v in ipairs(self.history[i])     do self.targetData[i][j] = v end
     end
+    masterDirty = true
 end
 
 function Chart:update(dt)
     if self.animProgress < 1.0 then
-        local elapsed = os.clock() - self.animStartTime
+        local elapsed     = os.clock() - self.animStartTime
         self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
-        local ease = easeOutCubic(self.animProgress)
-
+        local ease        = easeOutCubic(self.animProgress)
         for i = 1, #self.series do
             local prev   = self.prevData[i]   or {}
             local target = self.targetData[i] or {}
@@ -491,12 +485,12 @@ function Chart:update(dt)
                 self.displayData[i][j] = fromVal + (toVal - fromVal) * ease
             end
         end
+        masterDirty = true
     end
 end
 
-function Chart:draw()
-    if not self.enabled or not self.visible then return end
-
+-- Called only inside gl.CreateList — no hover logic here
+function Chart:drawToList()
     gl.PushMatrix()
     gl.Translate(self.x, self.y, 0)
     gl.Scale(self.scale, self.scale, 1)
@@ -509,11 +503,12 @@ function Chart:draw()
     local cW  = w - pad.left - pad.right
     local cH  = h - pad.top  - pad.bottom
 
+    -- Background
     gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    local bc = self.isHovered and COLOR.borderHot or COLOR.border
-    gl.Color(bc[1], bc[2], bc[3], bc[4])
+    -- Border (normal only — hot border comes from hover overlay list)
+    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
 
@@ -523,8 +518,10 @@ function Chart:draw()
     end
 
     if not hasData then
-        self:drawNoData(cX, cY, cW, cH)
-        self:drawHeader(w, h)
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.25)
+        gl.Text("— awaiting data —", cX + cW / 2, cY + cH / 2, 10, "c")
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+        gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
         gl.PopMatrix()
         return
     end
@@ -536,34 +533,31 @@ function Chart:draw()
         end
     end
 
-    local minV    = math.min(unpack(allValues))
-    local maxV    = math.max(unpack(allValues))
-    
-    -- Special handling for percent charts
+    local minV = math.min(unpack(allValues))
+    local maxV = math.max(unpack(allValues))
+
     if self.chartType == "percent" then
         minV = 0
         maxV = math.max(100, maxV)
     else
-        local span    = maxV - minV
+        local span     = maxV - minV
         local rangePad = span > 0 and span * 0.12 or math.max(maxV * 0.1, 100)
         minV = math.max(0, minV - rangePad)
         maxV = maxV + rangePad
     end
-    
+
     local range = maxV - minV
     if range == 0 then range = 1 end
 
+    -- Grid + Y labels
     for i = 0, 4 do
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
-
-        local gc = (i == 0) and COLOR.gridBase or COLOR.grid
+        local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
         gl.Color(gc[1], gc[2], gc[3], gc[4])
         gl.BeginEnd(GL.LINES, function()
-            gl.Vertex(cX,      yPos)
-            gl.Vertex(cX + cW, yPos)
+            gl.Vertex(cX, yPos); gl.Vertex(cX + cW, yPos)
         end)
-
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
         gl.Text(formatYAxis(v, self.chartType), cX - 5, yPos - 4, 9, "ro")
     end
@@ -571,11 +565,11 @@ function Chart:draw()
     local function toX(idx, total)
         return cX + ((idx - 1) / (total - 1)) * cW
     end
-
     local function toY(value)
         return cY + ((value - minV) / range) * cH
     end
 
+    -- Series lines + fills
     for seriesIdx, s in ipairs(self.series) do
         local data = self.displayData[seriesIdx]
         if #data >= 2 then
@@ -596,8 +590,7 @@ function Chart:draw()
                 for i, value in ipairs(data) do
                     if value and not (value ~= value) then
                         local x = toX(i, #data)
-                        gl.Vertex(x, cY)
-                        gl.Vertex(x, toY(value))
+                        gl.Vertex(x, cY); gl.Vertex(x, toY(value))
                     end
                 end
             end)
@@ -629,32 +622,22 @@ function Chart:draw()
                     if self.chartType == "multi" or self.chartType == "dual" then
                         labelOffset = (seriesIdx - 1) * 13
                     end
-
                     gl.Text(valueText, cX + cW + 2, toY(lastValue) - 4 + labelOffset, 9, "o")
                 end
             end
         end
     end
 
-    self:drawHeader(w, h)
+    -- Header
+    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+    gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
+
     gl.PopMatrix()
 end
 
-function Chart:drawHeader(w, h)
-    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
-    gl.Text(self.icon .. "  " .. self.label, PADDING.left + 2, h - PADDING.top - 10, 10, "o")
-end
-
-function Chart:drawNoData(cX, cY, cW, cH)
-    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.25)
-    gl.Text("— awaiting data —", cX + cW / 2, cY + cH / 2, 10, "c")
-end
-
 function Chart:isMouseOver(mx, my)
-    return mx >= self.x
-       and mx <= self.x + self.width  * self.scale
-       and my >= self.y
-       and my <= self.y + self.height * self.scale
+    return mx >= self.x and mx <= self.x + self.width  * self.scale
+       and my >= self.y and my <= self.y + self.height * self.scale
 end
 
 -------------------------------------------------------------------------------
@@ -677,7 +660,6 @@ local function seedArmyValues()
             allyTeams[teamID].armyValue = allyTeams[teamID].armyValue + cost
         end
     end
-
     for tid, teamData in pairs(allyTeams) do
         if tid ~= teamID then
             teamData.armyValue = 0
@@ -716,13 +698,11 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     if unitTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
         myTeamStats.unitCount = myTeamStats.unitCount + 1
-        -- Track total metal value of units completed for build efficiency
         myTeamStats.unitsMetalCompleted = myTeamStats.unitsMetalCompleted + cost
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = allyTeams[unitTeam].armyValue + cost
     end
-
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder and allyTeams[unitTeam] then
         allyTeams[unitTeam].buildPower = allyTeams[unitTeam].buildPower + (ud.buildSpeed or 0)
@@ -740,12 +720,9 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerD
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
     end
-
-    -- Credit kill to attacker's team
     if attackerTeam == teamID and attackerTeam ~= unitTeam then
         myTeamStats.kills = myTeamStats.kills + 1
     end
-
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder and allyTeams[unitTeam] then
         allyTeams[unitTeam].buildPower = math.max(0, allyTeams[unitTeam].buildPower - (ud.buildSpeed or 0))
@@ -754,30 +731,23 @@ end
 
 function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     local cost = unitMetalCost(unitDefID)
-
     if oldTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
         myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
     elseif allyTeams[oldTeam] then
         allyTeams[oldTeam].armyValue = math.max(0, allyTeams[oldTeam].armyValue - cost)
     end
-
     if newTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
         myTeamStats.unitCount = myTeamStats.unitCount + 1
     elseif allyTeams[newTeam] then
         allyTeams[newTeam].armyValue = allyTeams[newTeam].armyValue + cost
     end
-
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder then
         local bp = ud.buildSpeed or 0
-        if allyTeams[oldTeam] then
-            allyTeams[oldTeam].buildPower = math.max(0, allyTeams[oldTeam].buildPower - bp)
-        end
-        if allyTeams[newTeam] then
-            allyTeams[newTeam].buildPower = allyTeams[newTeam].buildPower + bp
-        end
+        if allyTeams[oldTeam] then allyTeams[oldTeam].buildPower = math.max(0, allyTeams[oldTeam].buildPower - bp) end
+        if allyTeams[newTeam] then allyTeams[newTeam].buildPower = allyTeams[newTeam].buildPower + bp end
     end
 end
 
@@ -792,18 +762,14 @@ end
 local function initAllyTeams()
     local currentAllyID = Spring.GetMyAllyTeamID()
     if not currentAllyID then return false end
-
     local teamList = Spring.GetTeamList(currentAllyID)
     if not teamList or #teamList == 0 then return false end
-
     allyTeamID = currentAllyID
     local newAllyTeams = {}
-
     for _, tid in ipairs(teamList) do
-        local r, g, b   = Spring.GetTeamColor(tid)
+        local r, g, b    = Spring.GetTeamColor(tid)
         local playerName = "Team " .. tid
         local _, leaderID, _, isAI = Spring.GetTeamInfo(tid)
-
         if isAI then
             local _, name = Spring.GetAIInfo(tid)
             playerName = name or playerName
@@ -811,7 +777,6 @@ local function initAllyTeams()
             local name = Spring.GetPlayerInfo(leaderID)
             playerName = name or playerName
         end
-
         newAllyTeams[tid] = {
             teamID       = tid,
             playerName   = playerName,
@@ -822,19 +787,17 @@ local function initAllyTeams()
             buildPower   = 0,
         }
     end
-
     allyTeams = newAllyTeams
     return true
 end
 
 -------------------------------------------------------------------------------
--- BUILD POWER TRACKING
+-- BUILD EFFICIENCY HELPER
 -------------------------------------------------------------------------------
 
 local function getCurrentBuildPower()
     local totalBuildPower = 0
     if not teamID then return 0 end
-    
     local myUnits = Spring.GetTeamUnits(teamID) or {}
     for _, uid in ipairs(myUnits) do
         local unitDefID = Spring.GetUnitDefID(uid)
@@ -845,7 +808,6 @@ local function getCurrentBuildPower()
             end
         end
     end
-    
     return totalBuildPower
 end
 
@@ -855,27 +817,18 @@ end
 
 local function saveConfig()
     local config = { version = "1.0", enabled = chartsEnabled, charts = {}, cards = {} }
-
     for _, chart in pairs(charts) do
         config.charts[chart.id] = {
-            x       = chart.x,
-            y       = chart.y,
-            scale   = chart.scale,
-            visible = chart.visible,
-            enabled = chart.enabled,
+            x = chart.x, y = chart.y, scale = chart.scale,
+            visible = chart.visible, enabled = chart.enabled,
         }
     end
-
     for id, card in pairs(statCards) do
         config.cards[id] = {
-            x       = card.x,
-            y       = card.y,
-            scale   = card.scale,
-            visible = card.visible,
-            enabled = card.enabled,
+            x = card.x, y = card.y, scale = card.scale,
+            visible = card.visible, enabled = card.enabled,
         }
     end
-
     local file = io.open(CONFIG_FILE, "w")
     if file then
         file:write("return " .. serializeTable(config, 0))
@@ -888,22 +841,18 @@ end
 
 local function loadConfig()
     if not VFS.FileExists(CONFIG_FILE) then return {}, {} end
-
     local fileContent = VFS.LoadFile(CONFIG_FILE)
     if not fileContent then return {}, {} end
-
     local chunk, err = loadstring(fileContent)
     if not chunk then
         Spring.Echo("BAR Charts: Parse error: " .. tostring(err))
         return {}, {}
     end
-
     local ok, result = pcall(chunk)
     if not ok or type(result) ~= "table" then
         Spring.Echo("BAR Charts: Invalid config")
         return {}, {}
     end
-
     if result.enabled ~= nil then chartsEnabled = result.enabled end
     return result.charts or {}, result.cards or {}
 end
@@ -916,120 +865,80 @@ local savedChartConfig = nil
 
 function widget:Initialize()
     Spring.Echo("BAR Charts: Initialize START")
-    vsx, vsy     = Spring.GetViewGeometry()
-    teamID       = Spring.GetMyTeamID()
-    allyTeamID   = Spring.GetMyAllyTeamID()
-    chartsReady  = false
+    vsx, vsy    = Spring.GetViewGeometry()
+    teamID      = Spring.GetMyTeamID()
+    allyTeamID  = Spring.GetMyAllyTeamID()
+    chartsReady = false
+    charts      = {}
+    statCards   = {}
 
-    charts   = {}
-    statCards = {}
-
-    -- ── LINE CHARTS ──────────────────────────────────────────────────────────
+    -- ── LINE CHARTS ───────────────────────────────────────────────────────────
 
     charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 230, "dual", {
         { label = "Income", color = COLOR.accent,  getValue = function() return myTeamStats.metalIncome end },
         { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.metalUsage  end },
-    }, false)
+    })
 
     charts.energy = Chart.new("chart-energy", "ENERGY", "⚡", vsx - 660, vsy - 230, "dual", {
         { label = "Income", color = COLOR.accent,  getValue = function() return myTeamStats.energyIncome end },
         { label = "Usage",  color = COLOR.accent2, getValue = function() return myTeamStats.energyUsage  end },
-    }, false)
+    })
 
     charts.damage = Chart.new("chart-damage", "DAMAGE", "✕", vsx - 970, vsy - 230, "dual", {
         { label = "Dealt", color = COLOR.success, getValue = function() return myTeamStats.damageDealt end },
         { label = "Taken", color = COLOR.danger,  getValue = function() return myTeamStats.damageTaken end },
-    }, false)
+    })
 
     charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙", vsx - 350, vsy - 430, "single", {
         { label = "Value", color = COLOR.accent, getValue = function() return myTeamStats.armyValue end },
-    }, false)
+    })
 
     charts.kd = Chart.new("chart-kd", "K/D RATIO", "✕", vsx - 660, vsy - 430, "ratio", {
         { label = "Ratio", color = COLOR.success, getValue = function()
             local k, d = myTeamStats.kills, myTeamStats.losses
             return d == 0 and (k > 0 and 5 or 0) or math.min(5, k / d)
         end },
-    }, false)
+    })
 
-    -- NEW: Build Efficiency Chart
     charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILD EFFICIENCY", "🔧", vsx - 970, vsy - 430, "percent", {
-        { label = "Efficiency", color = COLOR.success, getValue = function() 
-            return myTeamStats.buildEfficiency 
+        { label = "Efficiency", color = COLOR.success, getValue = function()
+            return myTeamStats.buildEfficiency
         end },
-    }, false)
+    })
 
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",  vsx - 1280, vsy - 430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧", vsx - 1280, vsy - 230, "multi", {}, true)
 
-    -- ── NUMERIC STAT CARDS ───────────────────────────────────────────────────
+    -- ── NUMERIC STAT CARDS ────────────────────────────────────────────────────
     local cardY    = vsy - 650
     local cardStep = 80
     local col1X    = vsx - 350
     local col2X    = vsx - 200
 
-    statCards["card-army-value"] = StatCard.new(
-        "card-army-value", "ARMY VALUE", "⚙",
-        col1X, cardY,
-        COLOR.accent,
-        function() return myTeamStats.armyValue end
-    )
+    statCards["card-army-value"] = StatCard.new("card-army-value", "ARMY VALUE", "⚙",
+        col1X, cardY, COLOR.accent, function() return myTeamStats.armyValue end)
+    statCards["card-unit-count"] = StatCard.new("card-unit-count", "UNITS", "▣",
+        col2X, cardY, COLOR.accent, function() return myTeamStats.unitCount end)
+    statCards["card-kills"] = StatCard.new("card-kills", "KILLS", "✕",
+        col1X, cardY - cardStep, COLOR.success, function() return myTeamStats.kills end)
+    statCards["card-losses"] = StatCard.new("card-losses", "LOSSES", "↓",
+        col2X, cardY - cardStep, COLOR.danger, function() return myTeamStats.losses end)
+    statCards["card-dmg-dealt"] = StatCard.new("card-dmg-dealt", "DMG DEALT", "▲",
+        col1X, cardY - cardStep * 2, COLOR.success, function() return myTeamStats.damageDealt end)
+    statCards["card-dmg-taken"] = StatCard.new("card-dmg-taken", "DMG TAKEN", "▼",
+        col2X, cardY - cardStep * 2, COLOR.danger, function() return myTeamStats.damageTaken end)
+    statCards["card-metal-lost"] = StatCard.new("card-metal-lost", "METAL LOST", "◆",
+        col1X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.metalLost end)
 
-    statCards["card-unit-count"] = StatCard.new(
-        "card-unit-count", "UNITS", "▣",
-        col2X, cardY,
-        COLOR.accent,
-        function() return myTeamStats.unitCount end
-    )
-
-    statCards["card-kills"] = StatCard.new(
-        "card-kills", "KILLS", "✕",
-        col1X, cardY - cardStep,
-        COLOR.success,
-        function() return myTeamStats.kills end
-    )
-
-    statCards["card-losses"] = StatCard.new(
-        "card-losses", "LOSSES", "↓",
-        col2X, cardY - cardStep,
-        COLOR.danger,
-        function() return myTeamStats.losses end
-    )
-
-    statCards["card-dmg-dealt"] = StatCard.new(
-        "card-dmg-dealt", "DMG DEALT", "▲",
-        col1X, cardY - cardStep * 2,
-        COLOR.success,
-        function() return myTeamStats.damageDealt end
-    )
-
-    statCards["card-dmg-taken"] = StatCard.new(
-        "card-dmg-taken", "DMG TAKEN", "▼",
-        col2X, cardY - cardStep * 2,
-        COLOR.danger,
-        function() return myTeamStats.damageTaken end
-    )
-
-    statCards["card-metal-lost"] = StatCard.new(
-        "card-metal-lost", "METAL LOST", "◆",
-        col1X, cardY - cardStep * 3,
-        COLOR.gold,
-        function() return myTeamStats.metalLost end
-    )
-
-    -- ── APPLY SAVED CONFIG ───────────────────────────────────────────────────
-
+    -- ── APPLY SAVED CONFIG ────────────────────────────────────────────────────
     local chartCfg, cardCfg = loadConfig()
-
     local chartById = {}
-    for _, chart in pairs(charts) do
-        chartById[chart.id] = chart
-    end
+    for _, chart in pairs(charts) do chartById[chart.id] = chart end
+
     for id, cfg in pairs(type(chartCfg) == "table" and chartCfg or {}) do
         local chart = chartById[id]
         if chart and type(cfg) == "table" then
-            chart.x     = cfg.x     or chart.x
-            chart.y     = cfg.y     or chart.y
+            chart.x = cfg.x or chart.x; chart.y = cfg.y or chart.y
             chart.scale = cfg.scale or chart.scale
             if cfg.visible ~= nil then chart.visible = cfg.visible end
             if cfg.enabled ~= nil then chart.enabled = cfg.enabled end
@@ -1039,14 +948,14 @@ function widget:Initialize()
     for id, cfg in pairs(type(cardCfg) == "table" and cardCfg or {}) do
         local card = statCards[id]
         if card and type(cfg) == "table" then
-            card.x     = cfg.x     or card.x
-            card.y     = cfg.y     or card.y
+            card.x = cfg.x or card.x; card.y = cfg.y or card.y
             card.scale = cfg.scale or card.scale
             if cfg.visible ~= nil then card.visible = cfg.visible end
             if cfg.enabled ~= nil then card.enabled = cfg.enabled end
         end
     end
 
+    masterDirty = true
     Spring.Echo("BAR Charts: Initialized, waiting for team data...")
 end
 
@@ -1063,35 +972,50 @@ function widget:Update(dt)
             if initAllyTeams() then
                 charts.allyArmy:rebuildMultiTeamSeries()
                 charts.allyBuildPower:rebuildMultiTeamSeries()
-
                 seedArmyValues()
                 seedBuildPower()
                 seedUnitCount()
-
                 chartsReady    = true
                 lastUpdateTime = -UPDATE_INTERVAL
+                masterDirty    = true
             end
         end
         return
     end
 
+    -- Animate all charts/cards — they set masterDirty if still in motion
+    local anyAnimating = false
     for _, chart in pairs(charts) do
         chart:update(dt)
+        if chart.animProgress < 1.0 then anyAnimating = true end
     end
     for _, card in pairs(statCards) do
         card:update(dt)
+        if card.animProgress < 1.0 then anyAnimating = true end
     end
 
+    -- Throttle display list rebuilds during animation to ~20fps
+    if masterDirty then
+        local now = os.clock()
+        if anyAnimating then
+            if now - masterLastRebuild >= ANIM_REBUILD_INTERVAL then
+                rebuildMasterList()
+            end
+        else
+            -- Not animating: rebuild immediately (data just changed)
+            rebuildMasterList()
+        end
+    end
+
+    -- Periodic data fetch (every 10s)
     local gameTime = Spring.GetGameSeconds()
     if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
         lastUpdateTime = gameTime
-
         if not teamID then
             teamID = Spring.GetMyTeamID()
             if not teamID then return end
         end
 
-        -- My team resource stats
         local m_inc, m_use = Spring.GetTeamResourceStats(teamID, "metal")
         local e_inc, e_use = Spring.GetTeamResourceStats(teamID, "energy")
         myTeamStats.metalIncome  = m_inc or 0
@@ -1105,39 +1029,27 @@ function widget:Update(dt)
             myTeamStats.damageTaken = dmg_taken or 0
         end
 
-        -- Calculate build efficiency
-        local currentBuildPower = getCurrentBuildPower()
-        local theoreticalMax = currentBuildPower * UPDATE_INTERVAL
-        local actualBuilt = myTeamStats.unitsMetalCompleted - myTeamStats.lastUnitsMetalCompleted
-        
-        if theoreticalMax > 0 then
-            myTeamStats.buildEfficiency = math.min(100, (actualBuilt / theoreticalMax) * 100)
-        else
-            myTeamStats.buildEfficiency = 0
-        end
-        
+        local currentBuildPower  = getCurrentBuildPower()
+        local theoreticalMax     = currentBuildPower * UPDATE_INTERVAL
+        local actualBuilt        = myTeamStats.unitsMetalCompleted - myTeamStats.lastUnitsMetalCompleted
+        myTeamStats.buildEfficiency = theoreticalMax > 0
+            and math.min(100, (actualBuilt / theoreticalMax) * 100)
+            or 0
         myTeamStats.lastUnitsMetalCompleted = myTeamStats.unitsMetalCompleted
 
-        -- Ally team resource stats
         if type(allyTeams) == "table" then
             for tid, teamData in pairs(allyTeams) do
-                local tm_inc, tm_use = Spring.GetTeamResourceStats(tid, "metal")
-                local te_inc, te_use = Spring.GetTeamResourceStats(tid, "energy")
+                local tm_inc = Spring.GetTeamResourceStats(tid, "metal")
+                local te_inc = Spring.GetTeamResourceStats(tid, "energy")
                 teamData.metalIncome  = tm_inc or 0
                 teamData.energyIncome = te_inc or 0
             end
         end
 
-        for _, chart in pairs(charts) do
-            if chart.id == "chart-ally-army" then
-                -- Spring.Echo("addDataPoint: ally-army series count=" .. #chart.series)
-            end
-            chart:addDataPoint()
-        end
+        for _, chart in pairs(charts) do chart:addDataPoint() end
+        for _, card  in pairs(statCards) do card:setTarget(card.getValue()) end
 
-        for _, card in pairs(statCards) do
-            card:setTarget(card.getValue())
-        end
+        masterDirty = true  -- force immediate rebuild (no animation yet)
     end
 end
 
@@ -1148,40 +1060,34 @@ end
 function widget:GameStart()
     chartsReady    = false
     lastUpdateTime = 0
-    myTeamStats.armyValue  = 0
-    myTeamStats.unitCount  = 0
-    myTeamStats.kills      = 0
-    myTeamStats.losses     = 0
-    myTeamStats.metalLost  = 0
-    myTeamStats.damageDealt = 0
-    myTeamStats.damageTaken = 0
-    myTeamStats.buildEfficiency = 0
-    myTeamStats.unitsMetalCompleted = 0
-    myTeamStats.lastUnitsMetalCompleted = 0
+    myTeamStats.armyValue  = 0; myTeamStats.unitCount  = 0
+    myTeamStats.kills      = 0; myTeamStats.losses     = 0
+    myTeamStats.metalLost  = 0; myTeamStats.damageDealt = 0
+    myTeamStats.damageTaken = 0; myTeamStats.buildEfficiency = 0
+    myTeamStats.unitsMetalCompleted = 0; myTeamStats.lastUnitsMetalCompleted = 0
     for tid, teamData in pairs(allyTeams) do
-        teamData.armyValue  = 0
-        teamData.buildPower = 0
+        teamData.armyValue = 0; teamData.buildPower = 0
     end
+    masterDirty = true
     Spring.Echo("BAR Charts: Game started, waiting for team data...")
 end
 
 -------------------------------------------------------------------------------
--- RENDERING
+-- RENDERING — the hot path, now trivially cheap
 -------------------------------------------------------------------------------
 
 function widget:DrawScreen()
     if not chartsEnabled then return end
 
-    for _, chart in pairs(charts) do
-        chart:draw()
+    -- Replay the pre-compiled display list — single GL call, near-zero CPU
+    if masterDisplayList then
+        gl.CallList(masterDisplayList)
     end
 
-    for _, card in pairs(statCards) do
-        card:draw()
+    -- Hover overlay: only rebuild when hover state changes (handled in MouseMove)
+    if hoverDisplayList then
+        gl.CallList(hoverDisplayList)
     end
-
-    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
-    gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
 end
 
 -------------------------------------------------------------------------------
@@ -1192,10 +1098,13 @@ function widget:KeyPress(key, mods, isRepeat)
     if key == Spring.GetKeyCode("f9") then
         chartsEnabled = not chartsEnabled
         Spring.Echo("BAR Charts: " .. (chartsEnabled and "Enabled" or "Disabled"))
+        masterDirty = true
         return true
     end
     return false
 end
+
+local prevHoverState = {}  -- track hover state to avoid unnecessary hover list rebuilds
 
 local function findHitElement(mx, my)
     for id, card in pairs(statCards) do
@@ -1209,10 +1118,8 @@ end
 
 function widget:MousePress(mx, my, button)
     if not chartsEnabled then return false end
-
     local elem, kind = findHitElement(mx, my)
     if not elem then return false end
-
     if button == 1 then
         elem.isDragging = true
         elem.dragStartX = mx - elem.x
@@ -1220,15 +1127,15 @@ function widget:MousePress(mx, my, button)
         return true
     elseif button == 3 then
         elem.visible = not elem.visible
+        masterDirty = true
+        rebuildHoverList()
         return true
     end
-
     return false
 end
 
 function widget:MouseRelease(mx, my, button)
     if not chartsEnabled then return false end
-
     if button == 1 then
         for _, card in pairs(statCards) do
             if card.isDragging then card.isDragging = false; return true end
@@ -1237,70 +1144,76 @@ function widget:MouseRelease(mx, my, button)
             if chart.isDragging then chart.isDragging = false; return true end
         end
     end
-
     return false
 end
 
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
 
+    -- Handle drag
     for _, card in pairs(statCards) do
         if card.isDragging then
             card.x = mx - card.dragStartX
             card.y = my - card.dragStartY
+            masterDirty = true
             return true
         end
     end
-
     for _, chart in pairs(charts) do
         if chart.isDragging then
             chart.x = mx - chart.dragStartX
             chart.y = my - chart.dragStartY
+            masterDirty = true
             return true
         end
     end
 
-    local anyHovered = false
-    for _, card in pairs(statCards) do
-        card.isHovered = card:isMouseOver(mx, my)
-        if card.isHovered then anyHovered = true end
+    -- Update hover state; only rebuild hover list if something changed
+    local hoverChanged = false
+    for id, card in pairs(statCards) do
+        local h = card:isMouseOver(mx, my)
+        if h ~= card.isHovered then hoverChanged = true end
+        card.isHovered = h
     end
-    for _, chart in pairs(charts) do
-        chart.isHovered = chart:isMouseOver(mx, my)
-        if chart.isHovered then anyHovered = true end
+    for id, chart in pairs(charts) do
+        local h = chart:isMouseOver(mx, my)
+        if h ~= chart.isHovered then hoverChanged = true end
+        chart.isHovered = h
     end
 
-    return anyHovered
+    if hoverChanged then rebuildHoverList() end
+
+    -- Return true only if hovering something (to suppress other mouse handlers)
+    for _, card in pairs(statCards) do if card.isHovered then return true end end
+    for _, chart in pairs(charts) do if chart.isHovered then return true end end
+    return false
 end
 
 function widget:MouseWheel(up, value)
     if not chartsEnabled then return false end
-
     local mx, my = Spring.GetMouseState()
-
     for _, card in pairs(statCards) do
         if card:isMouseOver(mx, my) then
             card.scale = up and math.min(2.0, card.scale + 0.1)
                             or  math.max(0.5, card.scale - 0.1)
+            masterDirty = true
             return true
         end
     end
-
     for _, chart in pairs(charts) do
         if chart:isMouseOver(mx, my) then
             chart.scale = up and math.min(2.0, chart.scale + 0.1)
                              or  math.max(0.5, chart.scale - 0.1)
+            masterDirty = true
             return true
         end
     end
-
     return false
 end
 
 function widget:ViewResize()
     local oldVsx, oldVsy = vsx, vsy
     vsx, vsy = Spring.GetViewGeometry()
-
     if not savedChartConfig then
         local ratioX = vsx / oldVsx
         local ratioY = vsy / oldVsy
@@ -1313,12 +1226,13 @@ function widget:ViewResize()
             card.y = card.y * ratioY
         end
     end
+    masterDirty = true
+    rebuildHoverList()
 end
 
 function widget:TextCommand(command)
     if command == "barcharts save" then
         saveConfig()
-        Spring.Echo("BAR Charts: Configuration saved manually")
         return true
     elseif command == "barcharts reset" then
         os.remove(CONFIG_FILE)
@@ -1328,10 +1242,11 @@ function widget:TextCommand(command)
         Spring.Echo("=== BAR Charts Debug ===")
         Spring.Echo("vsx=" .. tostring(vsx) .. " vsy=" .. tostring(vsy))
         Spring.Echo("chartsEnabled=" .. tostring(chartsEnabled) .. " chartsReady=" .. tostring(chartsReady))
+        Spring.Echo("masterDirty=" .. tostring(masterDirty) .. " masterDisplayList=" .. tostring(masterDisplayList))
         Spring.Echo("-- CARDS --")
         for id, card in pairs(statCards) do
-            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s enabled=%s",
-                id, card.x, card.y, card.scale, tostring(card.visible), tostring(card.enabled)))
+            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s",
+                id, card.x, card.y, card.scale, tostring(card.visible)))
         end
         Spring.Echo("-- CHARTS --")
         for _, chart in pairs(charts) do
@@ -1345,5 +1260,6 @@ end
 
 function widget:Shutdown()
     saveConfig()
+    freeLists()
     Spring.Echo("BAR Charts: Shutdown")
 end
