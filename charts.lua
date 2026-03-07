@@ -710,18 +710,18 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 end
 
 function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam)
+    -- Army value and build power are updated here since the unit list changes immediately.
+    -- Kills and losses are intentionally NOT tracked here; they are fetched authoritatively
+    -- from Spring.GetTeamUnitStats() in the periodic update loop to avoid inaccuracies
+    -- caused by LOS restrictions or anti-cheat mechanisms filtering event data.
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
         myTeamStats.unitCount = math.max(0, myTeamStats.unitCount - 1)
-        myTeamStats.losses    = myTeamStats.losses + 1
         myTeamStats.metalLost = myTeamStats.metalLost + cost
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue = math.max(0, allyTeams[unitTeam].armyValue - cost)
-    end
-    if attackerTeam == teamID and attackerTeam ~= unitTeam then
-        myTeamStats.kills = myTeamStats.kills + 1
     end
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder and allyTeams[unitTeam] then
@@ -1028,6 +1028,14 @@ function widget:Update(dt)
             myTeamStats.damageDealt = dmg_dealt or 0
             myTeamStats.damageTaken = dmg_taken or 0
         end
+
+        -- Fetch authoritative kills and losses from the engine's unit stats.
+        -- This is more reliable than counting UnitDestroyed events, which can be
+        -- suppressed by LOS restrictions or anti-cheat filtering.
+        -- Spring.GetTeamUnitStats returns multiple values: killed, died, captured, outCaptured, received
+        local uKilled, uDied = Spring.GetTeamUnitStats(teamID)
+        if uKilled then myTeamStats.kills  = uKilled end
+        if uDied   then myTeamStats.losses = uDied   end
 
         local currentBuildPower  = getCurrentBuildPower()
         local theoreticalMax     = currentBuildPower * UPDATE_INTERVAL
