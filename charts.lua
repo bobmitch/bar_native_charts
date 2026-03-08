@@ -701,7 +701,7 @@ function Chart:drawToList()
             gl.LineWidth(2.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
                 for i, value in ipairs(data) do
-                    if value and not (value ~= v) then
+                    if value and not (value ~= value) then
                         gl.Vertex(toX(i, #data), toY(value))
                     end
                 end
