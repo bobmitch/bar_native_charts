@@ -99,12 +99,17 @@ local CARD_WIDTH  = 140
 local CARD_HEIGHT = 70
 
 -- How often (seconds) to rebuild display lists during animation
--- Lower = smoother animation but more rebuilds; 0.05 = 20fps rebuild during lerp
 local ANIM_REBUILD_INTERVAL = 0.05
 
--- Builder efficiency scaling: BP * BP_TO_METAL ≈ metal/s capacity at full utilisation.
--- With ~1000 BP producing ~50 m/s of vehicles, the ratio is 0.05.
+-- Builder efficiency scaling
 local BP_TO_METAL = 0.05
+
+-- Build efficiency rolling average: sample once per second (every 30 game ticks
+-- at the engine's fixed 30 Hz simulation rate), average over this many samples.
+-- 30 samples = ~30s window, smoothing build-ramp transients without masking
+-- real sustained stalls.
+local BUILD_EFF_TICKS_PER_SAMPLE = 30   -- ticks between samples (30 ticks = 1s at 30 Hz)
+local BUILD_EFF_WINDOW_SIZE      = 30   -- number of samples kept (~30s window)
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
@@ -118,10 +123,10 @@ local allyTeamID = nil
 local allyTeams  = {}
 
 -- Master display list handles
-local masterDisplayList   = nil   -- Compiled list of ALL chart+card draw calls
-local masterDirty         = true  -- Needs rebuild?
-local masterLastRebuild   = 0     -- Time of last rebuild (for anim throttle)
-local hoverDisplayList    = nil   -- Cheap per-frame hover border overlay
+local masterDisplayList   = nil
+local masterDirty         = true
+local masterLastRebuild   = 0
+local hoverDisplayList    = nil
 
 local myTeamStats = {
     metalIncome      = 0, metalUsage   = 0,
@@ -130,19 +135,26 @@ local myTeamStats = {
     armyValue        = 0, unitCount    = 0,
     kills            = 0, losses       = 0,
     metalLost        = 0,
-    buildEfficiency  = 0,   -- (metalUsage / (totalBP * BP_TO_METAL)) * 100; uncapped
-    metalStall       = 0,   -- 0 = ok, 1 = partial stall (pull > income), 2 = hard stall (pull > income*1.5)
-    totalBP          = 0,   -- sum of buildSpeed for all owned builder units
+    buildEfficiency  = 0,   -- rolling average (%), exposed to charts/cards
+    metalStall       = 0,   -- 0=ok, 1=partial stall, 2=hard stall
+    totalBP          = 0,
 }
 
 -- unitID → { bp = buildSpeed, defID = unitDefID } for every builder unit we own.
--- Maintained incrementally via unit events; used to compute totalBP and buildEfficiency.
 local builderUnits = {}
 
 -- maxMetalUseCache[builderDefID][targetDefID] = maxMetal (metal/s at full build speed).
--- Persists across ticks — a given builder type + target type combo never changes.
--- Only the inner table needs creating on first use; entries are never invalidated.
 local maxMetalUseCache = {}
+
+-- Rolling average state for build efficiency.
+-- Samples are collected once per BUILD_EFF_TICKS_PER_SAMPLE game ticks using the
+-- same per-builder ratio logic as the main update, then averaged over the
+-- last BUILD_EFF_WINDOW_SIZE samples. This smooths over builder ramp-up /
+-- ramp-down transients without masking real sustained stalls.
+local buildEffSamples     = {}   -- ring buffer of recent raw efficiency samples
+local buildEffSampleIndex = 0    -- next write position (1-based, wraps)
+local buildEffSampleCount = 0    -- how many valid entries are in the buffer
+local buildEffTickCounter = 0    -- ticks elapsed since last sample
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -228,6 +240,85 @@ local function drawRoundedRect(x, y, w, h, r, filled)
 end
 
 -------------------------------------------------------------------------------
+-- BUILD EFFICIENCY — TICK-BASED SAMPLER + ROLLING AVERAGE
+-------------------------------------------------------------------------------
+
+-- Computes a raw instantaneous build efficiency reading (0–100) using the same
+-- per-builder ratio method as the main update loop. Called every
+-- BUILD_EFF_TICKS_PER_SAMPLE ticks from widget:GameFrame (once per second at
+-- 30 Hz). Returns the value to push into the ring buffer.
+local function sampleBuildEfficiency()
+    local effSum   = 0
+    local effCount = 0
+    for uid, builderData in pairs(builderUnits) do
+        local bp    = builderData.bp
+        local defID = builderData.defID
+        local targetUnitID = Spring.GetUnitIsBuilding(uid)
+        if targetUnitID then
+            local targetDefID = Spring.GetUnitDefID(targetUnitID)
+            local maxMetal = nil
+            if defID and targetDefID then
+                local row = maxMetalUseCache[defID]
+                if row then maxMetal = row[targetDefID] end
+                if maxMetal == nil then
+                    local bud = UnitDefs[defID]
+                    local tud = UnitDefs[targetDefID]
+                    if bud and tud then
+                        local bt = tud.buildTime or 1
+                        if bt <= 0 then bt = 1 end
+                        maxMetal = (bp / bt) * (tud.metalCost or 0)
+                    else
+                        maxMetal = 0
+                    end
+                    if not maxMetalUseCache[defID] then maxMetalUseCache[defID] = {} end
+                    maxMetalUseCache[defID][targetDefID] = maxMetal
+                end
+            end
+            local _, mPull = Spring.GetUnitResources(uid, "metal")
+            local mUsing = mPull or 0
+            if maxMetal and maxMetal > 0 then
+                local ratio = math.min(1.0, mUsing / maxMetal)
+                effSum   = effSum   + ratio
+                effCount = effCount + 1
+            end
+        end
+        -- Idle builders intentionally excluded (same policy as main loop)
+    end
+    -- No active builders: treat as fully efficient (nothing to stall on)
+    if effCount == 0 then
+        return myTeamStats.totalBP > 0 and 100 or 0
+    end
+    return (effSum / effCount) * 100
+end
+
+-- Push one sample into the ring buffer and recompute the rolling average.
+-- The average is written directly into myTeamStats.buildEfficiency so all
+-- consumers (chart + card) pick it up without any other changes.
+local function pushBuildEffSample(value)
+    buildEffSampleIndex = (buildEffSampleIndex % BUILD_EFF_WINDOW_SIZE) + 1
+    buildEffSamples[buildEffSampleIndex] = value
+    if buildEffSampleCount < BUILD_EFF_WINDOW_SIZE then
+        buildEffSampleCount = buildEffSampleCount + 1
+    end
+
+    -- Recompute average over all valid entries
+    local sum = 0
+    for i = 1, buildEffSampleCount do
+        sum = sum + (buildEffSamples[i] or 0)
+    end
+    myTeamStats.buildEfficiency = sum / buildEffSampleCount
+end
+
+-- Reset the rolling average buffer (called on game start / widget init)
+local function resetBuildEffSamples()
+    buildEffSamples     = {}
+    buildEffSampleIndex = 0
+    buildEffSampleCount = 0
+    buildEffTickCounter = 0
+    myTeamStats.buildEfficiency = 0
+end
+
+-------------------------------------------------------------------------------
 -- DISPLAY LIST MANAGEMENT
 -------------------------------------------------------------------------------
 
@@ -242,28 +333,22 @@ local function freeLists()
     end
 end
 
--- Rebuild the master display list from all charts + cards.
--- Called at most once per ANIM_REBUILD_INTERVAL during animation,
--- or immediately when data changes.
 local function rebuildMasterList()
     if masterDisplayList then
         gl.DeleteList(masterDisplayList)
     end
 
     masterDisplayList = gl.CreateList(function()
-        -- Draw all charts
         for _, chart in pairs(charts) do
             if chart.enabled and chart.visible then
                 chart:drawToList()
             end
         end
-        -- Draw all stat cards
         for _, card in pairs(statCards) do
             if card.enabled and card.visible then
                 card:drawToList()
             end
         end
-        -- HUD hint
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
         gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
     end)
@@ -272,7 +357,6 @@ local function rebuildMasterList()
     masterLastRebuild = os.clock()
 end
 
--- Rebuild the hover overlay list (just hot borders, no fills — very cheap)
 local function rebuildHoverList()
     if hoverDisplayList then
         gl.DeleteList(hoverDisplayList)
@@ -339,7 +423,7 @@ function StatCard:setTarget(value)
     self.targetValue  = value
     self.animProgress = 0.0
     self.animStart    = os.clock()
-    masterDirty       = true   -- will need a list rebuild
+    masterDirty       = true
 end
 
 function StatCard:update(dt)
@@ -352,8 +436,6 @@ function StatCard:update(dt)
     end
 end
 
--- This is called INSIDE gl.CreateList — no conditional branches on isHovered here
--- (hover is handled by the separate cheap overlay list)
 function StatCard:drawToList()
     local w = CARD_WIDTH
     local h = CARD_HEIGHT
@@ -378,7 +460,6 @@ function StatCard:drawToList()
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, 10, h - 18, 9, "o")
 
-    -- Stall indicator (build efficiency card only)
     if self.id == "card-build-efficiency" then
         local stall = myTeamStats.metalStall
         if stall == 2 then
@@ -514,7 +595,6 @@ function Chart:update(dt)
     end
 end
 
--- Called only inside gl.CreateList — no hover logic here
 function Chart:drawToList()
     gl.PushMatrix()
     gl.Translate(self.x, self.y, 0)
@@ -528,11 +608,9 @@ function Chart:drawToList()
     local cW  = w - pad.left - pad.right
     local cH  = h - pad.top  - pad.bottom
 
-    -- Background
     gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    -- Border (normal only — hot border comes from hover overlay list)
     gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
@@ -565,16 +643,11 @@ function Chart:drawToList()
         minV = 0
         maxV = 100
     elseif self.chartType == "storage" then
-        -- Symmetric axis centred on 0. Default ±100 (full range of balanced economy).
-        -- Expands symmetrically to fit extremes (e.g. burst build drain or full stockpile).
-        -- Value meaning: 0 = level at 50% storage (steady), +100 = full, -100 = empty.
         local absMax = math.max(math.abs(minV), math.abs(maxV), 100)
         local axisPad = absMax * 0.12
         minV = -(absMax + axisPad)
         maxV =  (absMax + axisPad)
     elseif self.chartType == "demand" then
-        -- Symmetric axis centred on 0. Range expands to fit data with padding,
-        -- minimum ±100% so the zero line is always visible in context.
         local absMax = math.max(math.abs(minV), math.abs(maxV), 100)
         local pad    = absMax * 0.15
         minV = -(absMax + pad)
@@ -589,7 +662,6 @@ function Chart:drawToList()
     local range = maxV - minV
     if range == 0 then range = 1 end
 
-    -- Grid + Y labels
     for i = 0, 4 do
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
@@ -609,7 +681,6 @@ function Chart:drawToList()
         return cY + ((value - minV) / range) * cH
     end
 
-    -- Zero reference line for centred chart types
     if self.chartType == "demand" or self.chartType == "storage" then
         local zeroY = toY(0)
         gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45)
@@ -621,7 +692,6 @@ function Chart:drawToList()
         gl.Text("0", cX - 5, zeroY - 4, 9, "ro")
     end
 
-    -- Series lines + fills
     for seriesIdx, s in ipairs(self.series) do
         local data = self.displayData[seriesIdx]
         if #data >= 2 then
@@ -631,7 +701,7 @@ function Chart:drawToList()
             gl.LineWidth(2.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
                 for i, value in ipairs(data) do
-                    if value and not (value ~= value) then
+                    if value and not (value ~= v) then
                         gl.Vertex(toX(i, #data), toY(value))
                     end
                 end
@@ -683,11 +753,9 @@ function Chart:drawToList()
         end
     end
 
-    -- Header
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
 
-    -- Stall indicator (build efficiency chart only)
     if self.id == "chart-build-efficiency" then
         local stall = myTeamStats.metalStall
         if stall == 2 then
@@ -783,10 +851,6 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
 end
 
 function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam)
-    -- Army value and build power are updated here since the unit list changes immediately.
-    -- Kills and losses are intentionally NOT tracked here; they are fetched authoritatively
-    -- from Spring.GetTeamUnitStats() in the periodic update loop to avoid inaccuracies
-    -- caused by LOS restrictions or anti-cheat mechanisms filtering event data.
     local cost = unitMetalCost(unitDefID)
     if unitTeam == teamID then
         myTeamStats.armyValue = math.max(0, myTeamStats.armyValue - cost)
@@ -931,6 +995,8 @@ function widget:Initialize()
     charts      = {}
     statCards   = {}
 
+    resetBuildEffSamples()
+
     -- ── LINE CHARTS ───────────────────────────────────────────────────────────
 
     charts.metal = Chart.new("chart-metal", "METAL", "⚙", vsx - 350, vsy - 230, "dual", {
@@ -959,6 +1025,7 @@ function widget:Initialize()
         end },
     })
 
+    -- buildEfficiency read from myTeamStats, which now holds the rolling average
     charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILDER EFFICIENCY", "🔧", vsx - 970, vsy - 430, "percent", {
         { label = "Efficiency", color = COLOR.gold, getValue = function()
             return myTeamStats.buildEfficiency
@@ -988,6 +1055,7 @@ function widget:Initialize()
         col2X, cardY - cardStep * 2, COLOR.danger, function() return myTeamStats.damageTaken end)
     statCards["card-metal-lost"] = StatCard.new("card-metal-lost", "METAL LOST", "◆",
         col1X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.metalLost end)
+    -- Card reads the rolling average via myTeamStats.buildEfficiency, same as the chart
     statCards["card-build-efficiency"] = StatCard.new("card-build-efficiency", "BUILD EFF", "🔧",
         col2X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.buildEfficiency end)
 
@@ -1044,7 +1112,7 @@ function widget:Update(dt)
         return
     end
 
-    -- Animate all charts/cards — they set masterDirty if still in motion
+    -- Animate all charts/cards
     local anyAnimating = false
     for _, chart in pairs(charts) do
         chart:update(dt)
@@ -1057,13 +1125,12 @@ function widget:Update(dt)
 
     -- Throttle display list rebuilds during animation to ~20fps
     if masterDirty then
-        local now = os.clock()
+        local t = os.clock()
         if anyAnimating then
-            if now - masterLastRebuild >= ANIM_REBUILD_INTERVAL then
+            if t - masterLastRebuild >= ANIM_REBUILD_INTERVAL then
                 rebuildMasterList()
             end
         else
-            -- Not animating: rebuild immediately (data just changed)
             rebuildMasterList()
         end
     end
@@ -1077,16 +1144,6 @@ function widget:Update(dt)
             if not teamID then return end
         end
 
-        -- GetTeamResources returns live per-second rates:
-        --   currentLevel, storage, pull, income, expense, share
-        -- "income"  = metal/s being generated right now
-        -- "expense" = metal/s actually being spent right now (may be < pull if metal-stalling)
-        -- "pull"    = metal/s being requested by all builders regardless of availability
-        --
-        -- GetTeamResourceStats returns cumulative totals for the current stats period:
-        --   used, produced, excess, received, sent
-        -- We use GetTeamResources for income/expense (live rates), and
-        -- GetTeamResourceStats only for the period totals we still need.
         local m_level, m_storage, m_pull, m_income, m_expense, m_share = Spring.GetTeamResources(teamID, "metal")
         local e_level, e_storage, e_pull, e_income, e_expense, e_share = Spring.GetTeamResources(teamID, "energy")
         myTeamStats.metalIncome  = m_income  or 0
@@ -1094,82 +1151,22 @@ function widget:Update(dt)
         myTeamStats.energyIncome = e_income  or 0
         myTeamStats.energyUsage  = e_expense or 0
 
-        -- Builder efficiency: per-unit ratio of actual metal draw vs theoretical max metal draw
-        -- for the unit currently being constructed, averaged across all active builders.
-        -- Idle builders are excluded from both numerator and denominator (they don't drag
-        -- the average down — we only measure builders that are assigned to a task).
-        -- If no builders are actively constructing, we report 100% (nothing to measure).
-        --
-        -- Per-builder max metal rate = (builderSpeed / targetBuildTime) * targetMetalCost
-        -- This value is cached by [builderDefID][targetDefID] since it depends only on
-        -- unit definitions, not runtime state — so it is computed at most once per combo.
-        --
-        -- GetUnitResources(unitID, "metal") → currentLevel, pull, income, expense, share
-        -- We use the "pull" value (index 2) as the actual metal draw rate for the unit.
-        local totalBP  = 0
-        local effSum   = 0
-        local effCount = 0
+        -- totalBP is still computed here (not in the sampler) since it only
+        -- needs to be current for the stall indicator and the "no builders" path.
+        local totalBP = 0
         for uid, builderData in pairs(builderUnits) do
-            local bp    = builderData.bp
-            local defID = builderData.defID
-            totalBP = totalBP + bp
-
-            local targetUnitID = Spring.GetUnitIsBuilding(uid)
-            if targetUnitID then
-                -- Builder is actively constructing something
-                local targetDefID = Spring.GetUnitDefID(targetUnitID)
-
-                -- Look up cached max metal/s for this builder+target combo
-                local maxMetal = nil
-                if defID and targetDefID then
-                    local row = maxMetalUseCache[defID]
-                    if row then
-                        maxMetal = row[targetDefID]  -- nil if not yet computed
-                    end
-                    if maxMetal == nil then
-                        -- First time seeing this combo — compute and store it
-                        local bud = UnitDefs[defID]
-                        local tud = UnitDefs[targetDefID]
-                        if bud and tud then
-                            local bt = tud.buildTime or 1
-                            if bt <= 0 then bt = 1 end
-                            maxMetal = (bp / bt) * (tud.metalCost or 0)
-                        else
-                            maxMetal = 0
-                        end
-                        if not maxMetalUseCache[defID] then
-                            maxMetalUseCache[defID] = {}
-                        end
-                        maxMetalUseCache[defID][targetDefID] = maxMetal
-                    end
-                end
-
-                -- Actual metal draw: GetUnitResources returns currentLevel, pull, income, expense, share
-                local _, mPull = Spring.GetUnitResources(uid, "metal")
-                local mUsing = mPull or 0
-
-                if maxMetal and maxMetal > 0 then
-                    local ratio = math.min(1.0, mUsing / maxMetal)
-                    effSum   = effSum   + ratio
-                    effCount = effCount + 1
-                end
-            end
-            -- Idle builders (targetUnitID == nil) are intentionally skipped
+            totalBP = totalBP + builderData.bp
         end
         myTeamStats.totalBP = totalBP
-        myTeamStats.buildEfficiency = effCount > 0
-            and ((effSum / effCount) * 100)
-            or  (totalBP > 0 and 100 or 0)  -- all idle or no builders → report 100%
 
-        -- Metal stall detection: builders are stalling when they requested more metal than
-        -- they actually received, i.e. the engine throttled them. This is indicated by
-        -- expense < pull (pull = requested rate, expense = actually spent rate).
-        -- A small tolerance (2%) avoids false positives from floating point jitter.
-        -- Hard stall: receiving less than 60% of what was requested (red).
-        -- Partial stall: receiving 60–99% of what was requested (amber).
+        -- NOTE: myTeamStats.buildEfficiency is maintained by the GameFrame tick sampler
+        -- (widget:GameFrame → pushBuildEffSample / sampleBuildEfficiency). We do NOT
+        -- overwrite it here. The chart and card both read the rolling average automatically.
+
+        -- Metal stall detection (unchanged)
         local pull    = m_pull    or 0
         local expense = m_expense or 0
-        if pull > 1 then  -- ignore when pull is negligible (no active builders)
+        if pull > 1 then
             local ratio = expense / pull
             if ratio < 0.60 then
                 myTeamStats.metalStall = 2
@@ -1188,10 +1185,6 @@ function widget:Update(dt)
             myTeamStats.damageTaken = dmg_taken or 0
         end
 
-        -- Fetch authoritative kills and losses from the engine's unit stats.
-        -- This is more reliable than counting UnitDestroyed events, which can be
-        -- suppressed by LOS restrictions or anti-cheat filtering.
-        -- Spring.GetTeamUnitStats returns multiple values: killed, died, captured, outCaptured, received
         local uKilled, uDied = Spring.GetTeamUnitStats(teamID)
         if uKilled then myTeamStats.kills  = uKilled end
         if uDied   then myTeamStats.losses = uDied   end
@@ -1208,7 +1201,24 @@ function widget:Update(dt)
         for _, chart in pairs(charts) do chart:addDataPoint() end
         for _, card  in pairs(statCards) do card:setTarget(card.getValue()) end
 
-        masterDirty = true  -- force immediate rebuild (no animation yet)
+        masterDirty = true
+    end
+end
+
+-------------------------------------------------------------------------------
+-- GAME FRAME — build efficiency sampler (fires every game tick at 30 Hz)
+-------------------------------------------------------------------------------
+
+-- widget:GameFrame fires once per simulation tick. We count ticks and sample
+-- every BUILD_EFF_TICKS_PER_SAMPLE ticks (30 = 1 s at 30 Hz). Using game ticks
+-- rather than os.clock() keeps the sampler locked to simulation time, so it
+-- pauses correctly when the game is paused or running in slow-motion.
+function widget:GameFrame(n)
+    if not chartsReady then return end
+    buildEffTickCounter = buildEffTickCounter + 1
+    if buildEffTickCounter >= BUILD_EFF_TICKS_PER_SAMPLE then
+        buildEffTickCounter = 0
+        pushBuildEffSample(sampleBuildEfficiency())
     end
 end
 
@@ -1225,6 +1235,7 @@ function widget:GameStart()
     myTeamStats.damageTaken    = 0; myTeamStats.buildEfficiency = 0
     myTeamStats.metalStall     = 0; myTeamStats.totalBP         = 0
     builderUnits = {}
+    resetBuildEffSamples()
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue = 0; teamData.buildPower = 0
     end
@@ -1233,21 +1244,13 @@ function widget:GameStart()
 end
 
 -------------------------------------------------------------------------------
--- RENDERING — the hot path, now trivially cheap
+-- RENDERING
 -------------------------------------------------------------------------------
 
 function widget:DrawScreen()
     if not chartsEnabled then return end
-
-    -- Replay the pre-compiled display list — single GL call, near-zero CPU
-    if masterDisplayList then
-        gl.CallList(masterDisplayList)
-    end
-
-    -- Hover overlay: only rebuild when hover state changes (handled in MouseMove)
-    if hoverDisplayList then
-        gl.CallList(hoverDisplayList)
-    end
+    if masterDisplayList then gl.CallList(masterDisplayList) end
+    if hoverDisplayList  then gl.CallList(hoverDisplayList)  end
 end
 
 -------------------------------------------------------------------------------
@@ -1264,7 +1267,7 @@ function widget:KeyPress(key, mods, isRepeat)
     return false
 end
 
-local prevHoverState = {}  -- track hover state to avoid unnecessary hover list rebuilds
+local prevHoverState = {}
 
 local function findHitElement(mx, my)
     for id, card in pairs(statCards) do
@@ -1309,8 +1312,6 @@ end
 
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
-
-    -- Handle drag
     for _, card in pairs(statCards) do
         if card.isDragging then
             card.x = mx - card.dragStartX
@@ -1327,8 +1328,6 @@ function widget:MouseMove(mx, my, dx, dy)
             return true
         end
     end
-
-    -- Update hover state; only rebuild hover list if something changed
     local hoverChanged = false
     for id, card in pairs(statCards) do
         local h = card:isMouseOver(mx, my)
@@ -1340,10 +1339,7 @@ function widget:MouseMove(mx, my, dx, dy)
         if h ~= chart.isHovered then hoverChanged = true end
         chart.isHovered = h
     end
-
     if hoverChanged then rebuildHoverList() end
-
-    -- Return true only if hovering something (to suppress other mouse handlers)
     for _, card in pairs(statCards) do if card.isHovered then return true end end
     for _, chart in pairs(charts) do if chart.isHovered then return true end end
     return false
@@ -1403,6 +1399,8 @@ function widget:TextCommand(command)
         Spring.Echo("vsx=" .. tostring(vsx) .. " vsy=" .. tostring(vsy))
         Spring.Echo("chartsEnabled=" .. tostring(chartsEnabled) .. " chartsReady=" .. tostring(chartsReady))
         Spring.Echo("masterDirty=" .. tostring(masterDirty) .. " masterDisplayList=" .. tostring(masterDisplayList))
+        Spring.Echo(string.format("buildEfficiency=%.1f%% (rolling avg over %d/%d samples)",
+            myTeamStats.buildEfficiency, buildEffSampleCount, BUILD_EFF_WINDOW_SIZE))
         Spring.Echo("-- CARDS --")
         for id, card in pairs(statCards) do
             Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s",
@@ -1415,8 +1413,10 @@ function widget:TextCommand(command)
         end
         return true
     elseif command == "barcharts bp" then
-        -- Builder efficiency diagnostic — type /barcharts bp in-game while building
         Spring.Echo("=== Builder Efficiency Diagnostic ===")
+        Spring.Echo(string.format("  Rolling average: %.1f%% (%d/%d samples, window=%ds)",
+            myTeamStats.buildEfficiency, buildEffSampleCount, BUILD_EFF_WINDOW_SIZE,
+            BUILD_EFF_WINDOW_SIZE * (BUILD_EFF_TICKS_PER_SAMPLE / 30)))
         local totalBP      = 0
         local builderCount = 0
         local effSum       = 0
@@ -1441,10 +1441,9 @@ function widget:TextCommand(command)
                 effCount = effCount + 1
             end
         end
-        local eff = effCount > 0 and (effSum / effCount * 100) or (totalBP > 0 and 100 or 0)
-        Spring.Echo(string.format("  builders=%d  totalBP=%.1f  active=%d  efficiency=%.1f%%",
-            builderCount, totalBP, effCount, eff))
-        Spring.Echo(string.format("  myTeamStats.buildEfficiency=%.1f%%", myTeamStats.buildEfficiency))
+        local instantEff = effCount > 0 and (effSum / effCount * 100) or (totalBP > 0 and 100 or 0)
+        Spring.Echo(string.format("  builders=%d  totalBP=%.1f  active=%d  instant=%.1f%%  rolling=%.1f%%",
+            builderCount, totalBP, effCount, instantEff, myTeamStats.buildEfficiency))
         return true
     end
     return false
