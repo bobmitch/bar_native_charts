@@ -102,6 +102,10 @@ local CARD_HEIGHT = 70
 -- Lower = smoother animation but more rebuilds; 0.05 = 20fps rebuild during lerp
 local ANIM_REBUILD_INTERVAL = 0.05
 
+-- Builder efficiency scaling: BP * BP_TO_METAL ≈ metal/s capacity at full utilisation.
+-- With ~1000 BP producing ~50 m/s of vehicles, the ratio is 0.05.
+local BP_TO_METAL = 0.05
+
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
 -------------------------------------------------------------------------------
@@ -126,19 +130,19 @@ local myTeamStats = {
     armyValue        = 0, unitCount    = 0,
     kills            = 0, losses       = 0,
     metalLost        = 0,
-    buildEfficiency  = 0,   -- 0–100 % of total build speed currently active
+    buildEfficiency  = 0,   -- (metalUsage / (totalBP * BP_TO_METAL)) * 100; uncapped
+    metalStall       = 0,   -- 0 = ok, 1 = partial stall (pull > income), 2 = hard stall (pull > income*1.5)
+    totalBP          = 0,   -- sum of buildSpeed for all owned builder units
 }
 
--- unitID → buildSpeed for every builder unit we own.
--- Maintained incrementally via unit events; used to compute buildEfficiency.
+-- unitID → { bp = buildSpeed, defID = unitDefID } for every builder unit we own.
+-- Maintained incrementally via unit events; used to compute totalBP and buildEfficiency.
 local builderUnits = {}
 
--- Per-tick accumulators for builder efficiency.
--- Every GameFrame we add (activeBP / totalBP) as a fractional sample so that
--- the graph point reflects average efficiency over the full update interval
--- rather than a single spot-check at collection time.
-local beff_activeTicks = 0   -- sum of (activeBP / totalBP) samples
-local beff_sampleCount = 0   -- number of ticks sampled
+-- maxMetalUseCache[builderDefID][targetDefID] = maxMetal (metal/s at full build speed).
+-- Persists across ticks — a given builder type + target type combo never changes.
+-- Only the inner table needs creating on first use; entries are never invalidated.
+local maxMetalUseCache = {}
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -374,6 +378,18 @@ function StatCard:drawToList()
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, 10, h - 18, 9, "o")
 
+    -- Stall indicator (build efficiency card only)
+    if self.id == "card-build-efficiency" then
+        local stall = myTeamStats.metalStall
+        if stall == 2 then
+            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+            gl.Text("⚠ STALL", w - 6, h - 18, 9, "ro")
+        elseif stall == 1 then
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+            gl.Text("⚠ STALL", w - 6, h - 18, 9, "ro")
+        end
+    end
+
     gl.Color(c[1], c[2], c[3], 1.0)
     gl.Text(formatNumber(math.floor(self.displayValue + 0.5)), w / 2 + 5, 10, 20, "co")
 
@@ -547,7 +563,7 @@ function Chart:drawToList()
 
     if self.chartType == "percent" then
         minV = 0
-        maxV = math.max(100, maxV)
+        maxV = 100
     elseif self.chartType == "storage" then
         -- Symmetric axis centred on 0. Default ±100 (full range of balanced economy).
         -- Expands symmetrically to fit extremes (e.g. burst build drain or full stockpile).
@@ -671,6 +687,18 @@ function Chart:drawToList()
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
 
+    -- Stall indicator (build efficiency chart only)
+    if self.id == "chart-build-efficiency" then
+        local stall = myTeamStats.metalStall
+        if stall == 2 then
+            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+            gl.Text("⚠ STALL", w - pad.right - 2, h - pad.top - 10, 10, "ro")
+        elseif stall == 1 then
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+            gl.Text("⚠ STALL", w - pad.right - 2, h - pad.top - 10, 10, "ro")
+        end
+    end
+
     gl.PopMatrix()
 end
 
@@ -721,7 +749,7 @@ local function seedBuildPower()
                 local bp = ud.buildSpeed or 0
                 teamData.buildPower = teamData.buildPower + bp
                 if tid == teamID then
-                    builderUnits[uid] = bp
+                    builderUnits[uid] = { bp = bp, defID = Spring.GetUnitDefID(uid) }
                 end
             end
         end
@@ -744,7 +772,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     if unitTeam == teamID then
         myTeamStats.armyValue = myTeamStats.armyValue + cost
         myTeamStats.unitCount = myTeamStats.unitCount + 1
-        if bp > 0 then builderUnits[unitID] = bp end
+        if bp > 0 then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
     end
     if allyTeams[unitTeam] then
         allyTeams[unitTeam].armyValue  = allyTeams[unitTeam].armyValue + cost
@@ -796,7 +824,7 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     local ud = UnitDefs[unitDefID]
     if ud and ud.isBuilder then
         local bp = ud.buildSpeed or 0
-        if newTeam == teamID then builderUnits[unitID] = bp end
+        if newTeam == teamID then builderUnits[unitID] = { bp = bp, defID = unitDefID } end
         if allyTeams[oldTeam] then allyTeams[oldTeam].buildPower = math.max(0, allyTeams[oldTeam].buildPower - bp) end
         if allyTeams[newTeam] then allyTeams[newTeam].buildPower = allyTeams[newTeam].buildPower + bp end
     end
@@ -960,6 +988,8 @@ function widget:Initialize()
         col2X, cardY - cardStep * 2, COLOR.danger, function() return myTeamStats.damageTaken end)
     statCards["card-metal-lost"] = StatCard.new("card-metal-lost", "METAL LOST", "◆",
         col1X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.metalLost end)
+    statCards["card-build-efficiency"] = StatCard.new("card-build-efficiency", "BUILD EFF", "🔧",
+        col2X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.buildEfficiency end)
 
     -- ── APPLY SAVED CONFIG ────────────────────────────────────────────────────
     local chartCfg, cardCfg = loadConfig()
@@ -1064,15 +1094,93 @@ function widget:Update(dt)
         myTeamStats.energyIncome = e_income  or 0
         myTeamStats.energyUsage  = e_expense or 0
 
-        -- Builder efficiency: average of per-tick samples accumulated since last
-        -- graph update via widget:GameFrame(). Each tick contributes activeBP/totalBP
-        -- so the result is weighted by build speed and averaged over real play time,
-        -- not a single spot-check. Reset accumulators after consuming.
-        myTeamStats.buildEfficiency = beff_sampleCount > 0
-            and (beff_activeTicks / beff_sampleCount * 100)
-            or  0
-        beff_activeTicks = 0
-        beff_sampleCount = 0
+        -- Builder efficiency: per-unit ratio of actual metal draw vs theoretical max metal draw
+        -- for the unit currently being constructed, averaged across all active builders.
+        -- Idle builders are excluded from both numerator and denominator (they don't drag
+        -- the average down — we only measure builders that are assigned to a task).
+        -- If no builders are actively constructing, we report 100% (nothing to measure).
+        --
+        -- Per-builder max metal rate = (builderSpeed / targetBuildTime) * targetMetalCost
+        -- This value is cached by [builderDefID][targetDefID] since it depends only on
+        -- unit definitions, not runtime state — so it is computed at most once per combo.
+        --
+        -- GetUnitResources(unitID, "metal") → currentLevel, pull, income, expense, share
+        -- We use the "pull" value (index 2) as the actual metal draw rate for the unit.
+        local totalBP  = 0
+        local effSum   = 0
+        local effCount = 0
+        for uid, builderData in pairs(builderUnits) do
+            local bp    = builderData.bp
+            local defID = builderData.defID
+            totalBP = totalBP + bp
+
+            local targetUnitID = Spring.GetUnitIsBuilding(uid)
+            if targetUnitID then
+                -- Builder is actively constructing something
+                local targetDefID = Spring.GetUnitDefID(targetUnitID)
+
+                -- Look up cached max metal/s for this builder+target combo
+                local maxMetal = nil
+                if defID and targetDefID then
+                    local row = maxMetalUseCache[defID]
+                    if row then
+                        maxMetal = row[targetDefID]  -- nil if not yet computed
+                    end
+                    if maxMetal == nil then
+                        -- First time seeing this combo — compute and store it
+                        local bud = UnitDefs[defID]
+                        local tud = UnitDefs[targetDefID]
+                        if bud and tud then
+                            local bt = tud.buildTime or 1
+                            if bt <= 0 then bt = 1 end
+                            maxMetal = (bp / bt) * (tud.metalCost or 0)
+                        else
+                            maxMetal = 0
+                        end
+                        if not maxMetalUseCache[defID] then
+                            maxMetalUseCache[defID] = {}
+                        end
+                        maxMetalUseCache[defID][targetDefID] = maxMetal
+                    end
+                end
+
+                -- Actual metal draw: GetUnitResources returns currentLevel, pull, income, expense, share
+                local _, mPull = Spring.GetUnitResources(uid, "metal")
+                local mUsing = mPull or 0
+
+                if maxMetal and maxMetal > 0 then
+                    local ratio = math.min(1.0, mUsing / maxMetal)
+                    effSum   = effSum   + ratio
+                    effCount = effCount + 1
+                end
+            end
+            -- Idle builders (targetUnitID == nil) are intentionally skipped
+        end
+        myTeamStats.totalBP = totalBP
+        myTeamStats.buildEfficiency = effCount > 0
+            and ((effSum / effCount) * 100)
+            or  (totalBP > 0 and 100 or 0)  -- all idle or no builders → report 100%
+
+        -- Metal stall detection: builders are stalling when they requested more metal than
+        -- they actually received, i.e. the engine throttled them. This is indicated by
+        -- expense < pull (pull = requested rate, expense = actually spent rate).
+        -- A small tolerance (2%) avoids false positives from floating point jitter.
+        -- Hard stall: receiving less than 60% of what was requested (red).
+        -- Partial stall: receiving 60–99% of what was requested (amber).
+        local pull    = m_pull    or 0
+        local expense = m_expense or 0
+        if pull > 1 then  -- ignore when pull is negligible (no active builders)
+            local ratio = expense / pull
+            if ratio < 0.60 then
+                myTeamStats.metalStall = 2
+            elseif ratio < 0.98 then
+                myTeamStats.metalStall = 1
+            else
+                myTeamStats.metalStall = 0
+            end
+        else
+            myTeamStats.metalStall = 0
+        end
 
         if Spring.GetTeamDamageStats then
             local dmg_dealt, dmg_taken = Spring.GetTeamDamageStats(teamID)
@@ -1105,32 +1213,6 @@ function widget:Update(dt)
 end
 
 -------------------------------------------------------------------------------
--- PER-TICK BUILDER EFFICIENCY SAMPLING
--------------------------------------------------------------------------------
-
--- Called every simulation tick (30 Hz). We compute activeBP/totalBP for this
--- tick and accumulate it so widget:Update can average over the full interval.
--- Keeping the math minimal: one pass over builderUnits (typically <20 entries),
--- two divisions, two additions — negligible cost even at 30 Hz.
-function widget:GameFrame(frame)
-    if not chartsReady then return end
-
-    local totalBP  = 0
-    local activeBP = 0
-    for uid, bp in pairs(builderUnits) do
-        totalBP = totalBP + bp
-        if Spring.GetUnitIsBuilding(uid) then
-            activeBP = activeBP + bp
-        end
-    end
-
-    if totalBP > 0 then
-        beff_activeTicks = beff_activeTicks + (activeBP / totalBP)
-        beff_sampleCount = beff_sampleCount + 1
-    end
-end
-
--------------------------------------------------------------------------------
 -- GAME START
 -------------------------------------------------------------------------------
 
@@ -1141,9 +1223,8 @@ function widget:GameStart()
     myTeamStats.kills          = 0; myTeamStats.losses         = 0
     myTeamStats.metalLost      = 0; myTeamStats.damageDealt     = 0
     myTeamStats.damageTaken    = 0; myTeamStats.buildEfficiency = 0
-    builderUnits     = {}
-    beff_activeTicks = 0
-    beff_sampleCount = 0
+    myTeamStats.metalStall     = 0; myTeamStats.totalBP         = 0
+    builderUnits = {}
     for tid, teamData in pairs(allyTeams) do
         teamData.armyValue = 0; teamData.buildPower = 0
     end
@@ -1336,21 +1417,33 @@ function widget:TextCommand(command)
     elseif command == "barcharts bp" then
         -- Builder efficiency diagnostic — type /barcharts bp in-game while building
         Spring.Echo("=== Builder Efficiency Diagnostic ===")
-        local totalBP  = 0
-        local activeBP = 0
+        local totalBP      = 0
         local builderCount = 0
-        for uid, bp in pairs(builderUnits) do
+        local effSum       = 0
+        local effCount     = 0
+        for uid, builderData in pairs(builderUnits) do
             builderCount = builderCount + 1
+            local bp    = builderData.bp
+            local defID = builderData.defID
             totalBP = totalBP + bp
-            local isBuilding = Spring.GetUnitIsBuilding(uid)
-            if isBuilding then activeBP = activeBP + bp end
-            local ud = UnitDefs[Spring.GetUnitDefID(uid) or 0]
-            Spring.Echo(string.format("    uid=%d  name=%s  bp=%.1f  building=%s",
-                uid, ud and ud.name or "?", bp, tostring(isBuilding ~= nil)))
+            local targetUnitID = Spring.GetUnitIsBuilding(uid)
+            local bud = defID and UnitDefs[defID]
+            local targetDefID = targetUnitID and Spring.GetUnitDefID(targetUnitID)
+            local maxMetal = (defID and targetDefID and maxMetalUseCache[defID]) and maxMetalUseCache[defID][targetDefID] or 0
+            local _, mPull = Spring.GetUnitResources(uid, "metal")
+            local mUsing = mPull or 0
+            local ratio = (maxMetal > 0) and math.min(1.0, mUsing / maxMetal) or nil
+            Spring.Echo(string.format("    uid=%d  name=%s  bp=%.1f  building=%s  maxMetal=%.2f  using=%.2f  ratio=%s",
+                uid, bud and bud.name or "?", bp, tostring(targetUnitID ~= nil),
+                maxMetal, mUsing, ratio and string.format("%.0f%%", ratio * 100) or "idle"))
+            if ratio then
+                effSum   = effSum   + ratio
+                effCount = effCount + 1
+            end
         end
-        local eff = totalBP > 0 and (activeBP / totalBP * 100) or 0
-        Spring.Echo(string.format("  builders=%d  totalBP=%.1f  activeBP=%.1f  efficiency=%.1f%%",
-            builderCount, totalBP, activeBP, eff))
+        local eff = effCount > 0 and (effSum / effCount * 100) or (totalBP > 0 and 100 or 0)
+        Spring.Echo(string.format("  builders=%d  totalBP=%.1f  active=%d  efficiency=%.1f%%",
+            builderCount, totalBP, effCount, eff))
         Spring.Echo(string.format("  myTeamStats.buildEfficiency=%.1f%%", myTeamStats.buildEfficiency))
         return true
     end
