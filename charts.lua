@@ -7,15 +7,22 @@
     
     Controls:
     - F9: Toggle all charts on/off
-    - Click+Drag: Move charts/cards
-    - Mouse Wheel over chart/card: Scale size
-    - Right-click: Toggle individual chart/card visibility
+    - Click+Drag: Move charts/cards  (only when Edit Mode is ON)
+    - Mouse Wheel over chart/card: Scale size  (only when Edit Mode is ON)
+    - Right-click: Toggle individual chart/card visibility  (Edit Mode only)
+
+    Edit Mode Toggle:
+    - Small RmlUI pill button in top-left corner (default: LOCKED)
+    - Click pill to toggle LOCKED ↔ EDIT
+    - In LOCKED mode all chart mouse interactions are suppressed so
+      mis-clicks/scroll never accidentally move or zoom a chart mid-game.
     
     Commands:
     - /barcharts save   : Save layout immediately
     - /barcharts reset  : Delete config and restore defaults
     - /barcharts debug  : Print state to console
     - /barcharts bp     : Print builder efficiency diagnostic
+    - /barcharts edit   : Toggle edit mode from chat
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -62,8 +69,12 @@ end
 local vsx, vsy = Spring.GetViewGeometry()
 local CONFIG_FILE = "bar_charts_config.lua"
 
-local chartsEnabled = true
-local chartsReady   = false
+local chartsEnabled     = true
+local chartsReady       = false
+
+-- Edit mode: when false all chart mouse interactions are suppressed.
+-- This prevents accidental drag/zoom/hide of charts during normal gameplay.
+local chartsInteractive = false   -- default: LOCKED
 
 local COLOR = {
     bg          = {0.031, 0.047, 0.078, 0.72},
@@ -128,6 +139,103 @@ local buildEffSamples     = {}
 local buildEffSampleIndex = 0
 local buildEffSampleCount = 0
 local buildEffTickCounter = 0
+
+-------------------------------------------------------------------------------
+-- RMLUI TOGGLE WIDGET
+-------------------------------------------------------------------------------
+
+-- RmlUI state — context, document, data model
+local rmlContext    = nil
+local rmlDocument   = nil
+local rmlModel      = nil
+local rmlModelHandle = nil
+
+-- Data model table that RmlUI reads from
+local rmlData = {
+    labelText = "LOCKED",
+    iconClass = "state-locked",
+}
+
+-- Called by RmlUI when the user clicks the pill button.
+-- This function is registered on the data model so RML can reach it
+-- via data-event-click="onToggleClick(event)".
+local function onToggleClick(event)
+    chartsInteractive = not chartsInteractive
+
+    if rmlDocument then
+        local pill = rmlDocument:GetElementById("toggle-pill")
+        if pill then
+            if chartsInteractive then
+                pill:SetClass("state-edit",   true)
+                pill:SetClass("state-locked", false)
+                pill.inner_rml = "CHARTS: EDIT"
+            else
+                pill:SetClass("state-locked", true)
+                pill:SetClass("state-edit",   false)
+                pill.inner_rml = "CHARTS: LOCKED"
+            end
+        end
+    end
+
+    masterDirty = true
+    Spring.Echo("BAR Charts: " .. (chartsInteractive and "Edit mode ON — charts are interactive" or "Locked — charts are protected"))
+end
+
+local function initRmlToggle()
+    if not RmlUi then
+        Spring.Echo("BAR Charts: RmlUi not available, toggle widget skipped")
+        return
+    end
+
+    rmlContext = RmlUi.CreateContext("bar_charts_toggle_ctx")
+    if not rmlContext then
+        Spring.Echo("BAR Charts: failed to create RmlUI context")
+        return
+    end
+
+    -- Load fonts into our context. BAR ships these in LuaUI/Fonts/.
+    -- Try several common names; RmlUi silently ignores missing files.
+    local fonts = {
+        "LuaUI/Fonts/Exo2-SemiBold.ttf",
+        "LuaUI/Fonts/Exo2-Regular.ttf",
+        "LuaUI/Fonts/FreeSansBold.otf",
+        "LuaUI/Fonts/FreeSans.otf",
+    }
+    for _, f in ipairs(fonts) do
+        if VFS.FileExists(f) then
+            RmlUi.LoadFontFace(f)
+        end
+    end
+
+    -- No data model needed — we wire the click directly via element:AddEventListener
+    rmlDocument = rmlContext:LoadDocument("LuaUI/Widgets/bar_charts_toggle.rml")
+    if not rmlDocument then
+        Spring.Echo("BAR Charts: failed to load bar_charts_toggle.rml")
+        return
+    end
+
+    local pill = rmlDocument:GetElementById("toggle-pill")
+    if not pill then
+        Spring.Echo("BAR Charts: toggle-pill element not found in RML")
+        return
+    end
+
+    pill:AddEventListener("click", onToggleClick, false)
+    pill:SetClass("state-locked", true)
+    pill:SetClass("state-edit",   false)
+
+    rmlDocument:Show()
+    Spring.Echo("BAR Charts: RmlUI toggle initialized")
+end
+
+local function shutdownRmlToggle()
+    if rmlDocument then
+        rmlDocument:Close()
+        rmlDocument = nil
+    end
+    -- Note: don't destroy the context if it is shared with other widgets
+    rmlContext = nil
+end
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
@@ -291,6 +399,11 @@ local function rebuildMasterList()
         for _, card in pairs(statCards) do
             if card.enabled and card.visible then card:drawToList() end
         end
+        -- Hint text: show lock state when charts are visible
+        if chartsInteractive then
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.55)
+            gl.Text("✏ EDIT MODE", vsx - 150, 45, 11, "o")
+        end
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
         gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
     end)
@@ -300,6 +413,8 @@ end
 local function rebuildHoverList()
     if hoverDisplayList then gl.DeleteList(hoverDisplayList) end
     hoverDisplayList = gl.CreateList(function()
+        -- Only render hover highlights when interactive
+        if not chartsInteractive then return end
         for _, chart in pairs(charts) do
             if chart.enabled and chart.visible and chart.isHovered then
                 gl.PushMatrix()
@@ -516,7 +631,6 @@ function Chart:drawToList()
         return
     end
 
-    -- Gather all values to compute axis range
     local allValues = {}
     for i = 1, #self.series do
         for _, v in ipairs(self.history[i]) do
@@ -550,7 +664,6 @@ function Chart:drawToList()
     local range = maxV - minV
     if range == 0 then range = 1 end
 
-    -- Grid lines + Y-axis labels
     for i = 0, 4 do
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
@@ -581,7 +694,6 @@ function Chart:drawToList()
         gl.Text("0", cX - 5, zeroY - 4, 9, "ro")
     end
 
-    -- Draw each series
     for seriesIdx, s in ipairs(self.series) do
         local data = self.history[seriesIdx]
         if #data >= 2 then
@@ -608,7 +720,6 @@ function Chart:drawToList()
                 end
             end)
 
-            -- Endpoint dot + label
             if #data > 0 then
                 local lastValue = data[#data]
                 if lastValue and not (lastValue ~= lastValue) then
@@ -644,7 +755,6 @@ function Chart:drawToList()
         end
     end
 
-    -- Chart title
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
 
@@ -832,7 +942,13 @@ end
 -------------------------------------------------------------------------------
 
 local function saveConfig()
-    local config = { version = "1.0", enabled = chartsEnabled, charts = {}, cards = {} }
+    local config = {
+        version           = "1.0",
+        enabled           = chartsEnabled,
+        chartsInteractive = chartsInteractive,
+        charts            = {},
+        cards             = {},
+    }
     for _, chart in pairs(charts) do
         config.charts[chart.id] = {
             x = chart.x, y = chart.y, scale = chart.scale,
@@ -870,6 +986,8 @@ local function loadConfig()
         return {}, {}
     end
     if result.enabled ~= nil then chartsEnabled = result.enabled end
+    -- Restore interactive/locked state (always default to locked on fresh install)
+    if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
     return result.charts or {}, result.cards or {}
 end
 
@@ -965,6 +1083,9 @@ function widget:Initialize()
         end
     end
 
+    -- ── RMLUI TOGGLE ─────────────────────────────────────────────────────────
+    initRmlToggle()
+
     masterDirty = true
     Spring.Echo("BAR Charts: Initialized, waiting for team data...")
 end
@@ -993,12 +1114,10 @@ function widget:Update(dt)
         return
     end
 
-    -- Rebuild display list only when data is dirty
     if masterDirty then
         rebuildMasterList()
     end
 
-    -- Periodic data fetch (every 10s)
     local gameTime = Spring.GetGameSeconds()
     if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
         lastUpdateTime = gameTime
@@ -1020,7 +1139,6 @@ function widget:Update(dt)
         end
         myTeamStats.totalBP = totalBP
 
-        -- Metal stall detection
         local pull    = m_pull    or 0
         local expense = m_expense or 0
         if pull > 1 then
@@ -1131,7 +1249,9 @@ local function findHitElement(mx, my)
 end
 
 function widget:MousePress(mx, my, button)
-    if not chartsEnabled then return false end
+    -- Gate: all chart mouse interactions require edit mode
+    if not chartsEnabled or not chartsInteractive then return false end
+
     local elem, kind = findHitElement(mx, my)
     if not elem then return false end
     if button == 1 then
@@ -1149,7 +1269,8 @@ function widget:MousePress(mx, my, button)
 end
 
 function widget:MouseRelease(mx, my, button)
-    if not chartsEnabled then return false end
+    if not chartsEnabled or not chartsInteractive then return false end
+
     if button == 1 then
         for _, card in pairs(statCards) do
             if card.isDragging then card.isDragging = false; return true end
@@ -1163,41 +1284,53 @@ end
 
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
-    for _, card in pairs(statCards) do
-        if card.isDragging then
-            card.x = mx - card.dragStartX
-            card.y = my - card.dragStartY
-            masterDirty = true
-            return true
+
+    -- Drag is gated behind interactive mode; only hover detection proceeds in locked mode
+    if chartsInteractive then
+        for _, card in pairs(statCards) do
+            if card.isDragging then
+                card.x = mx - card.dragStartX
+                card.y = my - card.dragStartY
+                masterDirty = true
+                return true
+            end
+        end
+        for _, chart in pairs(charts) do
+            if chart.isDragging then
+                chart.x = mx - chart.dragStartX
+                chart.y = my - chart.dragStartY
+                masterDirty = true
+                return true
+            end
         end
     end
-    for _, chart in pairs(charts) do
-        if chart.isDragging then
-            chart.x = mx - chart.dragStartX
-            chart.y = my - chart.dragStartY
-            masterDirty = true
-            return true
-        end
-    end
+
+    -- Hover highlight updates (visual only, harmless in locked mode)
     local hoverChanged = false
     for id, card in pairs(statCards) do
-        local h = card:isMouseOver(mx, my)
+        local h = chartsInteractive and card:isMouseOver(mx, my) or false
         if h ~= card.isHovered then hoverChanged = true end
         card.isHovered = h
     end
     for id, chart in pairs(charts) do
-        local h = chart:isMouseOver(mx, my)
+        local h = chartsInteractive and chart:isMouseOver(mx, my) or false
         if h ~= chart.isHovered then hoverChanged = true end
         chart.isHovered = h
     end
     if hoverChanged then rebuildHoverList() end
+
+    -- In locked mode, never consume mouse events (game input passes through)
+    if not chartsInteractive then return false end
+
     for _, card in pairs(statCards) do if card.isHovered then return true end end
     for _, chart in pairs(charts) do if chart.isHovered then return true end end
     return false
 end
 
 function widget:MouseWheel(up, value)
-    if not chartsEnabled then return false end
+    -- Scroll is gated behind interactive mode
+    if not chartsEnabled or not chartsInteractive then return false end
+
     local mx, my = Spring.GetMouseState()
     for _, card in pairs(statCards) do
         if card:isMouseOver(mx, my) then
@@ -1243,10 +1376,15 @@ function widget:TextCommand(command)
         os.remove(CONFIG_FILE)
         Spring.Echo("BAR Charts: Configuration reset - restart widget to apply")
         return true
+    elseif command == "barcharts edit" then
+        -- Allow toggling edit mode from chat as a fallback (no RmlUI dependency)
+        onToggleClick(nil)
+        return true
     elseif command == "barcharts debug" then
         Spring.Echo("=== BAR Charts Debug ===")
         Spring.Echo("vsx=" .. tostring(vsx) .. " vsy=" .. tostring(vsy))
         Spring.Echo("chartsEnabled=" .. tostring(chartsEnabled) .. " chartsReady=" .. tostring(chartsReady))
+        Spring.Echo("chartsInteractive=" .. tostring(chartsInteractive) .. " (edit mode: " .. (chartsInteractive and "ON" or "OFF/LOCKED") .. ")")
         Spring.Echo("masterDirty=" .. tostring(masterDirty) .. " masterDisplayList=" .. tostring(masterDisplayList))
         Spring.Echo(string.format("buildEfficiency=%.1f%% (rolling avg over %d/%d samples)",
             myTeamStats.buildEfficiency, buildEffSampleCount, BUILD_EFF_WINDOW_SIZE))
@@ -1300,6 +1438,7 @@ end
 
 function widget:Shutdown()
     saveConfig()
+    shutdownRmlToggle()
     freeLists()
     Spring.Echo("BAR Charts: Shutdown")
 end
