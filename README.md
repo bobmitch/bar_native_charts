@@ -4,7 +4,7 @@ Real-time resource and combat stats overlay for Beyond All Reason.
 
 ## Installation
 
-1. Download `bar_charts_widget.lua` and `bar_charts_toggle.rml`
+1. Download `charts.lua` and `bar_charts_toggle.rml`
 2. Copy both files to your BAR widgets folder:
    - **Windows:** `C:\Users\<YourName>\Documents\My Games\Spring\LuaUI\Widgets\`
    - **Linux:** `~/.spring/LuaUI/Widgets/`
