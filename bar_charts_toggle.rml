@@ -1,0 +1,38 @@
+<rml>
+<head>
+    <title>Charts Edit Toggle</title>
+    <style>
+        body {
+            font-family: "Exo 2";
+            font-size: 14dp;
+            position: absolute;
+            right: 460dp;
+            top: 10px;
+            width: 140px;
+            height: 28px;
+        }
+        #toggle-pill {
+            display: block;
+            width: 138px;
+            height: 26px;
+            line-height: 26px;
+            padding-left: 8dp;
+            border-radius: 5dp;
+            border-width: 1dp;
+            background-color: rgba(8, 12, 20, 200);
+            border-color: rgba(90, 140, 200, 80);
+            color: rgba(140, 175, 210, 200);
+            cursor: pointer;
+        }
+        #toggle-pill.state-edit {
+            border-color: rgba(240, 170, 50, 180);
+            background-color: rgba(30, 20, 8, 220);
+            color: rgba(240, 195, 80, 255);
+        }
+    </style>
+</head>
+<body>
+    <div id="toggle-pill" class="state-locked">CHARTS: LOCKED</div>
+</body>
+</rml>
+
