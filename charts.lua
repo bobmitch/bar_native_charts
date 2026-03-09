@@ -1,18 +1,9 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
-    BAR CHARTS WIDGET — PERFORMANCE OPTIMIZED
+    BAR CHARTS WIDGET — NO ANIMATION
     
-    Key optimization: Display Lists
-    - All chart/card geometry is compiled into GL display lists
-    - DrawScreen() just calls gl.CallList() — near-zero CPU/GPU cost per frame
-    - Display lists are rebuilt only when data changes (every 10s)
-    - Hover/drag state gets its own cheap overlay pass (border only, no fills)
-    
-    Additional optimizations:
-    - Dirty flag system: only rebuild lists when data actually changed
-    - Separate static list (background/grid) from dynamic list (lines/values)
-    - Animation lerp still runs per-frame but only touches display list at
-      anim completion, keeping smooth transitions without constant rebuilds
+    Animation removed entirely. Display lists are rebuilt only when data
+    changes (every 10s) or on interaction. DrawScreen is near-zero cost.
     
     Controls:
     - F9: Toggle all charts on/off
@@ -23,6 +14,8 @@
     Commands:
     - /barcharts save   : Save layout immediately
     - /barcharts reset  : Delete config and restore defaults
+    - /barcharts debug  : Print state to console
+    - /barcharts bp     : Print builder efficiency diagnostic
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -87,7 +80,6 @@ local COLOR = {
     gold        = {0.941, 0.753, 0.251, 1.00},
 }
 
-local ANIM_DURATION   = 0.4
 local HISTORY_SIZE    = 60
 local UPDATE_INTERVAL = 10
 
@@ -98,18 +90,9 @@ local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH  = 140
 local CARD_HEIGHT = 70
 
--- How often (seconds) to rebuild display lists during animation
-local ANIM_REBUILD_INTERVAL = 0.05
-
--- Builder efficiency scaling
-local BP_TO_METAL = 0.05
-
--- Build efficiency rolling average: sample once per second (every 30 game ticks
--- at the engine's fixed 30 Hz simulation rate), average over this many samples.
--- 30 samples = ~30s window, smoothing build-ramp transients without masking
--- real sustained stalls.
-local BUILD_EFF_TICKS_PER_SAMPLE = 30   -- ticks between samples (30 ticks = 1s at 30 Hz)
-local BUILD_EFF_WINDOW_SIZE      = 30   -- number of samples kept (~30s window)
+-- Build efficiency rolling average settings
+local BUILD_EFF_TICKS_PER_SAMPLE = 30
+local BUILD_EFF_WINDOW_SIZE      = 30
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
@@ -122,11 +105,9 @@ local teamID     = nil
 local allyTeamID = nil
 local allyTeams  = {}
 
--- Master display list handles
-local masterDisplayList   = nil
-local masterDirty         = true
-local masterLastRebuild   = 0
-local hoverDisplayList    = nil
+local masterDisplayList = nil
+local masterDirty       = true
+local hoverDisplayList  = nil
 
 local myTeamStats = {
     metalIncome      = 0, metalUsage   = 0,
@@ -135,34 +116,22 @@ local myTeamStats = {
     armyValue        = 0, unitCount    = 0,
     kills            = 0, losses       = 0,
     metalLost        = 0,
-    buildEfficiency  = 0,   -- rolling average (%), exposed to charts/cards
-    metalStall       = 0,   -- 0=ok, 1=partial stall, 2=hard stall
+    buildEfficiency  = 0,
+    metalStall       = 0,
     totalBP          = 0,
 }
 
--- unitID → { bp = buildSpeed, defID = unitDefID } for every builder unit we own.
-local builderUnits = {}
-
--- maxMetalUseCache[builderDefID][targetDefID] = maxMetal (metal/s at full build speed).
+local builderUnits     = {}
 local maxMetalUseCache = {}
 
--- Rolling average state for build efficiency.
--- Samples are collected once per BUILD_EFF_TICKS_PER_SAMPLE game ticks using the
--- same per-builder ratio logic as the main update, then averaged over the
--- last BUILD_EFF_WINDOW_SIZE samples. This smooths over builder ramp-up /
--- ramp-down transients without masking real sustained stalls.
-local buildEffSamples     = {}   -- ring buffer of recent raw efficiency samples
-local buildEffSampleIndex = 0    -- next write position (1-based, wraps)
-local buildEffSampleCount = 0    -- how many valid entries are in the buffer
-local buildEffTickCounter = 0    -- ticks elapsed since last sample
+local buildEffSamples     = {}
+local buildEffSampleIndex = 0
+local buildEffSampleCount = 0
+local buildEffTickCounter = 0
 
 -------------------------------------------------------------------------------
 -- HELPER FUNCTIONS
 -------------------------------------------------------------------------------
-
-local function easeOutCubic(t)
-    return 1 - math.pow(1 - t, 3)
-end
 
 local function formatNumber(n)
     if n >= 1000000 then return string.format("%.1fM", n / 1000000)
@@ -187,31 +156,29 @@ local function drawRoundedRect(x, y, w, h, r, filled)
             gl.Vertex(x + w, y + h - r); gl.Vertex(x, y + h - r)
         end)
         local segments = 6
-        for i = 0, segments do
+        for i = 0, segments - 1 do
             local a1 = (math.pi / 2) * (i / segments)
             local a2 = (math.pi / 2) * ((i + 1) / segments)
-            if i < segments then
-                gl.BeginEnd(GL.TRIANGLES, function()
-                    gl.Vertex(x + r, y + r)
-                    gl.Vertex(x + r - r*math.cos(a1), y + r - r*math.sin(a1))
-                    gl.Vertex(x + r - r*math.cos(a2), y + r - r*math.sin(a2))
-                end)
-                gl.BeginEnd(GL.TRIANGLES, function()
-                    gl.Vertex(x + w - r, y + r)
-                    gl.Vertex(x + w - r + r*math.sin(a1), y + r - r*math.cos(a1))
-                    gl.Vertex(x + w - r + r*math.sin(a2), y + r - r*math.cos(a2))
-                end)
-                gl.BeginEnd(GL.TRIANGLES, function()
-                    gl.Vertex(x + w - r, y + h - r)
-                    gl.Vertex(x + w - r + r*math.cos(a1), y + h - r + r*math.sin(a1))
-                    gl.Vertex(x + w - r + r*math.cos(a2), y + h - r + r*math.sin(a2))
-                end)
-                gl.BeginEnd(GL.TRIANGLES, function()
-                    gl.Vertex(x + r, y + h - r)
-                    gl.Vertex(x + r - r*math.sin(a1), y + h - r + r*math.cos(a1))
-                    gl.Vertex(x + r - r*math.sin(a2), y + h - r + r*math.cos(a2))
-                end)
-            end
+            gl.BeginEnd(GL.TRIANGLES, function()
+                gl.Vertex(x + r, y + r)
+                gl.Vertex(x + r - r*math.cos(a1), y + r - r*math.sin(a1))
+                gl.Vertex(x + r - r*math.cos(a2), y + r - r*math.sin(a2))
+            end)
+            gl.BeginEnd(GL.TRIANGLES, function()
+                gl.Vertex(x + w - r, y + r)
+                gl.Vertex(x + w - r + r*math.sin(a1), y + r - r*math.cos(a1))
+                gl.Vertex(x + w - r + r*math.sin(a2), y + r - r*math.cos(a2))
+            end)
+            gl.BeginEnd(GL.TRIANGLES, function()
+                gl.Vertex(x + w - r, y + h - r)
+                gl.Vertex(x + w - r + r*math.cos(a1), y + h - r + r*math.sin(a1))
+                gl.Vertex(x + w - r + r*math.cos(a2), y + h - r + r*math.sin(a2))
+            end)
+            gl.BeginEnd(GL.TRIANGLES, function()
+                gl.Vertex(x + r, y + h - r)
+                gl.Vertex(x + r - r*math.sin(a1), y + h - r + r*math.cos(a1))
+                gl.Vertex(x + r - r*math.sin(a2), y + h - r + r*math.cos(a2))
+            end)
         end
     else
         gl.BeginEnd(GL.LINE_LOOP, function()
@@ -243,10 +210,6 @@ end
 -- BUILD EFFICIENCY — TICK-BASED SAMPLER + ROLLING AVERAGE
 -------------------------------------------------------------------------------
 
--- Computes a raw instantaneous build efficiency reading (0–100) using the same
--- per-builder ratio method as the main update loop. Called every
--- BUILD_EFF_TICKS_PER_SAMPLE ticks from widget:GameFrame (once per second at
--- 30 Hz). Returns the value to push into the ring buffer.
 local function sampleBuildEfficiency()
     local effSum   = 0
     local effCount = 0
@@ -282,26 +245,19 @@ local function sampleBuildEfficiency()
                 effCount = effCount + 1
             end
         end
-        -- Idle builders intentionally excluded (same policy as main loop)
     end
-    -- No active builders: treat as fully efficient (nothing to stall on)
     if effCount == 0 then
         return myTeamStats.totalBP > 0 and 100 or 0
     end
     return (effSum / effCount) * 100
 end
 
--- Push one sample into the ring buffer and recompute the rolling average.
--- The average is written directly into myTeamStats.buildEfficiency so all
--- consumers (chart + card) pick it up without any other changes.
 local function pushBuildEffSample(value)
     buildEffSampleIndex = (buildEffSampleIndex % BUILD_EFF_WINDOW_SIZE) + 1
     buildEffSamples[buildEffSampleIndex] = value
     if buildEffSampleCount < BUILD_EFF_WINDOW_SIZE then
         buildEffSampleCount = buildEffSampleCount + 1
     end
-
-    -- Recompute average over all valid entries
     local sum = 0
     for i = 1, buildEffSampleCount do
         sum = sum + (buildEffSamples[i] or 0)
@@ -309,7 +265,6 @@ local function pushBuildEffSample(value)
     myTeamStats.buildEfficiency = sum / buildEffSampleCount
 end
 
--- Reset the rolling average buffer (called on game start / widget init)
 local function resetBuildEffSamples()
     buildEffSamples     = {}
     buildEffSampleIndex = 0
@@ -323,44 +278,27 @@ end
 -------------------------------------------------------------------------------
 
 local function freeLists()
-    if masterDisplayList then
-        gl.DeleteList(masterDisplayList)
-        masterDisplayList = nil
-    end
-    if hoverDisplayList then
-        gl.DeleteList(hoverDisplayList)
-        hoverDisplayList = nil
-    end
+    if masterDisplayList then gl.DeleteList(masterDisplayList); masterDisplayList = nil end
+    if hoverDisplayList  then gl.DeleteList(hoverDisplayList);  hoverDisplayList  = nil end
 end
 
 local function rebuildMasterList()
-    if masterDisplayList then
-        gl.DeleteList(masterDisplayList)
-    end
-
+    if masterDisplayList then gl.DeleteList(masterDisplayList) end
     masterDisplayList = gl.CreateList(function()
         for _, chart in pairs(charts) do
-            if chart.enabled and chart.visible then
-                chart:drawToList()
-            end
+            if chart.enabled and chart.visible then chart:drawToList() end
         end
         for _, card in pairs(statCards) do
-            if card.enabled and card.visible then
-                card:drawToList()
-            end
+            if card.enabled and card.visible then card:drawToList() end
         end
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
         gl.Text("F9: Toggle Charts", vsx - 150, 30, 11, "o")
     end)
-
-    masterDirty       = false
-    masterLastRebuild = os.clock()
+    masterDirty = false
 end
 
 local function rebuildHoverList()
-    if hoverDisplayList then
-        gl.DeleteList(hoverDisplayList)
-    end
+    if hoverDisplayList then gl.DeleteList(hoverDisplayList) end
     hoverDisplayList = gl.CreateList(function()
         for _, chart in pairs(charts) do
             if chart.enabled and chart.visible and chart.isHovered then
@@ -407,10 +345,6 @@ function StatCard.new(id, label, icon, x, y, color, getValue)
     self.color        = color
     self.getValue     = getValue
     self.displayValue = 0
-    self.prevValue    = 0
-    self.targetValue  = 0
-    self.animProgress = 1.0
-    self.animStart    = 0
     self.isDragging   = false
     self.dragStartX   = 0
     self.dragStartY   = 0
@@ -418,22 +352,9 @@ function StatCard.new(id, label, icon, x, y, color, getValue)
     return self
 end
 
-function StatCard:setTarget(value)
-    self.prevValue    = self.displayValue
-    self.targetValue  = value
-    self.animProgress = 0.0
-    self.animStart    = os.clock()
-    masterDirty       = true
-end
-
-function StatCard:update(dt)
-    if self.animProgress < 1.0 then
-        local elapsed     = os.clock() - self.animStart
-        self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
-        local ease        = easeOutCubic(self.animProgress)
-        self.displayValue = self.prevValue + (self.targetValue - self.prevValue) * ease
-        masterDirty       = true
-    end
+function StatCard:setValue(value)
+    self.displayValue = value
+    masterDirty = true
 end
 
 function StatCard:drawToList()
@@ -491,39 +412,32 @@ Chart.__index = Chart
 
 function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     local self = setmetatable({}, Chart)
-    self.id          = id
-    self.label       = label
-    self.icon        = icon
-    self.x           = x
-    self.y           = y
-    self.width       = CHART_WIDTH
-    self.height      = CHART_HEIGHT
-    self.scale       = 1.0
-    self.enabled     = true
-    self.visible     = true
-    self.chartType   = chartType
-    self.series      = series
-    self.multiTeam   = multiTeam or false
-    self.history     = {}
+    self.id        = id
+    self.label     = label
+    self.icon      = icon
+    self.x         = x
+    self.y         = y
+    self.width     = CHART_WIDTH
+    self.height    = CHART_HEIGHT
+    self.scale     = 1.0
+    self.enabled   = true
+    self.visible   = true
+    self.chartType = chartType
+    self.series    = series
+    self.multiTeam = multiTeam or false
+    self.history   = {}
     for i = 1, #series do self.history[i] = {} end
-    self.displayData = {}
-    for i = 1, #series do self.displayData[i] = {} end
-    self.animProgress  = 1.0
-    self.animStartTime = 0
-    self.prevData      = {}
-    self.targetData    = {}
-    self.isDragging    = false
-    self.dragStartX    = 0
-    self.dragStartY    = 0
-    self.isHovered     = false
+    self.isDragging = false
+    self.dragStartX = 0
+    self.dragStartY = 0
+    self.isHovered  = false
     return self
 end
 
 function Chart:rebuildMultiTeamSeries()
     if not self.multiTeam then return end
-    self.history     = {}
-    self.displayData = {}
-    self.series      = {}
+    self.history = {}
+    self.series  = {}
     local idx = 1
     if type(allyTeams) == "table" then
         for tid, teamData in pairs(allyTeams) do
@@ -550,9 +464,8 @@ function Chart:rebuildMultiTeamSeries()
                     return allyTeams[tid] and allyTeams[tid].energyIncome or 0
                 end
             end
-            self.series[idx]      = seriesConfig
-            self.history[idx]     = {}
-            self.displayData[idx] = {}
+            self.series[idx]  = seriesConfig
+            self.history[idx] = {}
             idx = idx + 1
         end
     end
@@ -566,33 +479,7 @@ function Chart:addDataPoint()
             table.remove(self.history[i], 1)
         end
     end
-    self.animProgress  = 0.0
-    self.animStartTime = os.clock()
-    for i = 1, #self.series do
-        self.prevData[i]   = {}
-        self.targetData[i] = {}
-        for j, v in ipairs(self.displayData[i]) do self.prevData[i][j]   = v end
-        for j, v in ipairs(self.history[i])     do self.targetData[i][j] = v end
-    end
     masterDirty = true
-end
-
-function Chart:update(dt)
-    if self.animProgress < 1.0 then
-        local elapsed     = os.clock() - self.animStartTime
-        self.animProgress = math.min(1.0, elapsed / ANIM_DURATION)
-        local ease        = easeOutCubic(self.animProgress)
-        for i = 1, #self.series do
-            local prev   = self.prevData[i]   or {}
-            local target = self.targetData[i] or {}
-            for j = 1, math.max(#prev, #target) do
-                local fromVal = prev[j]   or target[j] or 0
-                local toVal   = target[j] or fromVal
-                self.displayData[i][j] = fromVal + (toVal - fromVal) * ease
-            end
-        end
-        masterDirty = true
-    end
 end
 
 function Chart:drawToList()
@@ -617,7 +504,7 @@ function Chart:drawToList()
 
     local hasData = false
     for i = 1, #self.series do
-        if #self.displayData[i] >= 2 then hasData = true; break end
+        if #self.history[i] >= 2 then hasData = true; break end
     end
 
     if not hasData then
@@ -629,9 +516,10 @@ function Chart:drawToList()
         return
     end
 
+    -- Gather all values to compute axis range
     local allValues = {}
     for i = 1, #self.series do
-        for _, v in ipairs(self.displayData[i]) do
+        for _, v in ipairs(self.history[i]) do
             if v and not (v ~= v) then table.insert(allValues, v) end
         end
     end
@@ -649,9 +537,9 @@ function Chart:drawToList()
         maxV =  (absMax + axisPad)
     elseif self.chartType == "demand" then
         local absMax = math.max(math.abs(minV), math.abs(maxV), 100)
-        local pad    = absMax * 0.15
-        minV = -(absMax + pad)
-        maxV =  (absMax + pad)
+        local p    = absMax * 0.15
+        minV = -(absMax + p)
+        maxV =  (absMax + p)
     else
         local span     = maxV - minV
         local rangePad = span > 0 and span * 0.12 or math.max(maxV * 0.1, 100)
@@ -662,6 +550,7 @@ function Chart:drawToList()
     local range = maxV - minV
     if range == 0 then range = 1 end
 
+    -- Grid lines + Y-axis labels
     for i = 0, 4 do
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
@@ -692,8 +581,9 @@ function Chart:drawToList()
         gl.Text("0", cX - 5, zeroY - 4, 9, "ro")
     end
 
+    -- Draw each series
     for seriesIdx, s in ipairs(self.series) do
-        local data = self.displayData[seriesIdx]
+        local data = self.history[seriesIdx]
         if #data >= 2 then
             local color = s.color
 
@@ -718,6 +608,7 @@ function Chart:drawToList()
                 end
             end)
 
+            -- Endpoint dot + label
             if #data > 0 then
                 local lastValue = data[#data]
                 if lastValue and not (lastValue ~= lastValue) then
@@ -753,6 +644,7 @@ function Chart:drawToList()
         end
     end
 
+    -- Chart title
     gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
     gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
 
@@ -787,6 +679,7 @@ end
 
 local function seedArmyValues()
     myTeamStats.armyValue = 0
+    if allyTeams[teamID] then allyTeams[teamID].armyValue = 0 end
     local myUnits = Spring.GetTeamUnits(teamID) or {}
     for _, uid in ipairs(myUnits) do
         local cost = unitMetalCost(Spring.GetUnitDefID(uid))
@@ -980,8 +873,6 @@ local function loadConfig()
     return result.charts or {}, result.cards or {}
 end
 
-local savedChartConfig = nil
-
 -------------------------------------------------------------------------------
 -- INITIALIZATION
 -------------------------------------------------------------------------------
@@ -1025,7 +916,6 @@ function widget:Initialize()
         end },
     })
 
-    -- buildEfficiency read from myTeamStats, which now holds the rolling average
     charts.buildEfficiency = Chart.new("chart-build-efficiency", "BUILDER EFFICIENCY", "🔧", vsx - 970, vsy - 430, "percent", {
         { label = "Efficiency", color = COLOR.gold, getValue = function()
             return myTeamStats.buildEfficiency
@@ -1041,23 +931,14 @@ function widget:Initialize()
     local col1X    = vsx - 350
     local col2X    = vsx - 200
 
-    statCards["card-army-value"] = StatCard.new("card-army-value", "ARMY VALUE", "⚙",
-        col1X, cardY, COLOR.accent, function() return myTeamStats.armyValue end)
-    statCards["card-unit-count"] = StatCard.new("card-unit-count", "UNITS", "▣",
-        col2X, cardY, COLOR.accent, function() return myTeamStats.unitCount end)
-    statCards["card-kills"] = StatCard.new("card-kills", "KILLS", "✕",
-        col1X, cardY - cardStep, COLOR.success, function() return myTeamStats.kills end)
-    statCards["card-losses"] = StatCard.new("card-losses", "LOSSES", "↓",
-        col2X, cardY - cardStep, COLOR.danger, function() return myTeamStats.losses end)
-    statCards["card-dmg-dealt"] = StatCard.new("card-dmg-dealt", "DMG DEALT", "▲",
-        col1X, cardY - cardStep * 2, COLOR.success, function() return myTeamStats.damageDealt end)
-    statCards["card-dmg-taken"] = StatCard.new("card-dmg-taken", "DMG TAKEN", "▼",
-        col2X, cardY - cardStep * 2, COLOR.danger, function() return myTeamStats.damageTaken end)
-    statCards["card-metal-lost"] = StatCard.new("card-metal-lost", "METAL LOST", "◆",
-        col1X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.metalLost end)
-    -- Card reads the rolling average via myTeamStats.buildEfficiency, same as the chart
-    statCards["card-build-efficiency"] = StatCard.new("card-build-efficiency", "BUILD EFF", "🔧",
-        col2X, cardY - cardStep * 3, COLOR.gold, function() return myTeamStats.buildEfficiency end)
+    statCards["card-army-value"]        = StatCard.new("card-army-value",        "ARMY VALUE", "⚙",  col1X, cardY,                COLOR.accent,  function() return myTeamStats.armyValue        end)
+    statCards["card-unit-count"]        = StatCard.new("card-unit-count",        "UNITS",      "▣",  col2X, cardY,                COLOR.accent,  function() return myTeamStats.unitCount        end)
+    statCards["card-kills"]             = StatCard.new("card-kills",             "KILLS",      "✕",  col1X, cardY - cardStep,     COLOR.success, function() return myTeamStats.kills            end)
+    statCards["card-losses"]            = StatCard.new("card-losses",            "LOSSES",     "↓",  col2X, cardY - cardStep,     COLOR.danger,  function() return myTeamStats.losses           end)
+    statCards["card-dmg-dealt"]         = StatCard.new("card-dmg-dealt",         "DMG DEALT",  "▲",  col1X, cardY - cardStep * 2, COLOR.success, function() return myTeamStats.damageDealt      end)
+    statCards["card-dmg-taken"]         = StatCard.new("card-dmg-taken",         "DMG TAKEN",  "▼",  col2X, cardY - cardStep * 2, COLOR.danger,  function() return myTeamStats.damageTaken      end)
+    statCards["card-metal-lost"]        = StatCard.new("card-metal-lost",        "METAL LOST", "◆",  col1X, cardY - cardStep * 3, COLOR.gold,    function() return myTeamStats.metalLost        end)
+    statCards["card-build-efficiency"]  = StatCard.new("card-build-efficiency",  "BUILD EFF",  "🔧", col2X, cardY - cardStep * 3, COLOR.gold,    function() return myTeamStats.buildEfficiency  end)
 
     -- ── APPLY SAVED CONFIG ────────────────────────────────────────────────────
     local chartCfg, cardCfg = loadConfig()
@@ -1112,27 +993,9 @@ function widget:Update(dt)
         return
     end
 
-    -- Animate all charts/cards
-    local anyAnimating = false
-    for _, chart in pairs(charts) do
-        chart:update(dt)
-        if chart.animProgress < 1.0 then anyAnimating = true end
-    end
-    for _, card in pairs(statCards) do
-        card:update(dt)
-        if card.animProgress < 1.0 then anyAnimating = true end
-    end
-
-    -- Throttle display list rebuilds during animation to ~20fps
+    -- Rebuild display list only when data is dirty
     if masterDirty then
-        local t = os.clock()
-        if anyAnimating then
-            if t - masterLastRebuild >= ANIM_REBUILD_INTERVAL then
-                rebuildMasterList()
-            end
-        else
-            rebuildMasterList()
-        end
+        rebuildMasterList()
     end
 
     -- Periodic data fetch (every 10s)
@@ -1144,26 +1007,20 @@ function widget:Update(dt)
             if not teamID then return end
         end
 
-        local m_level, m_storage, m_pull, m_income, m_expense, m_share = Spring.GetTeamResources(teamID, "metal")
-        local e_level, e_storage, e_pull, e_income, e_expense, e_share = Spring.GetTeamResources(teamID, "energy")
+        local m_level, m_storage, m_pull, m_income, m_expense = Spring.GetTeamResources(teamID, "metal")
+        local e_level, e_storage, e_pull, e_income, e_expense = Spring.GetTeamResources(teamID, "energy")
         myTeamStats.metalIncome  = m_income  or 0
         myTeamStats.metalUsage   = m_expense or 0
         myTeamStats.energyIncome = e_income  or 0
         myTeamStats.energyUsage  = e_expense or 0
 
-        -- totalBP is still computed here (not in the sampler) since it only
-        -- needs to be current for the stall indicator and the "no builders" path.
         local totalBP = 0
         for uid, builderData in pairs(builderUnits) do
             totalBP = totalBP + builderData.bp
         end
         myTeamStats.totalBP = totalBP
 
-        -- NOTE: myTeamStats.buildEfficiency is maintained by the GameFrame tick sampler
-        -- (widget:GameFrame → pushBuildEffSample / sampleBuildEfficiency). We do NOT
-        -- overwrite it here. The chart and card both read the rolling average automatically.
-
-        -- Metal stall detection (unchanged)
+        -- Metal stall detection
         local pull    = m_pull    or 0
         local expense = m_expense or 0
         if pull > 1 then
@@ -1199,20 +1056,16 @@ function widget:Update(dt)
         end
 
         for _, chart in pairs(charts) do chart:addDataPoint() end
-        for _, card  in pairs(statCards) do card:setTarget(card.getValue()) end
+        for _, card  in pairs(statCards) do card:setValue(card.getValue()) end
 
         masterDirty = true
     end
 end
 
 -------------------------------------------------------------------------------
--- GAME FRAME — build efficiency sampler (fires every game tick at 30 Hz)
+-- GAME FRAME — build efficiency sampler
 -------------------------------------------------------------------------------
 
--- widget:GameFrame fires once per simulation tick. We count ticks and sample
--- every BUILD_EFF_TICKS_PER_SAMPLE ticks (30 = 1 s at 30 Hz). Using game ticks
--- rather than os.clock() keeps the sampler locked to simulation time, so it
--- pauses correctly when the game is paused or running in slow-motion.
 function widget:GameFrame(n)
     if not chartsReady then return end
     buildEffTickCounter = buildEffTickCounter + 1
@@ -1227,13 +1080,13 @@ end
 -------------------------------------------------------------------------------
 
 function widget:GameStart()
-    chartsReady    = false
+    chartsReady = false
     lastUpdateTime = 0
     myTeamStats.armyValue      = 0; myTeamStats.unitCount      = 0
     myTeamStats.kills          = 0; myTeamStats.losses         = 0
-    myTeamStats.metalLost      = 0; myTeamStats.damageDealt     = 0
+    myTeamStats.metalLost      = 0; myTeamStats.damageDealt    = 0
     myTeamStats.damageTaken    = 0; myTeamStats.buildEfficiency = 0
-    myTeamStats.metalStall     = 0; myTeamStats.totalBP         = 0
+    myTeamStats.metalStall     = 0; myTeamStats.totalBP        = 0
     builderUnits = {}
     resetBuildEffSamples()
     for tid, teamData in pairs(allyTeams) do
@@ -1266,8 +1119,6 @@ function widget:KeyPress(key, mods, isRepeat)
     end
     return false
 end
-
-local prevHoverState = {}
 
 local function findHitElement(mx, my)
     for id, card in pairs(statCards) do
@@ -1370,17 +1221,15 @@ end
 function widget:ViewResize()
     local oldVsx, oldVsy = vsx, vsy
     vsx, vsy = Spring.GetViewGeometry()
-    if not savedChartConfig then
-        local ratioX = vsx / oldVsx
-        local ratioY = vsy / oldVsy
-        for _, chart in pairs(charts) do
-            chart.x = chart.x * ratioX
-            chart.y = chart.y * ratioY
-        end
-        for _, card in pairs(statCards) do
-            card.x = card.x * ratioX
-            card.y = card.y * ratioY
-        end
+    local ratioX = vsx / oldVsx
+    local ratioY = vsy / oldVsy
+    for _, chart in pairs(charts) do
+        chart.x = chart.x * ratioX
+        chart.y = chart.y * ratioY
+    end
+    for _, card in pairs(statCards) do
+        card.x = card.x * ratioX
+        card.y = card.y * ratioY
     end
     masterDirty = true
     rebuildHoverList()
