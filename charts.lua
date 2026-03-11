@@ -16,6 +16,8 @@
     - Click pill to toggle LOCKED ↔ EDIT
     - In LOCKED mode all chart mouse interactions are suppressed so
       mis-clicks/scroll never accidentally move or zoom a chart mid-game.
+    - In EDIT mode, disabled charts/cards are shown semi-transparent so
+      you can find, move, resize, and re-enable them.
     
     Commands:
     - /barcharts save   : Save layout immediately
@@ -394,10 +396,16 @@ local function rebuildMasterList()
     if masterDisplayList then gl.DeleteList(masterDisplayList) end
     masterDisplayList = gl.CreateList(function()
         for _, chart in pairs(charts) do
-            if chart.enabled and chart.visible then chart:drawToList() end
+            -- Always render if visible, OR if disabled but edit mode is on
+            if (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive) then
+                chart:drawToList()
+            end
         end
         for _, card in pairs(statCards) do
-            if card.enabled and card.visible then card:drawToList() end
+            -- Always render if visible, OR if disabled but edit mode is on
+            if (card.enabled and card.visible) or (not card.enabled and chartsInteractive) then
+                card:drawToList()
+            end
         end
         -- Hint text: show lock state when charts are visible
         if chartsInteractive then
@@ -416,7 +424,8 @@ local function rebuildHoverList()
         -- Only render hover highlights when interactive
         if not chartsInteractive then return end
         for _, chart in pairs(charts) do
-            if chart.enabled and chart.visible and chart.isHovered then
+            -- Show hover highlight for all charts in edit mode (enabled or disabled)
+            if chart.isHovered then
                 gl.PushMatrix()
                 gl.Translate(chart.x, chart.y, 0)
                 gl.Scale(chart.scale, chart.scale, 1)
@@ -427,7 +436,8 @@ local function rebuildHoverList()
             end
         end
         for _, card in pairs(statCards) do
-            if card.enabled and card.visible and card.isHovered then
+            -- Show hover highlight for all cards in edit mode (enabled or disabled)
+            if card.isHovered then
                 gl.PushMatrix()
                 gl.Translate(card.x, card.y, 0)
                 gl.Scale(card.scale, card.scale, 1)
@@ -476,39 +486,48 @@ function StatCard:drawToList()
     local w = CARD_WIDTH
     local h = CARD_HEIGHT
     local c = self.color
+    
+    -- In edit mode, show disabled cards semi-transparent
+    local alphaMultiplier = (not self.enabled and chartsInteractive) and 0.35 or 1.0
 
     gl.PushMatrix()
     gl.Translate(self.x, self.y, 0)
     gl.Scale(self.scale, self.scale, 1)
 
-    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
+    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4] * alphaMultiplier)
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
+    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4] * alphaMultiplier)
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
 
-    gl.Color(c[1], c[2], c[3], 0.7)
+    gl.Color(c[1], c[2], c[3], 0.7 * alphaMultiplier)
     gl.BeginEnd(GL.QUADS, function()
         gl.Vertex(0, 4); gl.Vertex(3, 4); gl.Vertex(3, h - 4); gl.Vertex(0, h - 4)
     end)
 
-    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4] * alphaMultiplier)
     gl.Text(self.icon .. "  " .. self.label, 10, h - 18, 9, "o")
 
-    if self.id == "card-build-efficiency" then
+    if self.id == "card-build-efficiency" and self.enabled then
         local stall = myTeamStats.metalStall
         if stall == 2 then
-            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0 * alphaMultiplier)
             gl.Text("⚠ STALL", w - 6, h - 18, 9, "ro")
         elseif stall == 1 then
-            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0 * alphaMultiplier)
             gl.Text("⚠ STALL", w - 6, h - 18, 9, "ro")
         end
     end
 
-    gl.Color(c[1], c[2], c[3], 1.0)
+    gl.Color(c[1], c[2], c[3], 1.0 * alphaMultiplier)
     gl.Text(formatNumber(math.floor(self.displayValue + 0.5)), w / 2 + 5, 10, 20, "co")
+    
+    -- Show "DISABLED" label when in edit mode and card is disabled
+    if not self.enabled and chartsInteractive then
+        gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 0.8)
+        gl.Text("DISABLED", w / 2, h / 2, 10, "co")
+    end
 
     gl.PopMatrix()
 end
@@ -609,11 +628,14 @@ function Chart:drawToList()
     local cY  = pad.bottom
     local cW  = w - pad.left - pad.right
     local cH  = h - pad.top  - pad.bottom
+    
+    -- In edit mode, show disabled charts semi-transparent
+    local alphaMultiplier = (not self.enabled and chartsInteractive) and 0.35 or 1.0
 
-    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
+    gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4] * alphaMultiplier)
     drawRoundedRect(0, 0, w, h, 4, true)
 
-    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
+    gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4] * alphaMultiplier)
     gl.LineWidth(1)
     drawRoundedRect(0.5, 0.5, w - 1, h - 1, 4, false)
 
@@ -622,10 +644,11 @@ function Chart:drawToList()
         if #self.history[i] >= 2 then hasData = true; break end
     end
 
-    if not hasData then
-        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.25)
-        gl.Text("— awaiting data —", cX + cW / 2, cY + cH / 2, 10, "c")
-        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+    if not hasData or not self.enabled then
+        local displayText = not self.enabled and "— DISABLED —" or "— awaiting data —"
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.25 * alphaMultiplier)
+        gl.Text(displayText, cX + cW / 2, cY + cH / 2, 10, "c")
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4] * alphaMultiplier)
         gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
         gl.PopMatrix()
         return
@@ -668,11 +691,11 @@ function Chart:drawToList()
         local v    = minV + (range * i / 4)
         local yPos = cY + (cH * i / 4)
         local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
-        gl.Color(gc[1], gc[2], gc[3], gc[4])
+        gl.Color(gc[1], gc[2], gc[3], gc[4] * alphaMultiplier)
         gl.BeginEnd(GL.LINES, function()
             gl.Vertex(cX, yPos); gl.Vertex(cX + cW, yPos)
         end)
-        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4] * alphaMultiplier)
         gl.Text(formatYAxis(v, self.chartType), cX - 5, yPos - 4, 9, "ro")
     end
 
@@ -685,12 +708,12 @@ function Chart:drawToList()
 
     if self.chartType == "demand" or self.chartType == "storage" then
         local zeroY = toY(0)
-        gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45)
+        gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45 * alphaMultiplier)
         gl.LineWidth(1.0)
         gl.BeginEnd(GL.LINES, function()
             gl.Vertex(cX, zeroY); gl.Vertex(cX + cW, zeroY)
         end)
-        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.5)
+        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.5 * alphaMultiplier)
         gl.Text("0", cX - 5, zeroY - 4, 9, "ro")
     end
 
@@ -699,7 +722,7 @@ function Chart:drawToList()
         if #data >= 2 then
             local color = s.color
 
-            gl.Color(color[1], color[2], color[3], 1.0)
+            gl.Color(color[1], color[2], color[3], 1.0 * alphaMultiplier)
             gl.LineWidth(2.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
                 for i, value in ipairs(data) do
@@ -709,7 +732,7 @@ function Chart:drawToList()
                 end
             end)
 
-            gl.Color(color[1], color[2], color[3], 0.15)
+            gl.Color(color[1], color[2], color[3], 0.15 * alphaMultiplier)
             gl.BeginEnd(GL.TRIANGLE_STRIP, function()
                 local fillBase = (self.chartType == "demand" or self.chartType == "storage") and toY(0) or cY
                 for i, value in ipairs(data) do
@@ -723,13 +746,13 @@ function Chart:drawToList()
             if #data > 0 then
                 local lastValue = data[#data]
                 if lastValue and not (lastValue ~= lastValue) then
-                    gl.Color(color[1], color[2], color[3], 0.8)
+                    gl.Color(color[1], color[2], color[3], 0.8 * alphaMultiplier)
                     gl.PointSize(6)
                     gl.BeginEnd(GL.POINTS, function()
                         gl.Vertex(toX(#data, #data), toY(lastValue))
                     end)
 
-                    gl.Color(color[1], color[2], color[3], 1.0)
+                    gl.Color(color[1], color[2], color[3], 1.0 * alphaMultiplier)
                     local valueText
                     if self.chartType == "percent" then
                         valueText = string.format("%.0f%%", lastValue)
@@ -755,16 +778,16 @@ function Chart:drawToList()
         end
     end
 
-    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4] * alphaMultiplier)
     gl.Text(self.icon .. "  " .. self.label, pad.left + 2, h - pad.top - 10, 10, "o")
 
-    if self.id == "chart-build-efficiency" then
+    if self.id == "chart-build-efficiency" and self.enabled then
         local stall = myTeamStats.metalStall
         if stall == 2 then
-            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0 * alphaMultiplier)
             gl.Text("⚠ STALL", w - pad.right - 2, h - pad.top - 10, 10, "ro")
         elseif stall == 1 then
-            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0 * alphaMultiplier)
             gl.Text("⚠ STALL", w - pad.right - 2, h - pad.top - 10, 10, "ro")
         end
     end
@@ -1239,11 +1262,16 @@ function widget:KeyPress(key, mods, isRepeat)
 end
 
 local function findHitElement(mx, my)
+    -- In edit mode, allow interaction with disabled charts/cards too
     for id, card in pairs(statCards) do
-        if card:isMouseOver(mx, my) then return card, "card" end
+        if (card.enabled or chartsInteractive) and card:isMouseOver(mx, my) then 
+            return card, "card" 
+        end
     end
     for id, chart in pairs(charts) do
-        if chart:isMouseOver(mx, my) then return chart, "chart" end
+        if (chart.enabled or chartsInteractive) and chart:isMouseOver(mx, my) then 
+            return chart, "chart" 
+        end
     end
     return nil, nil
 end
@@ -1260,7 +1288,8 @@ function widget:MousePress(mx, my, button)
         elem.dragStartY = my - elem.y
         return true
     elseif button == 3 then
-        elem.visible = not elem.visible
+        -- Right-click toggles enabled state when in edit mode
+        elem.enabled = not elem.enabled
         masterDirty = true
         rebuildHoverList()
         return true
@@ -1390,13 +1419,13 @@ function widget:TextCommand(command)
             myTeamStats.buildEfficiency, buildEffSampleCount, BUILD_EFF_WINDOW_SIZE))
         Spring.Echo("-- CARDS --")
         for id, card in pairs(statCards) do
-            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s",
-                id, card.x, card.y, card.scale, tostring(card.visible)))
+            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s enabled=%s",
+                id, card.x, card.y, card.scale, tostring(card.visible), tostring(card.enabled)))
         end
         Spring.Echo("-- CHARTS --")
         for _, chart in pairs(charts) do
-            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s",
-                chart.id, chart.x, chart.y, chart.scale, tostring(chart.visible)))
+            Spring.Echo(string.format("  %s: x=%.0f y=%.0f scale=%.1f visible=%s enabled=%s",
+                chart.id, chart.x, chart.y, chart.scale, tostring(chart.visible), tostring(chart.enabled)))
         end
         return true
     elseif command == "barcharts bp" then
