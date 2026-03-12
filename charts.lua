@@ -1118,6 +1118,11 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Update(dt)
+    -- Always rebuild display list if dirty, so placeholders render before data is ready
+    if masterDirty then
+        rebuildMasterList()
+    end
+
     if not chartsReady then
         local gameTime = Spring.GetGameSeconds()
         if gameTime - lastUpdateTime >= UPDATE_INTERVAL then
@@ -1135,10 +1140,6 @@ function widget:Update(dt)
             end
         end
         return
-    end
-
-    if masterDirty then
-        rebuildMasterList()
     end
 
     local gameTime = Spring.GetGameSeconds()
