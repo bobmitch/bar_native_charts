@@ -94,4 +94,8 @@ local UPDATE_INTERVAL = 10   -- higher = less CPU (try 15)
 - BAR Discord: [discord.gg/NK7QWfVE9M](https://discord.gg/NK7QWfVE9M) → `#widgets`
 - GitHub issues
 
+## Thanks
+
+Thanks to SuperKitowiec and SHiFT_DeL3TE for early feedback and testing.
+
 **Author:** FilthyMitch | **License:** MIT
