@@ -2,6 +2,8 @@
 
 Real-time resource and combat stats overlay for Beyond All Reason.
 
+For audio triggers, animations and a more streamer oriented tool, see the sister project: [Bar Announcer](https://github.com/bobmitch/bar)
+
 ![New Project (1)](https://github.com/user-attachments/assets/77d7a8c6-b317-4e65-8e11-7e71cd9578f6)
 
 
