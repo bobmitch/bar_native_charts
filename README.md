@@ -2,6 +2,9 @@
 
 Real-time resource and combat stats overlay for Beyond All Reason.
 
+![New Project (1)](https://github.com/user-attachments/assets/77d7a8c6-b317-4e65-8e11-7e71cd9578f6)
+
+
 ## Installation
 
 1. Download `charts.lua` and `bar_charts_toggle.rml`
