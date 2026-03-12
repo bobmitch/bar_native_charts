@@ -395,22 +395,16 @@ end
 local function rebuildMasterList()
     if masterDisplayList then gl.DeleteList(masterDisplayList) end
     masterDisplayList = gl.CreateList(function()
-        for _, card in pairs(statCards) do
-            if card.isDragging then
-                card.x = mx - card.dragStartX
-                card.y = my - card.dragStartY
-                masterDirty = true
-                rebuildHoverList()   -- ← keeps outline in sync with card position
-                return true
+        for _, chart in pairs(charts) do
+            -- Always render if visible, OR if disabled but edit mode is on
+            if (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive) then
+                chart:drawToList()
             end
         end
-        for _, chart in pairs(charts) do
-            if chart.isDragging then
-                chart.x = mx - chart.dragStartX
-                chart.y = my - chart.dragStartY
-                masterDirty = true
-                rebuildHoverList()   -- ← keeps outline in sync with chart position
-                return true
+        for _, card in pairs(statCards) do
+            -- Always render if visible, OR if disabled but edit mode is on
+            if (card.enabled and card.visible) or (not card.enabled and chartsInteractive) then
+                card:drawToList()
             end
         end
         -- Hint text: show lock state when charts are visible
@@ -1328,6 +1322,7 @@ function widget:MouseMove(mx, my, dx, dy)
                 card.x = mx - card.dragStartX
                 card.y = my - card.dragStartY
                 masterDirty = true
+                rebuildHoverList() 
                 return true
             end
         end
@@ -1336,6 +1331,7 @@ function widget:MouseMove(mx, my, dx, dy)
                 chart.x = mx - chart.dragStartX
                 chart.y = my - chart.dragStartY
                 masterDirty = true
+                rebuildHoverList() 
                 return true
             end
         end
