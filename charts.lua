@@ -395,16 +395,22 @@ end
 local function rebuildMasterList()
     if masterDisplayList then gl.DeleteList(masterDisplayList) end
     masterDisplayList = gl.CreateList(function()
-        for _, chart in pairs(charts) do
-            -- Always render if visible, OR if disabled but edit mode is on
-            if (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive) then
-                chart:drawToList()
+        for _, card in pairs(statCards) do
+            if card.isDragging then
+                card.x = mx - card.dragStartX
+                card.y = my - card.dragStartY
+                masterDirty = true
+                rebuildHoverList()   -- ← keeps outline in sync with card position
+                return true
             end
         end
-        for _, card in pairs(statCards) do
-            -- Always render if visible, OR if disabled but edit mode is on
-            if (card.enabled and card.visible) or (not card.enabled and chartsInteractive) then
-                card:drawToList()
+        for _, chart in pairs(charts) do
+            if chart.isDragging then
+                chart.x = mx - chart.dragStartX
+                chart.y = my - chart.dragStartY
+                masterDirty = true
+                rebuildHoverList()   -- ← keeps outline in sync with chart position
+                return true
             end
         end
         -- Hint text: show lock state when charts are visible
