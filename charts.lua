@@ -20,11 +20,13 @@
       you can find, move, resize, and re-enable them.
     
     Commands:
-    - /barcharts save   : Save layout immediately
-    - /barcharts reset  : Delete config and restore defaults
-    - /barcharts debug  : Print state to console
-    - /barcharts bp     : Print builder efficiency diagnostic
-    - /barcharts edit   : Toggle edit mode from chat
+    - /barcharts save     : Save layout immediately
+    - /barcharts reset    : Delete config and restore defaults
+    - /barcharts debug    : Print state to console
+    - /barcharts bp       : Print builder efficiency diagnostic
+    - /barcharts edit     : Toggle edit mode from chat
+    - /barcharts hidepill : Hide the LOCKED/EDIT pill button
+    - /barcharts showpill : Show the LOCKED/EDIT pill button
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -77,6 +79,10 @@ local chartsReady       = false
 -- Edit mode: when false all chart mouse interactions are suppressed.
 -- This prevents accidental drag/zoom/hide of charts during normal gameplay.
 local chartsInteractive = false   -- default: LOCKED
+
+-- Pill visibility: set to false via /barcharts hidepill for a clean interface.
+-- /barcharts edit still works as a fallback when the pill is hidden.
+local pillVisible = true
 
 local COLOR = {
     bg          = {0.031, 0.047, 0.078, 0.72},
@@ -146,21 +152,9 @@ local buildEffTickCounter = 0
 -- RMLUI TOGGLE WIDGET
 -------------------------------------------------------------------------------
 
--- RmlUI state — context, document, data model
-local rmlContext    = nil
-local rmlDocument   = nil
-local rmlModel      = nil
-local rmlModelHandle = nil
+local rmlContext     = nil
+local rmlDocument    = nil
 
--- Data model table that RmlUI reads from
-local rmlData = {
-    labelText = "LOCKED",
-    iconClass = "state-locked",
-}
-
--- Called by RmlUI when the user clicks the pill button.
--- This function is registered on the data model so RML can reach it
--- via data-event-click="onToggleClick(event)".
 local function onToggleClick(event)
     chartsInteractive = not chartsInteractive
 
@@ -183,6 +177,21 @@ local function onToggleClick(event)
     Spring.Echo("BAR Charts: " .. (chartsInteractive and "Edit mode ON — charts are interactive" or "Locked — charts are protected"))
 end
 
+local function setPillVisible(visible)
+    pillVisible = visible
+    if rmlDocument then
+        local pill = rmlDocument:GetElementById("toggle-pill")
+        if pill then
+            pill.style.display = visible and "block" or "none"
+        end
+    end
+    if not visible then
+        Spring.Echo("BAR Charts: Pill hidden. Use /barcharts edit to toggle edit mode, /barcharts showpill to restore.")
+    else
+        Spring.Echo("BAR Charts: Pill visible.")
+    end
+end
+
 local function initRmlToggle()
     if not RmlUi then
         Spring.Echo("BAR Charts: RmlUi not available, toggle widget skipped")
@@ -195,8 +204,6 @@ local function initRmlToggle()
         return
     end
 
-    -- Load fonts into our context. BAR ships these in LuaUI/Fonts/.
-    -- Try several common names; RmlUi silently ignores missing files.
     local fonts = {
         "LuaUI/Fonts/Exo2-SemiBold.ttf",
         "LuaUI/Fonts/Exo2-Regular.ttf",
@@ -209,7 +216,6 @@ local function initRmlToggle()
         end
     end
 
-    -- No data model needed — we wire the click directly via element:AddEventListener
     rmlDocument = rmlContext:LoadDocument("LuaUI/Widgets/bar_charts_toggle.rml")
     if not rmlDocument then
         Spring.Echo("BAR Charts: failed to load bar_charts_toggle.rml")
@@ -226,6 +232,11 @@ local function initRmlToggle()
     pill:SetClass("state-locked", true)
     pill:SetClass("state-edit",   false)
 
+    -- Apply saved pill visibility immediately after document loads
+    if not pillVisible then
+        pill.style.display = "none"
+    end
+
     rmlDocument:Show()
     Spring.Echo("BAR Charts: RmlUI toggle initialized")
 end
@@ -235,7 +246,6 @@ local function shutdownRmlToggle()
         rmlDocument:Close()
         rmlDocument = nil
     end
-    -- Note: don't destroy the context if it is shared with other widgets
     rmlContext = nil
 end
 
@@ -396,18 +406,15 @@ local function rebuildMasterList()
     if masterDisplayList then gl.DeleteList(masterDisplayList) end
     masterDisplayList = gl.CreateList(function()
         for _, chart in pairs(charts) do
-            -- Always render if visible, OR if disabled but edit mode is on
             if (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive) then
                 chart:drawToList()
             end
         end
         for _, card in pairs(statCards) do
-            -- Always render if visible, OR if disabled but edit mode is on
             if (card.enabled and card.visible) or (not card.enabled and chartsInteractive) then
                 card:drawToList()
             end
         end
-        -- Hint text: show lock state when charts are visible
         if chartsInteractive then
             gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.55)
             gl.Text("✏ EDIT MODE", vsx - 150, 45, 11, "o")
@@ -421,10 +428,8 @@ end
 local function rebuildHoverList()
     if hoverDisplayList then gl.DeleteList(hoverDisplayList) end
     hoverDisplayList = gl.CreateList(function()
-        -- Only render hover highlights when interactive
         if not chartsInteractive then return end
         for _, chart in pairs(charts) do
-            -- Show hover highlight for all charts in edit mode (enabled or disabled)
             if chart.isHovered then
                 gl.PushMatrix()
                 gl.Translate(chart.x, chart.y, 0)
@@ -436,7 +441,6 @@ local function rebuildHoverList()
             end
         end
         for _, card in pairs(statCards) do
-            -- Show hover highlight for all cards in edit mode (enabled or disabled)
             if card.isHovered then
                 gl.PushMatrix()
                 gl.Translate(card.x, card.y, 0)
@@ -486,8 +490,6 @@ function StatCard:drawToList()
     local w = CARD_WIDTH
     local h = CARD_HEIGHT
     local c = self.color
-    
-    -- In edit mode, show disabled cards semi-transparent
     local alphaMultiplier = (not self.enabled and chartsInteractive) and 0.35 or 1.0
 
     gl.PushMatrix()
@@ -522,8 +524,7 @@ function StatCard:drawToList()
 
     gl.Color(c[1], c[2], c[3], 1.0 * alphaMultiplier)
     gl.Text(formatNumber(math.floor(self.displayValue + 0.5)), w / 2 + 5, 10, 20, "co")
-    
-    -- Show "DISABLED" label when in edit mode and card is disabled
+
     if not self.enabled and chartsInteractive then
         gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 0.8)
         gl.Text("DISABLED", w / 2, h / 2, 10, "co")
@@ -628,8 +629,6 @@ function Chart:drawToList()
     local cY  = pad.bottom
     local cW  = w - pad.left - pad.right
     local cH  = h - pad.top  - pad.bottom
-    
-    -- In edit mode, show disabled charts semi-transparent
     local alphaMultiplier = (not self.enabled and chartsInteractive) and 0.35 or 1.0
 
     gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4] * alphaMultiplier)
@@ -969,6 +968,7 @@ local function saveConfig()
         version           = "1.0",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
+        pillVisible       = pillVisible,
         charts            = {},
         cards             = {},
     }
@@ -1009,8 +1009,9 @@ local function loadConfig()
         return {}, {}
     end
     if result.enabled ~= nil then chartsEnabled = result.enabled end
-    -- Restore interactive/locked state (always default to locked on fresh install)
     if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
+    -- Restore pill visibility (defaults to true if not present in older configs)
+    if result.pillVisible ~= nil then pillVisible = result.pillVisible end
     return result.charts or {}, result.cards or {}
 end
 
@@ -1082,6 +1083,7 @@ function widget:Initialize()
     statCards["card-build-efficiency"]  = StatCard.new("card-build-efficiency",  "BUILD EFF",  "🔧", col2X, cardY - cardStep * 3, COLOR.gold,    function() return myTeamStats.buildEfficiency  end)
 
     -- ── APPLY SAVED CONFIG ────────────────────────────────────────────────────
+    -- loadConfig also restores pillVisible, which initRmlToggle reads below
     local chartCfg, cardCfg = loadConfig()
     local chartById = {}
     for _, chart in pairs(charts) do chartById[chart.id] = chart end
@@ -1107,6 +1109,8 @@ function widget:Initialize()
     end
 
     -- ── RMLUI TOGGLE ─────────────────────────────────────────────────────────
+    -- initRmlToggle reads pillVisible (already restored above by loadConfig)
+    -- and applies display:none immediately if the pill was previously hidden.
     initRmlToggle()
 
     masterDirty = true
@@ -1118,7 +1122,6 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Update(dt)
-    -- Always rebuild display list if dirty, so placeholders render before data is ready
     if masterDirty then
         rebuildMasterList()
     end
@@ -1263,22 +1266,20 @@ function widget:KeyPress(key, mods, isRepeat)
 end
 
 local function findHitElement(mx, my)
-    -- In edit mode, allow interaction with disabled charts/cards too
     for id, card in pairs(statCards) do
-        if (card.enabled or chartsInteractive) and card:isMouseOver(mx, my) then 
-            return card, "card" 
+        if (card.enabled or chartsInteractive) and card:isMouseOver(mx, my) then
+            return card, "card"
         end
     end
     for id, chart in pairs(charts) do
-        if (chart.enabled or chartsInteractive) and chart:isMouseOver(mx, my) then 
-            return chart, "chart" 
+        if (chart.enabled or chartsInteractive) and chart:isMouseOver(mx, my) then
+            return chart, "chart"
         end
     end
     return nil, nil
 end
 
 function widget:MousePress(mx, my, button)
-    -- Gate: all chart mouse interactions require edit mode
     if not chartsEnabled or not chartsInteractive then return false end
 
     local elem, kind = findHitElement(mx, my)
@@ -1289,7 +1290,6 @@ function widget:MousePress(mx, my, button)
         elem.dragStartY = my - elem.y
         return true
     elseif button == 3 then
-        -- Right-click toggles enabled state when in edit mode
         elem.enabled = not elem.enabled
         masterDirty = true
         rebuildHoverList()
@@ -1315,14 +1315,13 @@ end
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
 
-    -- Drag is gated behind interactive mode; only hover detection proceeds in locked mode
     if chartsInteractive then
         for _, card in pairs(statCards) do
             if card.isDragging then
                 card.x = mx - card.dragStartX
                 card.y = my - card.dragStartY
                 masterDirty = true
-                rebuildHoverList() 
+                rebuildHoverList()
                 return true
             end
         end
@@ -1331,13 +1330,12 @@ function widget:MouseMove(mx, my, dx, dy)
                 chart.x = mx - chart.dragStartX
                 chart.y = my - chart.dragStartY
                 masterDirty = true
-                rebuildHoverList() 
+                rebuildHoverList()
                 return true
             end
         end
     end
 
-    -- Hover highlight updates (visual only, harmless in locked mode)
     local hoverChanged = false
     for id, card in pairs(statCards) do
         local h = chartsInteractive and card:isMouseOver(mx, my) or false
@@ -1351,7 +1349,6 @@ function widget:MouseMove(mx, my, dx, dy)
     end
     if hoverChanged then rebuildHoverList() end
 
-    -- In locked mode, never consume mouse events (game input passes through)
     if not chartsInteractive then return false end
 
     for _, card in pairs(statCards) do if card.isHovered then return true end end
@@ -1360,7 +1357,6 @@ function widget:MouseMove(mx, my, dx, dy)
 end
 
 function widget:MouseWheel(up, value)
-    -- Scroll is gated behind interactive mode
     if not chartsEnabled or not chartsInteractive then return false end
 
     local mx, my = Spring.GetMouseState()
@@ -1409,14 +1405,22 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Configuration reset - restart widget to apply")
         return true
     elseif command == "barcharts edit" then
-        -- Allow toggling edit mode from chat as a fallback (no RmlUI dependency)
         onToggleClick(nil)
+        return true
+    elseif command == "barcharts hidepill" then
+        setPillVisible(false)
+        saveConfig()
+        return true
+    elseif command == "barcharts showpill" then
+        setPillVisible(true)
+        saveConfig()
         return true
     elseif command == "barcharts debug" then
         Spring.Echo("=== BAR Charts Debug ===")
         Spring.Echo("vsx=" .. tostring(vsx) .. " vsy=" .. tostring(vsy))
         Spring.Echo("chartsEnabled=" .. tostring(chartsEnabled) .. " chartsReady=" .. tostring(chartsReady))
         Spring.Echo("chartsInteractive=" .. tostring(chartsInteractive) .. " (edit mode: " .. (chartsInteractive and "ON" or "OFF/LOCKED") .. ")")
+        Spring.Echo("pillVisible=" .. tostring(pillVisible))
         Spring.Echo("masterDirty=" .. tostring(masterDirty) .. " masterDisplayList=" .. tostring(masterDisplayList))
         Spring.Echo(string.format("buildEfficiency=%.1f%% (rolling avg over %d/%d samples)",
             myTeamStats.buildEfficiency, buildEffSampleCount, BUILD_EFF_WINDOW_SIZE))
