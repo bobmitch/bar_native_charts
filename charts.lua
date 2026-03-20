@@ -1060,7 +1060,30 @@ local function initAllyTeams()
 
     local tlist
     if isSpectator then
-        tlist = Spring.GetTeamList()
+        -- GetTeamList() with no argument can miss teams in other ally groups
+        -- depending on engine version. Enumerate every ally group explicitly.
+        local allyTeamList = Spring.GetAllyTeamList()
+        local seen = {}
+        tlist = {}
+        if allyTeamList then
+            for _, atid in ipairs(allyTeamList) do
+                local teams = Spring.GetTeamList(atid) or {}
+                for _, tid in ipairs(teams) do
+                    if not seen[tid] then
+                        seen[tid] = true
+                        tlist[#tlist + 1] = tid
+                    end
+                end
+            end
+        end
+        -- Fallback: also sweep GetTeamList() bare in case engine behaviour differs
+        local bare = Spring.GetTeamList() or {}
+        for _, tid in ipairs(bare) do
+            if not seen[tid] then
+                seen[tid] = true
+                tlist[#tlist + 1] = tid
+            end
+        end
     else
         local aid = Spring.GetMyAllyTeamID()
         if not aid then return false end
