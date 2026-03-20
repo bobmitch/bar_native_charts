@@ -8,96 +8,99 @@ For audio triggers, animations and a more streamer oriented tool, see the sister
 
 
 ## Installation
-
+ 
 1. Download `charts.lua` and `bar_charts_toggle.rml`
-2. Copy both files to your BAR widgets folder:
-   - **Windows:** `C:\Users\<YourName>\Documents\My Games\Spring\LuaUI\Widgets\`
+2. Copy both to your BAR widgets folder:
+   - **Windows:** `Documents\My Games\Spring\LuaUI\Widgets\`
    - **Linux:** `~/.spring/LuaUI/Widgets/`
    - **Mac:** `~/Library/Application Support/Spring/LuaUI/Widgets/`
-3. Launch BAR → press **F11** → enable **"BAR Stats Charts"**
-4. Press **F9** to show/hide the charts
-
-## Charts Included
-
-**Personal (line charts):**
-- Metal Income / Usage
-- Energy Income / Usage
-- Damage Dealt / Taken
-- Army Value
-- K/D Ratio
-- Builder Efficiency
-
-**Team Comparison (multi-line):**
-- Team Army Values — compare army sizes across all allies
-- Team Build Power — compare total construction capacity
-
-**Stat Cards (numeric readouts):**
-Army Value, Unit Count, Kills, Losses, Damage Dealt/Taken, Metal Lost, Build Efficiency
-
+3. In-game: **F11** → enable **BAR Stats Charts**
+4. **F9** to show/hide
+ 
+---
+ 
+## Charts & Cards
+ 
+**Line charts (your team):** Metal Income/Usage · Energy Income/Usage · Damage Dealt/Taken · Army Value · K/D Ratio · Builder Efficiency
+ 
+**Multi-line charts (all allies):** Team Army Values · Team Build Power
+ 
+**Stat cards:** Army Value · Unit Count · Kills · Losses · Damage Dealt/Taken · Metal Lost · Build Efficiency
+ 
+---
+ 
 ## Controls
-
+ 
 | Action | How |
-|--------|-----|
-| Show/hide all charts | **F9** |
-| Enable edit mode | Click the **CHARTS: LOCKED** pill (top-right) |
-| Move a chart | Edit mode ON → click and drag |
-| Resize a chart | Edit mode ON → scroll wheel over chart |
-| Hide one chart | Edit mode ON → right-click chart |
-| Toggle edit from chat | `/barcharts edit` |
-
-> Charts are **locked by default** during gameplay so you can't accidentally move them. Click the pill button or type `/barcharts edit` to unlock.
-
+|---|---|
+| Show/hide all | **F9** |
+| Toggle edit mode | Click the **CHARTS: LOCKED** pill (top-right), or `/barcharts edit` |
+| Move a chart | Edit mode → drag |
+| Resize a chart | Edit mode → scroll wheel |
+| Hide one chart | Edit mode → right-click |
+ 
+> Charts are **locked by default** to prevent accidental moves during play.
+ 
+---
+ 
 ## Layout Saving
-
-Your chart positions, sizes, and visibility are saved automatically when you exit. They restore next session.
-
-- **Save now:** `/barcharts save`
-- **Reset to defaults:** `/barcharts reset` (then `/luaui reload`)
-
-Config is stored at:
-- **Windows:** `C:\Users\<You>\Documents\My Games\Spring\bar_charts_config.lua`
-- **Linux:** `~/.spring/bar_charts_config.lua`
-
-## Build Efficiency Card
-
-Shows how efficiently your builders are using available metal (0–100%). A **⚠ STALL** warning appears on affected charts/cards when your metal demand is outpacing supply.
-
-## Performance
-
-Default settings are fine for most PCs. If you experience lag, open the widget file and adjust these values near the top:
-
-```lua
-local HISTORY_SIZE    = 60   -- lower = less memory (try 30)
-local UPDATE_INTERVAL = 10   -- higher = less CPU (try 15)
-```
-
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| Charts won't save | Check write permissions on your Spring folder |
-| Team charts show "awaiting data" | Wait 10s after game start; must have live teammates |
-| Charts off-screen after resolution change | `/barcharts reset` then reposition |
-| Wrong team colors | `/luaui reload` |
-| Can't move charts | Make sure edit mode is ON (pill shows **CHARTS: EDIT**) |
-
-## Commands
-
+ 
+Positions, scales, and visibility save automatically on exit and restore next session.
+ 
 | Command | Effect |
-|---------|--------|
-| `/barcharts save` | Save layout immediately |
-| `/barcharts reset` | Restore default layout (requires `/luaui reload`) |
+|---|---|
+| `/barcharts save` | Save immediately |
+| `/barcharts reset` | Restore defaults (then `/luaui reload`) |
 | `/barcharts edit` | Toggle edit/locked mode |
-| `/barcharts debug` | Print current state to console |
-| `/barcharts bp` | Print builder efficiency diagnostic |
-
+| `/barcharts view <name\|id>` | Switch viewed team (spectator / ally) |
+| `/barcharts debug` | Print state to console |
+| `/barcharts bp` | Builder efficiency diagnostic |
+| `/barcharts hidepill` / `showpill` | Hide/restore the pill button |
+ 
+**Config file location:**
+- **Windows:** `Documents\My Games\Spring\bar_charts_config.lua`
+- **Linux:** `~/.spring/bar_charts_config.lua`
+ 
+---
+ 
+## Technical Notes
+ 
+**History:** 60-second ring buffer (1800 frames at 30 fps), sampled every frame, rendered at up to 150 points.
+ 
+**Multi-team buffering:** All ally teams (or all teams in spectator mode) are buffered simultaneously. Switching view is an O(1) pointer swap — no data gaps.
+ 
+**Spectator mode:** Detected automatically. All active game teams are tracked; the pill and `/barcharts view` can switch between them.
+ 
+**Builder Efficiency:** Measures how much metal active builders are pulling vs. their theoretical maximum. A **⚠ STALL** warning appears when metal demand outpaces supply.
+ 
+---
+ 
+## Performance Tuning
+ 
+Edit near the top of `charts.lua`:
+ 
+```lua
+local HISTORY_SIZE    = 1800  -- lower = less memory (try 900)
+local UPDATE_INTERVAL = 30    -- higher = less CPU (try 60)
+```
+ 
+---
+ 
+## Troubleshooting
+ 
+| Problem | Fix |
+|---|---|
+| Charts won't save | Check write permissions on your Spring folder |
+| Team charts show "awaiting data" | Wait ~10s after game start |
+| Charts off-screen after resolution change | `/barcharts reset` |
+| Wrong team colors | `/luaui reload` |
+| Can't move charts | Confirm pill shows **CHARTS: EDIT** |
+ 
+---
+ 
 ## Support
-
+ 
 - BAR Discord: [discord.gg/NK7QWfVE9M](https://discord.gg/NK7QWfVE9M) → `#widgets`
-- GitHub issues
-
-## Thanks
-
-Thanks to SuperKitowiec and SHiFT_DeL3TE for early feedback and testing.
-
-**Author:** FilthyMitch | **License:** MIT
+- GitHub Issues
+ 
+**Author:** FilthyMitch · **License:** MIT · **Thanks to:** SuperKitowiec and SHiFT_DeL3TE for testing
