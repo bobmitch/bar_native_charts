@@ -81,7 +81,7 @@ local HISTORY_SECONDS = 60
 local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 1800 frames
 local RENDER_POINTS   = 150
 
-local BUILD_EFF_TICKS_PER_SAMPLE = 30
+local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
 
 local CHART_WIDTH  = 300
@@ -808,8 +808,20 @@ local function drawChartLines(chart)
                 end)
             end
 
+            -- soft halo pass — wide, semi-transparent
+            gl.Color(clr[1], clr[2], clr[3], 0.35*am)
+            gl.LineWidth(4.5)
+            gl.BeginEnd(GL.LINE_STRIP, function()
+                for i, v in ipairs(pts) do
+                    if v and not (v ~= v) then
+                        local x = cX + ((i-1)/(nPts-1)) * cW
+                        gl.Vertex(x, toY(v))
+                    end
+                end
+            end)
+            -- crisp core pass — thin, fully opaque
             gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-            gl.LineWidth(2.0)
+            gl.LineWidth(1.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
                 for i, v in ipairs(pts) do
                     if v and not (v ~= v) then
