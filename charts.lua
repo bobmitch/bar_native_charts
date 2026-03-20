@@ -77,9 +77,9 @@ end
 local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
-local HISTORY_SECONDS = 60
+local HISTORY_SECONDS = 120
 local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 1800 frames
-local RENDER_POINTS   = 150
+local RENDER_POINTS   = 300
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
@@ -809,8 +809,8 @@ local function drawChartLines(chart)
             end
 
             -- soft halo pass — wide, semi-transparent
-            gl.Color(clr[1], clr[2], clr[3], 0.35*am)
-            gl.LineWidth(4.5)
+            gl.Color(clr[1], clr[2], clr[3], 0.25*am)
+            gl.LineWidth(3.5)
             gl.BeginEnd(GL.LINE_STRIP, function()
                 for i, v in ipairs(pts) do
                     if v and not (v ~= v) then
