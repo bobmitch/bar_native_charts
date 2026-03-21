@@ -1,7 +1,7 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.3 by FilthyMitch
+    v2.4 by FilthyMitch
 
     History window : exactly 60 in-game seconds = 1 800 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
@@ -35,6 +35,13 @@
       directly and sets chromeDirty=true the first time data arrives so the
       grid/labels get a fresh rebuild.  This fixes the "awaiting data" stuck
       state when the widget is loaded mid-game.
+
+    Team name labels (v2.4):
+      Multi-team charts show trailing end-labels at the rightmost data point.
+      A nudge algorithm prevents overlap when lines converge.  On hover-intent
+      (cursor dwelling ≥ HOVER_INTENT_THRESHOLD seconds) a ranked tooltip panel
+      replaces the ambient labels, showing all teams sorted by current value
+      with colored swatches.  Hover is tracked independently of edit mode.
 
 ═══════════════════════════════════════════════════════════════════════════
 ]]
@@ -89,6 +96,21 @@ local CHART_HEIGHT = 180
 local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH   = 140
 local CARD_HEIGHT  = 70
+
+-- ── Team label rendering (v2.4) ────────────────────────────────────────────
+-- Minimum pixel gap between nudged labels (in chart-local coords, pre-scale).
+local LABEL_MIN_GAP         = 13
+-- Opacity of ambient trailing end-labels (0-1).
+local LABEL_AMBIENT_OPACITY = 0.55
+-- Seconds the cursor must dwell over a chart before the tooltip panel appears.
+local HOVER_INTENT_THRESHOLD = 0.42
+-- Maximum characters shown in ambient end-labels.
+local LABEL_MAX_CHARS        = 4
+-- Right-side padding for end-label text (from chart right edge, chart coords).
+local LABEL_RIGHT_INSET      = 6
+-- Width reserved for the trailing hairline connector between nudged label
+-- and its endpoint dot.
+local HAIRLINE_LENGTH        = 10
 
 local COLOR = {
     bg        = {0.031, 0.047, 0.078, 0.72},
@@ -195,6 +217,12 @@ local FULL_SCAN_INTERVAL = GAME_FPS
 
 local chartsReadyWaitFrames = 0
 local READY_WAIT_FRAMES     = GAME_FPS * 3
+
+-- ── Hover-intent state (v2.4) ──────────────────────────────────────────────
+-- Keyed by chart.id.  Timer counts up while cursor is inside the chart,
+-- resets to 0 when cursor leaves.  Intent fires when timer >= threshold.
+local chartHoverTimer  = {}   -- [chartId] = seconds elapsed
+local chartHoverIntent = {}   -- [chartId] = bool  (threshold reached)
 
 -------------------------------------------------------------------------------
 -- RMLUI TOGGLE
@@ -898,6 +926,217 @@ local function drawCardValues()
 end
 
 -------------------------------------------------------------------------------
+-- TEAM LABEL RENDERING (v2.4)
+--
+-- nudgeLabels(entries, chartH, minGap)
+--   entries  : array of { dotY=<chart-local Y of endpoint>, labelY=<mutable> }
+--              sorted by dotY descending (highest on screen = highest value
+--              because Y increases upward in chart-local coords).
+--   chartH   : usable height in chart-local coords (cH).
+--   minGap   : minimum separation between adjacent label centres.
+--
+-- Algorithm (iterative push-apart, bounded):
+--   1. Start each label at its natural dotY.
+--   2. Sort descending by labelY so we process top-to-bottom.
+--   3. Iteratively scan pairs: if gap < minGap, compute the overlap and
+--      push them symmetrically apart (top label up, bottom label down).
+--   4. After pushing, clamp every label to [cY, cY+cH].
+--   5. Repeat until no overlaps remain or MAX_ITER is exhausted.
+--   The symmetric push keeps labels centred around their natural midpoint,
+--   which produces the most intuitive visual mapping back to their dots.
+--
+-- After convergence a hairline connector is drawn from the nudged label
+-- position to the actual dot position whenever the two differ by > 2px.
+-------------------------------------------------------------------------------
+
+local function nudgeLabels(entries, cYbase, cH)
+    local MAX_ITER = 30
+    local n        = #entries
+    if n == 0 then return end
+
+    -- Initialise labelY from dotY.
+    for _, e in ipairs(entries) do e.labelY = e.dotY end
+
+    -- Clamp helper — keeps label centre inside plot area with a small margin.
+    local margin = 4
+    local lo     = cYbase + margin
+    local hi     = cYbase + cH - margin
+    local function clampAll()
+        for _, e in ipairs(entries) do
+            if e.labelY < lo then e.labelY = lo end
+            if e.labelY > hi then e.labelY = hi end
+        end
+    end
+
+    -- Sort descending by labelY (higher Y = higher on screen in BAR's
+    -- coordinate system where Y increases upward).
+    local function sortDesc()
+        table.sort(entries, function(a, b) return a.labelY > b.labelY end)
+    end
+
+    sortDesc()
+
+    local changed = true
+    local iter    = 0
+    while changed and iter < MAX_ITER do
+        changed = false
+        iter    = iter + 1
+        -- One forward pass: push overlapping pairs apart.
+        for i = 1, n - 1 do
+            local top = entries[i]    -- higher Y (drawn higher on screen)
+            local bot = entries[i+1]  -- lower Y
+            local gap = top.labelY - bot.labelY
+            if gap < LABEL_MIN_GAP then
+                local push = (LABEL_MIN_GAP - gap) * 0.5
+                top.labelY = top.labelY + push
+                bot.labelY = bot.labelY - push
+                changed    = true
+            end
+        end
+        clampAll()
+        -- Re-sort after clamping because clamping can invert order.
+        sortDesc()
+    end
+end
+
+-- Truncate a player name to LABEL_MAX_CHARS, appending ".." if clipped.
+local function truncName(s)
+    return string.upper(s:sub(1, LABEL_MAX_CHARS))
+end
+
+-- Draw trailing end-labels and/or the hover-intent tooltip panel for a
+-- single multi-team chart.  Called from DrawScreen every frame.
+local function drawMultiTeamLabels(chart)
+    -- Only meaningful for multi-team charts with data.
+    if not chart.multiTeam then return end
+    if not chart.enabled or not chart.visible then return end
+    if not chart:hasData() then return end
+    if #chart.series == 0 then return end
+
+    -- Reuse the range computed by drawChartLines (may be nil first frame).
+    local mn = chart._minV
+    local r  = chart._range
+    if not mn or not r or r == 0 then return end
+
+    local cX = PADDING.left
+    local cY = PADDING.bottom
+    local cW = chart.width  - PADDING.left - PADDING.right
+    local cH = chart.height - PADDING.top  - PADDING.bottom
+
+    local function toY(v) return cY + ((v - mn) / r) * cH end
+
+    -- Build the entry table: one entry per series with a valid last value.
+    local entries = {}
+    for si, s in ipairs(chart.series) do
+        local pts = chart:getSamples(si)
+        local n   = #pts
+        if n >= 1 then
+            local last = pts[n]
+            if last and not (last ~= last) then
+                entries[#entries + 1] = {
+                    label  = s.label or ("Team "..si),
+                    color  = s.color,
+                    value  = last,
+                    dotY   = toY(last),
+                    labelY = toY(last),   -- will be mutated by nudgeLabels
+                }
+            end
+        end
+    end
+
+    if #entries == 0 then return end
+
+    local intent = chartHoverIntent[chart.id]
+
+    gl.PushMatrix()
+    gl.Translate(chart.x, chart.y, 0)
+    gl.Scale(chart.scale, chart.scale, 1)
+
+    if intent then
+        -----------------------------------------------------------------------
+        -- HOVER-INTENT MODE: ranked tooltip panel
+        -- Sort by current value descending so the strongest team is on top.
+        -----------------------------------------------------------------------
+        table.sort(entries, function(a, b) return a.value > b.value end)
+
+        local FONT_SIZE    = 9
+        local LINE_H       = 13     -- pixels per row
+        local SWATCH_W     = 4      -- coloured left stripe width
+        local PANEL_PAD_X  = 7
+        local PANEL_PAD_Y  = 5
+        local PANEL_W      = chart.width - PADDING.left - PADDING.right - 2
+        local PANEL_H      = #entries * LINE_H + PANEL_PAD_Y * 2
+        -- Position the panel just inside the top-right of the plot area.
+        local PANEL_X      = PADDING.left + 2
+        local PANEL_Y      = PADDING.bottom + cH - PANEL_H - 2
+
+        -- Panel background
+        gl.Color(0.02, 0.04, 0.08, 0.88)
+        drawRoundedRect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 3, true)
+        -- Panel border
+        gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], 0.5)
+        gl.LineWidth(1)
+        drawRoundedRect(PANEL_X + 0.5, PANEL_Y + 0.5, PANEL_W - 1, PANEL_H - 1, 3, false)
+
+        for i, e in ipairs(entries) do
+            local rowY = PANEL_Y + PANEL_H - PANEL_PAD_Y - (i * LINE_H) + 2
+            local clr  = e.color
+
+            -- Colour swatch stripe
+            gl.Color(clr[1], clr[2], clr[3], 0.85)
+            gl.BeginEnd(GL.QUADS, function()
+                gl.Vertex(PANEL_X,            rowY)
+                gl.Vertex(PANEL_X + SWATCH_W, rowY)
+                gl.Vertex(PANEL_X + SWATCH_W, rowY + LINE_H - 2)
+                gl.Vertex(PANEL_X,            rowY + LINE_H - 2)
+            end)
+
+            -- Player name (full, not truncated — panel has room)
+            local displayName = e.label
+            if #displayName > 14 then displayName = displayName:sub(1, 12) .. ".." end
+            gl.Color(clr[1], clr[2], clr[3], 1.0)
+            gl.Text(displayName, PANEL_X + SWATCH_W + PANEL_PAD_X, rowY + 1, FONT_SIZE, "o")
+
+            -- Value, right-aligned inside panel
+            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.9)
+            gl.Text(formatNumber(e.value), PANEL_X + PANEL_W - PANEL_PAD_X, rowY + 1, FONT_SIZE, "ro")
+        end
+
+    else
+        -----------------------------------------------------------------------
+        -- AMBIENT MODE: trailing end-labels with nudge
+        -----------------------------------------------------------------------
+        nudgeLabels(entries, cY, cH)
+
+        local dotX = cX + cW   -- X position of endpoint dots (right edge of plot)
+
+        for _, e in ipairs(entries) do
+            local clr     = e.color
+            local nudged  = math.abs(e.labelY - e.dotY) > 2
+
+            -- Hairline connector when label has been nudged away from its dot.
+            if nudged then
+                gl.Color(clr[1], clr[2], clr[3], LABEL_AMBIENT_OPACITY * 0.5)
+                gl.LineWidth(1)
+                gl.BeginEnd(GL.LINES, function()
+                    -- Connector runs horizontally from the dot X to just before the label.
+                    gl.Vertex(dotX + 2,                   e.dotY)
+                    gl.Vertex(dotX + 2 + HAIRLINE_LENGTH, e.labelY)
+                end)
+            end
+
+            -- Label text: name truncated, rendered right-to-left anchor so it
+            -- doesn't escape the chart's right edge.
+            gl.Color(clr[1], clr[2], clr[3], LABEL_AMBIENT_OPACITY)
+            local labelX = chart.width - LABEL_RIGHT_INSET
+            gl.Text(truncName(e.label), labelX, e.labelY - 4, 9, "ro")
+        end
+    end
+
+    gl.PopMatrix()
+end
+
+-------------------------------------------------------------------------------
 -- ARMY & BUILD POWER HELPERS
 -------------------------------------------------------------------------------
 
@@ -1017,37 +1256,20 @@ end
 -------------------------------------------------------------------------------
 
 -- v2.3: isActiveParticipant — simplified and robust.
--- Admits a team if it is alive and either:
---   (a) an AI team,
---   (b) led by a non-spectating human player, or
---   (c) has live units (fallback for edge cases / mid-game restart).
--- The `active` flag is intentionally NOT used — it can be false for the
--- local player in single-player or early LAN joins.
 local function isActiveParticipant(tid)
     local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
-
-    -- Exclude dead/resigned teams.
     if isDead then return false end
-
-    -- AI teams are always legitimate participants.
     if isAI then return true end
-
-    -- Always admit our own team unconditionally.
     if myTeamID ~= nil and tid == myTeamID then return true end
-
-    -- Exclude Gaia and leaderless slots unless they have units.
     if not leaderID or leaderID < 0 then
         local units = Spring.GetTeamUnits(tid)
         return units and #units > 0
     end
-
-    -- Human-led: exclude only if the leader is a spectator.
     local _, _, spectator = Spring.GetPlayerInfo(leaderID)
     if spectator then
         local units = Spring.GetTeamUnits(tid)
         return units and #units > 0
     end
-
     return true
 end
 
@@ -1065,15 +1287,12 @@ local function resolveTeamName(tid)
 end
 
 local function initAllyTeams()
-    -- Re-resolve spectator status and myTeamID on every attempt.
     local spec = Spring.GetSpectatingState()
     isSpectator = spec or false
     myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
 
     local tlist
     if isSpectator then
-        -- GetTeamList() with no argument can miss teams in other ally groups
-        -- depending on engine version. Enumerate every ally group explicitly.
         local allyTeamList = Spring.GetAllyTeamList()
         local seen = {}
         tlist = {}
@@ -1088,7 +1307,6 @@ local function initAllyTeams()
                 end
             end
         end
-        -- Fallback: also sweep GetTeamList() bare in case engine behaviour differs
         local bare = Spring.GetTeamList() or {}
         for _, tid in ipairs(bare) do
             if not seen[tid] then
@@ -1128,8 +1346,6 @@ local function initAllyTeams()
         end
     end
 
-    -- Mid-game restart fallback: if isActiveParticipant filtered everything
-    -- (engine state may be partially settled), admit any non-dead team with units.
     if not next(newTeams) then
         Spring.Echo("BAR Charts: isActiveParticipant filtered all teams — using unit-presence fallback")
         for _, tid in ipairs(tlist) do
@@ -1230,8 +1446,6 @@ local function collectStats(gameFrame)
 
     for _, card in pairs(statCards) do card:update() end
 
-    -- Trigger a chrome rebuild the first time any chart transitions from
-    -- no-data to has-data, so the grid and axis labels appear correctly.
     if not chromeDirty then
         for _, chart in pairs(charts) do
             if chart.enabled and chart._range == nil and chart:hasData() then
@@ -1341,7 +1555,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.3",
+        version           = "2.4",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         charts            = {},
@@ -1453,7 +1667,7 @@ local function findTeamByName(nameQuery)
 end
 
 -------------------------------------------------------------------------------
--- DIAGNOSTIC (used during ready-wait to log engine state)
+-- DIAGNOSTIC
 -------------------------------------------------------------------------------
 
 local function debugInitState()
@@ -1490,7 +1704,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.3: Initialize")
+    Spring.Echo("BAR Charts v2.4: Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -1508,52 +1722,76 @@ function widget:Initialize()
     builderUnits          = {}
     buildEffState         = {}
     maxMetalUseCache      = {}
+    chartHoverTimer       = {}
+    chartHoverIntent      = {}
     resetBuildEffForTeam(nil)
     buildChartsAndCards()
     local chartCfg, cardCfg = loadConfig()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.3: Initialized"
+    Spring.Echo("BAR Charts v2.4: Initialized"
         .. (isSpectator and " (SPECTATOR)" or "")
         .. ", waiting for team data…")
 end
 
 -------------------------------------------------------------------------------
--- UPDATE
+-- UPDATE (called every render frame by the engine)
+--
+-- v2.4: Advances per-chart hover-intent timers.
+-- Hover is now tracked for ALL charts regardless of chartsInteractive,
+-- so the tooltip panel works during normal play.
+-- The timer increments by dt while the cursor is inside the chart's screen
+-- rect, and resets to 0 the moment the cursor leaves.
+-- chartHoverIntent fires (and stays fired) once the timer crosses the
+-- threshold; it clears immediately on exit so re-entry starts fresh.
 -------------------------------------------------------------------------------
 
 local function pollLocalTeam()
     if not chartsReady then return end
-
     local teamID = Spring.GetLocalTeamID()
     if teamID == nil then return end
     if teamID == viewedTeamID then return end
-
     Spring.Echo(string.format(
         "BAR Charts [poll] GetLocalTeamID=%d  (current viewedTeamID=%s)",
         teamID, tostring(viewedTeamID)))
-
     if not allyTeams[teamID] then
         Spring.Echo(string.format(
-            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring",
-            teamID))
+            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring", teamID))
         return
     end
-
     local oldStats = allyTeams[viewedTeamID]
     Spring.Echo(string.format(
         "BAR Charts [poll] VIEW SWITCH  '%s' (team %s) → '%s' (team %d)",
         oldStats and oldStats.playerName or tostring(viewedTeamID),
         tostring(viewedTeamID),
         allyTeams[teamID].playerName, teamID))
-
     viewedTeamID = teamID
     chromeDirty  = true
 end
 
 function widget:Update(dt)
     pollLocalTeam()
+
+    -- ── Hover-intent timer updates ─────────────────────────────────────────
+    if not chartsEnabled then return end
+    local mx, my = Spring.GetMouseState()
+    for _, chart in pairs(charts) do
+        if chart.multiTeam and chart.enabled and chart.visible then
+            local inside = chart:isMouseOver(mx, my)
+            if inside then
+                local t = (chartHoverTimer[chart.id] or 0) + dt
+                chartHoverTimer[chart.id] = t
+                if t >= HOVER_INTENT_THRESHOLD then
+                    chartHoverIntent[chart.id] = true
+                end
+            else
+                -- Reset on exit — next dwell starts fresh.
+                chartHoverTimer[chart.id]  = 0
+                chartHoverIntent[chart.id] = false
+            end
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1564,7 +1802,7 @@ function widget:GameFrame(n)
     if not chartsReady then
         chartsReadyWaitFrames = chartsReadyWaitFrames + 1
         if chartsReadyWaitFrames >= READY_WAIT_FRAMES then
-            chartsReadyWaitFrames = 0  -- always reset so we retry every 3s until success
+            chartsReadyWaitFrames = 0
             debugInitState()
             if initAllyTeams() then
                 charts.allyArmy:rebuildMultiTeamSeries()
@@ -1578,7 +1816,7 @@ function widget:GameFrame(n)
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.3: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v2.4: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
                 Spring.Echo("BAR Charts: Tracked teams:")
                 for tid, stats in pairs(allyTeams) do
@@ -1618,6 +1856,8 @@ function widget:GameStart()
     history               = {}
     histHead              = {}
     histFull              = {}
+    chartHoverTimer       = {}
+    chartHoverIntent      = {}
     for _, stats in pairs(allyTeams) do
         stats.armyValue       = 0; stats.unitCount      = 0
         stats.kills           = 0; stats.losses         = 0
@@ -1627,7 +1867,7 @@ function widget:GameStart()
         stats.buildPower      = 0
     end
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.3: Game started")
+    Spring.Echo("BAR Charts v2.4: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -1638,7 +1878,11 @@ function widget:DrawScreen()
     if not chartsEnabled then return end
     if chromeDirty then rebuildChromeList() end
     if chromeDisplayList then gl.CallList(chromeDisplayList) end
-    for _, chart in pairs(charts) do drawChartLines(chart) end
+    for _, chart in pairs(charts) do
+        drawChartLines(chart)
+        -- Draw team name labels on top of lines for multi-team charts.
+        drawMultiTeamLabels(chart)
+    end
     drawCardValues()
     if hoverDisplayList then gl.CallList(hoverDisplayList) end
 end
@@ -1795,7 +2039,6 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Config reset — restart widget to apply")
         return true
     elseif command == "barcharts edit" then
-        -- Toggle edit mode directly — does not affect pill visibility.
         chartsInteractive = not chartsInteractive
         syncPillState()
         chromeDirty = true
@@ -1810,7 +2053,7 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Pill visible")
         return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.3 Debug ===")
+        Spring.Echo("=== BAR Charts v2.4 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
@@ -1827,6 +2070,11 @@ function widget:TextCommand(command)
                 tid, stats.playerName, mine, viewing,
                 stats.metalIncome, stats.metalUsage,
                 stats.armyValue, tostring(full), head))
+        end
+        Spring.Echo("-- HOVER INTENT --")
+        for id, t in pairs(chartHoverTimer) do
+            Spring.Echo(string.format("  %s  timer=%.2f  intent=%s",
+                id, t, tostring(chartHoverIntent[id] or false)))
         end
         return true
     elseif command == "barcharts viewdebug" then
@@ -1896,5 +2144,5 @@ function widget:Shutdown()
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.3: Shutdown")
+    Spring.Echo("BAR Charts v2.4: Shutdown")
 end
