@@ -1590,6 +1590,147 @@ function widget:Initialize()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
+
+    -- public interface for data yoinking
+    WG.BarCharts = {
+ 
+        -- ── Identity / version ───────────────────────────────────────────
+        version = "2.5",
+ 
+        -- ── Team enumeration ─────────────────────────────────────────────
+ 
+        --- Returns a list of all currently tracked team IDs.
+        -- @return table  e.g. { 0, 1, 2, 3 }
+        getTrackedTeams = function()
+            local out = {}
+            for tid in pairs(allyTeams) do
+                out[#out + 1] = tid
+            end
+            table.sort(out)
+            return out
+        end,
+ 
+        --- Returns the team ID whose data is currently shown in single-team
+        -- charts (the "viewed" team).  In a normal game this is the local
+        -- player's team; in spectator mode it is whichever team was last
+        -- selected via /barcharts view.
+        -- @return number|nil
+        getViewedTeamID = function()
+            return viewedTeamID
+        end,
+ 
+        --- Returns true if the local client is spectating.
+        -- @return boolean
+        isSpectator = function()
+            return isSpectator
+        end,
+ 
+        -- ── Team metadata ────────────────────────────────────────────────
+ 
+        --- Returns the live stats table for a team.
+        -- Fields: metalIncome, metalUsage, energyIncome, energyUsage,
+        --         damageDealt, damageTaken, armyValue, buildPower,
+        --         kills, losses, unitCount, metalLost,
+        --         buildEfficiency, metalStall, playerName, color, teamID.
+        -- The table is returned BY REFERENCE — values update every game
+        -- frame without another call.  Do NOT write to it.
+        -- @param  teamID  number
+        -- @return table|nil   nil if teamID is not tracked
+        getTeamStats = function(teamID)
+            return allyTeams[teamID]
+        end,
+ 
+        --- Convenience: returns the live stats table for the viewed team.
+        -- @return table|nil
+        getViewedTeamStats = function()
+            return allyTeams[viewedTeamID]
+        end,
+ 
+        -- ── Ring-buffer access ───────────────────────────────────────────
+ 
+        --- Valid series key strings — pass one of these to getSamples /
+        -- getRawBuffer / getBufferInfo.
+        seriesKeys = SERIES_KEYS,   -- shared constant reference, read-only
+ 
+        --- Returns a resampled array of up to `numPoints` values drawn
+        -- evenly from the ring buffer.  Index 1 is oldest, index N newest.
+        -- Returns a fresh table each call (safe to hold onto).
+        -- @param  teamID     number
+        -- @param  seriesKey  string   one of WG.BarCharts.seriesKeys
+        -- @param  numPoints  number?  default RENDER_POINTS (1500)
+        -- @return table|nil  nil if teamID or seriesKey is unknown
+        getSamples = function(teamID, seriesKey, numPoints)
+            numPoints = numPoints or RENDER_POINTS
+            if not history[teamID] then return nil end
+            if not history[teamID][seriesKey] then return nil end
+            return ringSample(teamID, seriesKey, numPoints)
+        end,
+ 
+        --- Returns { startIndex, count } describing the live ring buffer for
+        -- a team+series.  Use together with getRawBuffer if you want to
+        -- iterate the buffer yourself without the resampling step.
+        -- @param  teamID    number
+        -- @param  seriesKey string
+        -- @return number startIndex, number count   (both 0 if unknown)
+        getBufferInfo = function(teamID, seriesKey)
+            if not history[teamID] then return 0, 0 end
+            if not history[teamID][seriesKey] then return 0, 0 end
+            local s, c = ringRange(teamID, seriesKey)
+            return s, c
+        end,
+ 
+        --- Returns the RAW ring-buffer table for a team+series BY REFERENCE.
+        -- Length is always HISTORY_SIZE; valid entries run from startIndex
+        -- for `count` slots (wrapping).  Use getBufferInfo for the indices.
+        -- Treat as read-only.  Faster than getSamples when you need every
+        -- point or are doing your own downsampling.
+        -- @param  teamID    number
+        -- @param  seriesKey string
+        -- @return table|nil
+        getRawBuffer = function(teamID, seriesKey)
+            if not history[teamID] then return nil end
+            return history[teamID][seriesKey]
+        end,
+ 
+        --- Returns HISTORY_SIZE (total ring-buffer capacity in frames) and
+        -- GAME_FPS so callers can convert frame counts to seconds.
+        -- @return number historySize, number gameFPS
+        getBufferConstants = function()
+            return HISTORY_SIZE, GAME_FPS
+        end,
+ 
+        --- Returns the number of game frames currently held in the buffer
+        -- for a given team+series, and the current game clock in seconds.
+        -- Useful for x-axis scaling in external renderers.
+        -- @param  teamID    number
+        -- @param  seriesKey string
+        -- @return number windowSecs, number nowGameSecs
+        getTimeWindow = function(teamID, seriesKey)
+            if not history[teamID] or not history[teamID][seriesKey] then
+                return 0, 0
+            end
+            local _, count    = ringRange(teamID, seriesKey)
+            local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
+            return count / GAME_FPS, nowGameSecs
+        end,
+ 
+        -- ── Widget-state queries ─────────────────────────────────────────
+ 
+        --- True once the widget has finished its startup wait and begun
+        -- collecting data.  External widgets should guard on this before
+        -- reading any data.
+        -- @return boolean
+        isReady = function()
+            return chartsReady
+        end,
+ 
+        --- True if charts are currently visible (F9 toggle state).
+        -- @return boolean
+        isEnabled = function()
+            return chartsEnabled
+        end,
+    }
+
     Spring.Echo("BAR Charts v2.5: Initialized"
         .. (isSpectator and " (SPECTATOR)" or "")
         .. ", waiting for team data…")
@@ -2003,6 +2144,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Shutdown()
+    WG.BarCharts = nil -- shut down public interface
     saveConfig()
     shutdownRmlToggle()
     freeLists()
