@@ -685,35 +685,6 @@ local function rebuildChromeList()
     chromeDirty = false
 end
 
-local function rebuildHoverList()
-    if hoverDisplayList then gl.DeleteList(hoverDisplayList) end
-    hoverDisplayList = gl.CreateList(function()
-        if not chartsInteractive then return end
-        for _, chart in pairs(charts) do
-            if chart.isHovered then
-                gl.PushMatrix()
-                gl.Translate(chart.x, chart.y, 0)
-                gl.Scale(chart.scale, chart.scale, 1)
-                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], COLOR.borderHot[4])
-                gl.LineWidth(1.5)
-                drawRoundedRect(0.5, 0.5, chart.width-1, chart.height-1, 4, false)
-                gl.PopMatrix()
-            end
-        end
-        for _, card in pairs(statCards) do
-            if card.isHovered then
-                gl.PushMatrix()
-                gl.Translate(card.x, card.y, 0)
-                gl.Scale(card.scale, card.scale, 1)
-                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], COLOR.borderHot[4])
-                gl.LineWidth(1.5)
-                drawRoundedRect(0.5, 0.5, CARD_WIDTH-1, CARD_HEIGHT-1, 4, false)
-                gl.PopMatrix()
-            end
-        end
-    end)
-end
-
 -------------------------------------------------------------------------------
 -- DRAW CHART LINES (raw every frame)
 -- v2.3: no longer depends on chrome having been built first.
@@ -1640,7 +1611,35 @@ function widget:DrawScreen()
     if chromeDisplayList then gl.CallList(chromeDisplayList) end
     for _, chart in pairs(charts) do drawChartLines(chart) end
     drawCardValues()
-    if hoverDisplayList then gl.CallList(hoverDisplayList) end
+    for _, chart in pairs(charts) do
+        -- draw raw hover outlines without displaylists - would need to redraw when dragging anyway
+        if chart.isHovered or (chartsInteractive and chart.isDragging) then
+            gl.PushMatrix()
+            gl.Translate(chart.x, chart.y, 0)
+            gl.Scale(chart.scale, chart.scale, 1)
+            
+            -- Use COLOR.borderHot (the blue/cyan outline)
+            gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
+            gl.LineWidth(2.0)
+            
+            -- Draw the rectangle based on the current live x/y
+            drawRoundedRect(0.5, 0.5, chart.width-1, chart.height-1, 4, false)
+            gl.PopMatrix()
+        end
+    end
+
+    -- Repeat for statCards if necessary
+    for _, card in pairs(statCards) do
+        if card.isHovered or (chartsInteractive and card.isDragging) then
+            gl.PushMatrix()
+            gl.Translate(card.x, card.y, 0)
+            gl.Scale(card.scale, card.scale, 1)
+            gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
+            gl.LineWidth(2.0)
+            drawRoundedRect(0.5, 0.5, CARD_WIDTH-1, CARD_HEIGHT-1, 4, false)
+            gl.PopMatrix()
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -1683,7 +1682,6 @@ function widget:MousePress(mx, my, button)
     elseif button == 3 then
         elem.enabled = not elem.enabled
         chromeDirty  = true
-        rebuildHoverList()
         return true
     end
     return false
@@ -1704,13 +1702,13 @@ function widget:MouseMove(mx, my, dx, dy)
         for _, card in pairs(statCards) do
             if card.isDragging then
                 card.x = mx - card.dragStartX; card.y = my - card.dragStartY
-                chromeDirty = true; rebuildHoverList(); return true
+                chromeDirty = true; return true
             end
         end
         for _, chart in pairs(charts) do
             if chart.isDragging then
                 chart.x = mx - chart.dragStartX; chart.y = my - chart.dragStartY
-                chromeDirty = true; rebuildHoverList(); return true
+                chromeDirty = true; return true
             end
         end
     end
@@ -1723,7 +1721,6 @@ function widget:MouseMove(mx, my, dx, dy)
         local h = chartsInteractive and chart:isMouseOver(mx, my) or false
         if h ~= chart.isHovered then changed = true end; chart.isHovered = h
     end
-    if changed then rebuildHoverList() end
     if not chartsInteractive then return false end
     for _, c in pairs(statCards) do if c.isHovered then return true end end
     for _, c in pairs(charts)    do if c.isHovered then return true end end
@@ -1754,7 +1751,7 @@ function widget:ViewResize()
     local rx, ry = vsx/ox, vsy/oy
     for _, c in pairs(charts)    do c.x = c.x*rx; c.y = c.y*ry end
     for _, c in pairs(statCards) do c.x = c.x*rx; c.y = c.y*ry end
-    chromeDirty = true; rebuildHoverList()
+    chromeDirty = true; 
 end
 
 -------------------------------------------------------------------------------
