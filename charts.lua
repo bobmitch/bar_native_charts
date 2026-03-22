@@ -380,8 +380,10 @@ local function sampleBuildEfficiencyForTeam(tid)
     end
 
     if effCount == 0 then
-        local stats = allyTeams[tid]
-        return (stats and (stats.buildPower or 0) > 0) and 100 or 0
+        return 0
+        -- keeping old logic just in case below - we counted no workers as 100% efficient
+        -- local stats = allyTeams[tid]
+        -- return (stats and (stats.buildPower or 0) > 0) and 100 or 0
     end
     return (effSum / effCount) * 100
 end
