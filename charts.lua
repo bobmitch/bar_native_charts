@@ -1,9 +1,9 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.3 by FilthyMitch
+    v2.5 by FilthyMitch
 
-    History window : exactly 60 in-game seconds = 1 800 game frames at 30 fps
+    History window : exactly 120 in-game seconds = 3 600 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
     Rendering      : chrome (bg/grid/labels) in a display list, rebuilt only
                      on structural changes; line geometry drawn raw every
@@ -43,13 +43,28 @@
       are in world coordinates and the grid must be consistent across elements
       at different scales so they can align with each other.
 
+    X-axis timestamps (v2.4 / v2.5):
+      drawChartLines() draws time labels along the bottom of every chart.
+      Labels mark 30-second game-clock boundaries (e.g. :30, 1:00, 1:30 …).
+      Tick density is adaptive: the interval doubles (30→60→120→240 s …)
+      until adjacent labels are at least MIN_TICK_PX apart in chart pixels.
+      Labels are drawn inside the chart's PushMatrix/Scale block so they
+      always match the chart's current scale setting.
+
+      v2.5 game-clock fix:
+      Tick positions and labels are now derived from Spring.GetGameFrame()
+      rather than from the ring-buffer frame count.  This means timestamps
+      remain correct after a mid-game widget reload: the right edge of the
+      plot is always "now" in game time and tick labels show the actual
+      elapsed minutes:seconds since game start, not since the widget loaded.
+
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics overlay charts and cards",
+        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.5)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -84,25 +99,28 @@ end
 local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
-local HISTORY_SECONDS = 120
-local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 1800 frames
-local RENDER_POINTS   = 300
+local HISTORY_SECONDS = 600
+local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 3600 frames
+local RENDER_POINTS   = 1500
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
 
-local CHART_WIDTH  = 300
+local CHART_WIDTH  = 1500
 local CHART_HEIGHT = 180
 local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH   = 140
 local CARD_HEIGHT  = 70
 
 -- Snap grid constant.
--- All chart and card positions are kept on a 20px world-coordinate grid
--- continuously while dragging so the element always shows exactly where it
--- will land.  20px divides evenly into all chart/card dimensions (300, 180,
--- 140, 70) so edges align naturally when elements are placed side-by-side.
 local SNAP_GRID = 20
+
+-- X-axis timestamp constants.
+-- BASE_TICK_SECS: the finest granularity we ever try to draw (30 s).
+-- MIN_TICK_PX: minimum pixel gap (in scaled chart space) between adjacent
+-- tick labels before we coarsen to the next doubling step.
+local BASE_TICK_SECS = 30
+local MIN_TICK_PX    = 44   -- enough room for a ~":30" / "1:00" label at 9pt
 
 local COLOR = {
     bg        = {0.031, 0.047, 0.078, 0.72},
@@ -122,9 +140,86 @@ local COLOR = {
 -- SNAP HELPERS
 -------------------------------------------------------------------------------
 
--- Snap val to the nearest SNAP_GRID boundary (world coordinates only).
 local function snapTo(val)
     return math.floor(val / SNAP_GRID + 0.5) * SNAP_GRID
+end
+
+-------------------------------------------------------------------------------
+-- X-AXIS TIMESTAMP HELPERS
+-------------------------------------------------------------------------------
+
+-- Format a whole number of seconds as "M:SS" or ":SS".
+-- Examples:  0→":00"  30→":30"  60→"1:00"  90→"1:30"  120→"2:00"
+local function formatTimestamp(secs)
+    local m = math.floor(secs / 60)
+    local s = secs % 60
+    if m == 0 then
+        return string.format(":%02d", s)
+    else
+        return string.format("%d:%02d", m, s)
+    end
+end
+
+-- Draw time-axis tick marks and labels along the bottom of a chart.
+-- Must be called inside a PushMatrix / Translate(chart.x, chart.y) /
+-- Scale(chart.scale, chart.scale, 1) block so coordinates are in the
+-- chart's local space.
+--
+-- Parameters (all in chart-local pixels unless noted):
+--   cX, cW       – plot area left edge and width
+--   cY           – plot area bottom edge (baseline for tick stems)
+--   windowSecs   – how many seconds of history the ring buffer currently holds
+--   nowGameSecs  – current game clock in seconds (Spring.GetGameFrame()/GAME_FPS)
+--   alpha        – master opacity (matches the rest of the chart)
+--
+-- v2.5: tick positions and labels are anchored to the absolute game clock so
+-- that timestamps remain correct after a mid-game widget reload.  The right
+-- edge of the plot is always "now" (nowGameSecs); the left edge represents
+-- (nowGameSecs - windowSecs).  Ticks are placed at every multiple of
+-- tickSecs that falls within that interval, and labelled with the absolute
+-- game-elapsed time at that tick position.
+local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
+    if windowSecs <= 0 then return end
+
+    -- Adaptive tick interval: start at BASE_TICK_SECS and double until
+    -- adjacent ticks are at least MIN_TICK_PX apart in chart-local pixels.
+    local tickSecs = BASE_TICK_SECS
+    local pxPerSec = cW / windowSecs
+    while (tickSecs * pxPerSec) < MIN_TICK_PX do
+        tickSecs = tickSecs * 2   -- 30 → 60 → 120 → 240 …
+        if tickSecs > windowSecs then return end
+    end
+
+    -- Absolute game time of the left (oldest) and right (newest) edges.
+    local rightSecs = nowGameSecs
+    local leftSecs  = nowGameSecs - windowSecs
+
+    -- First tick at or after leftSecs that lands on a tickSecs boundary.
+    local firstTick = math.ceil(leftSecs / tickSecs) * tickSecs
+
+    local c     = COLOR.muted
+    local tickH = 4   -- height of tick stem in chart-local pixels
+
+    local t = firstTick
+    while t <= rightSecs do
+        -- Fractional position across the plot width (0 = left, 1 = right).
+        local frac = (t - leftSecs) / windowSecs
+        local xPos = cX + frac * cW
+
+        -- Tick stem
+        gl.Color(c[1], c[2], c[3], (c[4] * 0.7) * alpha)
+        gl.LineWidth(1.0)
+        gl.BeginEnd(GL.LINES, function()
+            gl.Vertex(xPos, cY)
+            gl.Vertex(xPos, cY - tickH)
+        end)
+
+        -- Label: absolute game-elapsed seconds at this tick position.
+        gl.Color(c[1], c[2], c[3], (c[4] * 0.85) * alpha)
+        gl.Text(formatTimestamp(math.floor(t + 0.5)), xPos, cY - tickH - 9, 8, "co")
+
+        t = t + tickSecs
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -225,10 +320,8 @@ local READY_WAIT_FRAMES     = GAME_FPS * 3
 
 local rmlContext  = nil
 local rmlDocument = nil
-local pillVisible = true   -- tracks whether the pill UI is shown
+local pillVisible = true
 
--- Update pill label/classes to match current chartsInteractive state.
--- Safe to call whether or not the document exists.
 local function syncPillState()
     if not rmlDocument then return end
     local pill = rmlDocument:GetElementById("toggle-pill")
@@ -244,7 +337,6 @@ local function syncPillState()
     end
 end
 
--- Show or hide the pill document without affecting chartsInteractive.
 local function setPillVisible(visible)
     pillVisible = visible
     if not rmlDocument then return end
@@ -256,7 +348,6 @@ local function setPillVisible(visible)
     end
 end
 
--- Called when the pill is clicked in-game.
 local function onToggleClick(event)
     chartsInteractive = not chartsInteractive
     syncPillState()
@@ -511,6 +602,24 @@ function Chart:hasData()
     return false
 end
 
+-- Return the visible time window as { windowSecs, nowGameSecs }.
+--   windowSecs  – seconds of history currently held in the ring buffer
+--   nowGameSecs – current game clock in fractional seconds
+-- Both values are needed by drawTimeAxis to anchor tick labels to the
+-- absolute game clock rather than to buffer-relative time.
+-- Returns 0, 0 if no data is available yet.
+function Chart:timeWindow()
+    local s = self.series[1]
+    if not s then return 0, 0 end
+    local tid = s.teamID or viewedTeamID
+    if not tid or not history[tid] then return 0, 0 end
+    local key = s.seriesKey
+    if not history[tid][key] then return 0, 0 end
+    local _, count = ringRange(tid, key)
+    local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
+    return count / GAME_FPS, nowGameSecs
+end
+
 -- ── StatCard ──────────────────────────────────────────────────────────────────
 
 local StatCard = {}
@@ -638,7 +747,6 @@ local function rebuildChromeList()
                         minV, maxV = 0, 100
                     end
 
-                    -- Y-axis range clamping
                     if chart.chartType == "percent" then
                         minV = 0; maxV = 100
                     elseif chart.chartType == "storage" then
@@ -650,7 +758,6 @@ local function rebuildChromeList()
                         local p  = ab * 0.15
                         minV = -(ab+p); maxV = (ab+p)
                     else
-                        -- single / dual / multi / ratio: always anchor to 0
                         minV = 0
                         local p = maxV > 0 and maxV*0.12 or 100
                         maxV = maxV + p
@@ -710,8 +817,7 @@ end
 -------------------------------------------------------------------------------
 -- DRAW CHART LINES (raw every frame)
 -- v2.3: no longer depends on chrome having been built first.
--- Layout is computed directly from PADDING constants so lines render
--- as soon as hasData() is true, even on mid-game widget restart.
+-- v2.5: draws adaptive x-axis time labels at 30-second intervals.
 -------------------------------------------------------------------------------
 
 local function computeRange(chart)
@@ -736,7 +842,6 @@ local function computeRange(chart)
         local ab = math.max(math.abs(mn), math.abs(mx), 100)
         local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
     else
-        -- single / dual / multi / ratio: always anchor to 0
         mn = 0
         local p = mx > 0 and mx*0.12 or 100
         mx = mx + p
@@ -755,21 +860,16 @@ local function drawChartLines(chart)
     local mn, mx, r = computeRange(chart)
     if not mn then return end
 
-    -- Compute layout from constants directly — never rely on chrome having
-    -- been built first.  This is the v2.3 fix for mid-game widget restart.
     local cX = PADDING.left
     local cY = PADDING.bottom
     local cW = chart.width  - PADDING.left - PADDING.right
     local cH = chart.height - PADDING.top  - PADDING.bottom
 
-    -- Keep cached values in sync so chrome rebuilds use correct coords.
     chart._cX = cX; chart._cY = cY
     chart._cW = cW; chart._cH = cH
 
-    -- If chrome hasn't rendered with data yet, force a rebuild so the
-    -- grid lines and Y-axis labels appear at the correct scale.
     if chromeDirty == false and chart._range ~= nil then
-        -- already in sync, nothing to do
+        -- already in sync
     else
         chromeDirty = true
     end
@@ -781,6 +881,7 @@ local function drawChartLines(chart)
     gl.Translate(chart.x, chart.y, 0)
     gl.Scale(chart.scale, chart.scale, 1)
 
+    -- ── Data lines ────────────────────────────────────────────────────────
     for si, s in ipairs(chart.series) do
         local pts  = chart:getSamples(si)
         local nPts = #pts
@@ -801,7 +902,7 @@ local function drawChartLines(chart)
                 end)
             end
 
-            -- soft halo pass — wide, semi-transparent
+            -- soft halo pass
             gl.Color(clr[1], clr[2], clr[3], 0.25*am)
             gl.LineWidth(3.5)
             gl.BeginEnd(GL.LINE_STRIP, function()
@@ -812,7 +913,7 @@ local function drawChartLines(chart)
                     end
                 end
             end)
-            -- crisp core pass — thin, fully opaque
+            -- crisp core pass
             gl.Color(clr[1], clr[2], clr[3], 1.0*am)
             gl.LineWidth(1.0)
             gl.BeginEnd(GL.LINE_STRIP, function()
@@ -833,17 +934,19 @@ local function drawChartLines(chart)
         end
     end
 
-    gl.PopMatrix()
+    -- ── X-axis time labels (v2.4 / v2.5) ────────────────────────────────────
+    -- timeWindow() returns the buffer duration AND the current game clock so
+    -- that tick labels reflect absolute game-elapsed time even after a reload.
+    local windowSecs, nowGameSecs = chart:timeWindow()
+    if windowSecs >= BASE_TICK_SECS then
+        drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
+    end
 
-    -- ── Per-view overlays drawn raw (viewedTeamID must be live) ──────────
+    -- ── Per-view overlays ─────────────────────────────────────────────────
     local pad    = PADDING
     local w      = chart.width
     local h      = chart.height
     local vStats = allyTeams[viewedTeamID]
-
-    gl.PushMatrix()
-    gl.Translate(chart.x, chart.y, 0)
-    gl.Scale(chart.scale, chart.scale, 1)
 
     if chart.id == "chart-build-efficiency" then
         local stall = vStats and vStats.metalStall or 0
@@ -855,8 +958,6 @@ local function drawChartLines(chart)
             gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
         end
     end
-
-    -- Removed: "▶ playerName" overlay — names are not shown on charts
 
     gl.PopMatrix()
 end
@@ -1277,6 +1378,14 @@ local function buildChartsAndCards()
             local _, cnt = ringRange(tid, "kills")
             return cnt >= 2
         end
+        -- timeWindow for K/D: derive from the kills buffer
+        charts.kd.timeWindow = function(self)
+            local tid = viewedTeamID
+            if not tid or not history[tid] then return 0, 0 end
+            local _, count = ringRange(tid, "kills")
+            local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
+            return count / GAME_FPS, nowGameSecs
+        end
     end
 
     -- ── Stat Cards ─────────────────────────────────────────────────────────
@@ -1308,7 +1417,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.3",
+        version           = "2.4",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         charts            = {},
@@ -1457,7 +1566,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.3: Initialize")
+    Spring.Echo("BAR Charts v2.5: Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -1481,7 +1590,7 @@ function widget:Initialize()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.3: Initialized"
+    Spring.Echo("BAR Charts v2.5: Initialized"
         .. (isSpectator and " (SPECTATOR)" or "")
         .. ", waiting for team data…")
 end
@@ -1545,7 +1654,7 @@ function widget:GameFrame(n)
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.3: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v2.5: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
                 Spring.Echo("BAR Charts: Tracked teams:")
                 for tid, stats in pairs(allyTeams) do
@@ -1594,7 +1703,7 @@ function widget:GameStart()
         stats.buildPower      = 0
     end
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.3: Game started")
+    Spring.Echo("BAR Charts v2.5: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -1665,8 +1774,6 @@ function widget:MousePress(mx, my, button)
     if not elem then return false end
     if button == 1 then
         elem.isDragging = true
-        -- Store offset between cursor and element's current snapped position
-        -- so the element does not jump on first move.
         elem.dragStartX = mx - elem.x
         elem.dragStartY = my - elem.y
         return true
@@ -1700,7 +1807,6 @@ end
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
     if chartsInteractive then
-        -- Cards: live 20px snap while dragging.
         for _, card in pairs(statCards) do
             if card.isDragging then
                 card.x      = snapTo(mx - card.dragStartX)
@@ -1709,7 +1815,6 @@ function widget:MouseMove(mx, my, dx, dy)
                 return true
             end
         end
-        -- Charts: live 20px snap while dragging.
         for _, chart in pairs(charts) do
             if chart.isDragging then
                 chart.x     = snapTo(mx - chart.dragStartX)
@@ -1719,7 +1824,6 @@ function widget:MouseMove(mx, my, dx, dy)
             end
         end
     end
-    -- Hover tracking (edit mode only).
     local changed = false
     for id, card in pairs(statCards) do
         local h = chartsInteractive and card:isMouseOver(mx, my) or false
@@ -1814,14 +1918,15 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Pill visible")
         return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.3 Debug ===")
+        Spring.Echo("=== BAR Charts v2.5 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
         Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
             tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
-        Spring.Echo(string.format("SNAP_GRID=%dpx", SNAP_GRID))
+        Spring.Echo(string.format("SNAP_GRID=%dpx  BASE_TICK_SECS=%ds  MIN_TICK_PX=%dpx",
+            SNAP_GRID, BASE_TICK_SECS, MIN_TICK_PX))
         Spring.Echo("-- ACTIVE PARTICIPANT TEAMS --")
         for tid, stats in pairs(allyTeams) do
             local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
@@ -1901,5 +2006,5 @@ function widget:Shutdown()
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.3: Shutdown")
+    Spring.Echo("BAR Charts v2.5: Shutdown")
 end
