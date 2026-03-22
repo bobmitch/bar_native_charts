@@ -36,6 +36,13 @@
       grid/labels get a fresh rebuild.  This fixes the "awaiting data" stuck
       state when the widget is loaded mid-game.
 
+    Snap placement (v2.3):
+      Charts and cards snap to a 20px world-coordinate grid continuously
+      while dragging, so the element always shows exactly where it will land.
+      Scale is intentionally NOT factored into snap — all stored x/y values
+      are in world coordinates and the grid must be consistent across elements
+      at different scales so they can align with each other.
+
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
@@ -90,6 +97,13 @@ local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH   = 140
 local CARD_HEIGHT  = 70
 
+-- Snap grid constant.
+-- All chart and card positions are kept on a 20px world-coordinate grid
+-- continuously while dragging so the element always shows exactly where it
+-- will land.  20px divides evenly into all chart/card dimensions (300, 180,
+-- 140, 70) so edges align naturally when elements are placed side-by-side.
+local SNAP_GRID = 20
+
 local COLOR = {
     bg        = {0.031, 0.047, 0.078, 0.72},
     border    = {0.353, 0.706, 1.000, 0.18},
@@ -103,6 +117,15 @@ local COLOR = {
     success   = {0.188, 0.941, 0.627, 1.00},
     gold      = {0.941, 0.753, 0.251, 1.00},
 }
+
+-------------------------------------------------------------------------------
+-- SNAP HELPERS
+-------------------------------------------------------------------------------
+
+-- Snap val to the nearest SNAP_GRID boundary (world coordinates only).
+local function snapTo(val)
+    return math.floor(val / SNAP_GRID + 0.5) * SNAP_GRID
+end
 
 -------------------------------------------------------------------------------
 -- GLOBAL STATE
@@ -381,9 +404,6 @@ local function sampleBuildEfficiencyForTeam(tid)
 
     if effCount == 0 then
         return 0
-        -- keeping old logic just in case below - we counted no workers as 100% efficient
-        -- local stats = allyTeams[tid]
-        -- return (stats and (stats.buildPower or 0) > 0) and 100 or 0
     end
     return (effSum / effCount) * 100
 end
@@ -989,38 +1009,20 @@ end
 -- ALLY TEAM INIT
 -------------------------------------------------------------------------------
 
--- v2.3: isActiveParticipant — simplified and robust.
--- Admits a team if it is alive and either:
---   (a) an AI team,
---   (b) led by a non-spectating human player, or
---   (c) has live units (fallback for edge cases / mid-game restart).
--- The `active` flag is intentionally NOT used — it can be false for the
--- local player in single-player or early LAN joins.
 local function isActiveParticipant(tid)
     local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
-
-    -- Exclude dead/resigned teams.
     if isDead then return false end
-
-    -- AI teams are always legitimate participants.
     if isAI then return true end
-
-    -- Always admit our own team unconditionally.
     if myTeamID ~= nil and tid == myTeamID then return true end
-
-    -- Exclude Gaia and leaderless slots unless they have units.
     if not leaderID or leaderID < 0 then
         local units = Spring.GetTeamUnits(tid)
         return units and #units > 0
     end
-
-    -- Human-led: exclude only if the leader is a spectator.
     local _, _, spectator = Spring.GetPlayerInfo(leaderID)
     if spectator then
         local units = Spring.GetTeamUnits(tid)
         return units and #units > 0
     end
-
     return true
 end
 
@@ -1038,15 +1040,12 @@ local function resolveTeamName(tid)
 end
 
 local function initAllyTeams()
-    -- Re-resolve spectator status and myTeamID on every attempt.
     local spec = Spring.GetSpectatingState()
     isSpectator = spec or false
     myTeamID    = isSpectator and nil or Spring.GetMyTeamID()
 
     local tlist
     if isSpectator then
-        -- GetTeamList() with no argument can miss teams in other ally groups
-        -- depending on engine version. Enumerate every ally group explicitly.
         local allyTeamList = Spring.GetAllyTeamList()
         local seen = {}
         tlist = {}
@@ -1061,7 +1060,6 @@ local function initAllyTeams()
                 end
             end
         end
-        -- Fallback: also sweep GetTeamList() bare in case engine behaviour differs
         local bare = Spring.GetTeamList() or {}
         for _, tid in ipairs(bare) do
             if not seen[tid] then
@@ -1101,8 +1099,6 @@ local function initAllyTeams()
         end
     end
 
-    -- Mid-game restart fallback: if isActiveParticipant filtered everything
-    -- (engine state may be partially settled), admit any non-dead team with units.
     if not next(newTeams) then
         Spring.Echo("BAR Charts: isActiveParticipant filtered all teams — using unit-presence fallback")
         for _, tid in ipairs(tlist) do
@@ -1203,8 +1199,6 @@ local function collectStats(gameFrame)
 
     for _, card in pairs(statCards) do card:update() end
 
-    -- Trigger a chrome rebuild the first time any chart transitions from
-    -- no-data to has-data, so the grid and axis labels appear correctly.
     if not chromeDirty then
         for _, chart in pairs(charts) do
             if chart.enabled and chart._range == nil and chart:hasData() then
@@ -1426,7 +1420,7 @@ local function findTeamByName(nameQuery)
 end
 
 -------------------------------------------------------------------------------
--- DIAGNOSTIC (used during ready-wait to log engine state)
+-- DIAGNOSTIC
 -------------------------------------------------------------------------------
 
 local function debugInitState()
@@ -1537,7 +1531,7 @@ function widget:GameFrame(n)
     if not chartsReady then
         chartsReadyWaitFrames = chartsReadyWaitFrames + 1
         if chartsReadyWaitFrames >= READY_WAIT_FRAMES then
-            chartsReadyWaitFrames = 0  -- always reset so we retry every 3s until success
+            chartsReadyWaitFrames = 0
             debugInitState()
             if initAllyTeams() then
                 charts.allyArmy:rebuildMultiTeamSeries()
@@ -1614,23 +1608,16 @@ function widget:DrawScreen()
     for _, chart in pairs(charts) do drawChartLines(chart) end
     drawCardValues()
     for _, chart in pairs(charts) do
-        -- draw raw hover outlines without displaylists - would need to redraw when dragging anyway
         if chart.isHovered or (chartsInteractive and chart.isDragging) then
             gl.PushMatrix()
             gl.Translate(chart.x, chart.y, 0)
             gl.Scale(chart.scale, chart.scale, 1)
-            
-            -- Use COLOR.borderHot (the blue/cyan outline)
             gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
             gl.LineWidth(2.0)
-            
-            -- Draw the rectangle based on the current live x/y
             drawRoundedRect(0.5, 0.5, chart.width-1, chart.height-1, 4, false)
             gl.PopMatrix()
         end
     end
-
-    -- Repeat for statCards if necessary
     for _, card in pairs(statCards) do
         if card.isHovered or (chartsInteractive and card.isDragging) then
             gl.PushMatrix()
@@ -1678,6 +1665,8 @@ function widget:MousePress(mx, my, button)
     if not elem then return false end
     if button == 1 then
         elem.isDragging = true
+        -- Store offset between cursor and element's current snapped position
+        -- so the element does not jump on first move.
         elem.dragStartX = mx - elem.x
         elem.dragStartY = my - elem.y
         return true
@@ -1692,8 +1681,18 @@ end
 function widget:MouseRelease(mx, my, button)
     if not chartsEnabled or not chartsInteractive then return false end
     if button == 1 then
-        for _, card  in pairs(statCards) do if card.isDragging  then card.isDragging  = false; return true end end
-        for _, chart in pairs(charts)    do if chart.isDragging then chart.isDragging = false; return true end end
+        for _, card in pairs(statCards) do
+            if card.isDragging then
+                card.isDragging = false
+                return true
+            end
+        end
+        for _, chart in pairs(charts) do
+            if chart.isDragging then
+                chart.isDragging = false
+                return true
+            end
+        end
     end
     return false
 end
@@ -1701,19 +1700,26 @@ end
 function widget:MouseMove(mx, my, dx, dy)
     if not chartsEnabled then return false end
     if chartsInteractive then
+        -- Cards: live 20px snap while dragging.
         for _, card in pairs(statCards) do
             if card.isDragging then
-                card.x = mx - card.dragStartX; card.y = my - card.dragStartY
-                chromeDirty = true; return true
+                card.x      = snapTo(mx - card.dragStartX)
+                card.y      = snapTo(my - card.dragStartY)
+                chromeDirty = true
+                return true
             end
         end
+        -- Charts: live 20px snap while dragging.
         for _, chart in pairs(charts) do
             if chart.isDragging then
-                chart.x = mx - chart.dragStartX; chart.y = my - chart.dragStartY
-                chromeDirty = true; return true
+                chart.x     = snapTo(mx - chart.dragStartX)
+                chart.y     = snapTo(my - chart.dragStartY)
+                chromeDirty = true
+                return true
             end
         end
     end
+    -- Hover tracking (edit mode only).
     local changed = false
     for id, card in pairs(statCards) do
         local h = chartsInteractive and card:isMouseOver(mx, my) or false
@@ -1753,7 +1759,7 @@ function widget:ViewResize()
     local rx, ry = vsx/ox, vsy/oy
     for _, c in pairs(charts)    do c.x = c.x*rx; c.y = c.y*ry end
     for _, c in pairs(statCards) do c.x = c.x*rx; c.y = c.y*ry end
-    chromeDirty = true; 
+    chromeDirty = true
 end
 
 -------------------------------------------------------------------------------
@@ -1794,7 +1800,6 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Config reset — restart widget to apply")
         return true
     elseif command == "barcharts edit" then
-        -- Toggle edit mode directly — does not affect pill visibility.
         chartsInteractive = not chartsInteractive
         syncPillState()
         chromeDirty = true
@@ -1816,6 +1821,7 @@ function widget:TextCommand(command)
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
         Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
             tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
+        Spring.Echo(string.format("SNAP_GRID=%dpx", SNAP_GRID))
         Spring.Echo("-- ACTIVE PARTICIPANT TEAMS --")
         for tid, stats in pairs(allyTeams) do
             local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
