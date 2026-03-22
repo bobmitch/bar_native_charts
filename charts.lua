@@ -1,7 +1,7 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.5 by FilthyMitch
+    v2.6 by FilthyMitch
 
     History window : exactly 120 in-game seconds = 3 600 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
@@ -58,13 +58,31 @@
       plot is always "now" in game time and tick labels show the actual
       elapsed minutes:seconds since game start, not since the widget loaded.
 
+    Snapshot system (v2.6):
+      WG.BarCharts.takeSnapshot()  — deep-copies the live ring buffers for
+        all tracked teams into a plain serializable table, together with the
+        game-clock time at which the snapshot was taken.  Safe to hold across
+        frames; the live buffers continue advancing independently.
+
+      WG.BarCharts.drawFromSnapshot(snap, teamID, chartID, x, y, scale)  —
+        renders a single chart using frozen snapshot data.  Temporarily swaps
+        the module-level history/histHead/histFull/viewedTeamID references,
+        calls the normal drawChartLines() path (so all existing styling,
+        fill, halo, time-axis etc. are reused), then restores live state.
+        The time-axis is anchored to snap.takenAtGameSecs so timestamps show
+        the moment of capture rather than the current game clock.
+
+      WG.BarCharts.serializeSnapshot(snap) / deserializeSnapshot(str)  —
+        converts a snapshot to/from a Lua-source string so third-party widgets
+        can persist it across sessions via VFS / io.
+
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.5)",
+        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.6)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -100,7 +118,7 @@ local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
 local HISTORY_SECONDS = 600
-local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 3600 frames
+local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 18000 frames
 local RENDER_POINTS   = 1500
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
@@ -116,11 +134,8 @@ local CARD_HEIGHT  = 70
 local SNAP_GRID = 20
 
 -- X-axis timestamp constants.
--- BASE_TICK_SECS: the finest granularity we ever try to draw (30 s).
--- MIN_TICK_PX: minimum pixel gap (in scaled chart space) between adjacent
--- tick labels before we coarsen to the next doubling step.
 local BASE_TICK_SECS = 30
-local MIN_TICK_PX    = 44   -- enough room for a ~":30" / "1:00" label at 9pt
+local MIN_TICK_PX    = 44
 
 local COLOR = {
     bg        = {0.031, 0.047, 0.078, 0.72},
@@ -148,8 +163,6 @@ end
 -- X-AXIS TIMESTAMP HELPERS
 -------------------------------------------------------------------------------
 
--- Format a whole number of seconds as "M:SS" or ":SS".
--- Examples:  0→":00"  30→":30"  60→"1:00"  90→"1:30"  120→"2:00"
 local function formatTimestamp(secs)
     local m = math.floor(secs / 60)
     local s = secs % 60
@@ -160,53 +173,31 @@ local function formatTimestamp(secs)
     end
 end
 
--- Draw time-axis tick marks and labels along the bottom of a chart.
--- Must be called inside a PushMatrix / Translate(chart.x, chart.y) /
--- Scale(chart.scale, chart.scale, 1) block so coordinates are in the
--- chart's local space.
---
--- Parameters (all in chart-local pixels unless noted):
---   cX, cW       – plot area left edge and width
---   cY           – plot area bottom edge (baseline for tick stems)
---   windowSecs   – how many seconds of history the ring buffer currently holds
---   nowGameSecs  – current game clock in seconds (Spring.GetGameFrame()/GAME_FPS)
---   alpha        – master opacity (matches the rest of the chart)
---
--- v2.5: tick positions and labels are anchored to the absolute game clock so
--- that timestamps remain correct after a mid-game widget reload.  The right
--- edge of the plot is always "now" (nowGameSecs); the left edge represents
--- (nowGameSecs - windowSecs).  Ticks are placed at every multiple of
--- tickSecs that falls within that interval, and labelled with the absolute
--- game-elapsed time at that tick position.
+-- drawTimeAxis: draws tick marks and labels along the bottom of a chart.
+-- nowGameSecs may be overridden by callers (e.g. snapshot rendering passes
+-- snap.takenAtGameSecs so timestamps reflect capture time, not live clock).
 local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
     if windowSecs <= 0 then return end
 
-    -- Adaptive tick interval: start at BASE_TICK_SECS and double until
-    -- adjacent ticks are at least MIN_TICK_PX apart in chart-local pixels.
     local tickSecs = BASE_TICK_SECS
     local pxPerSec = cW / windowSecs
     while (tickSecs * pxPerSec) < MIN_TICK_PX do
-        tickSecs = tickSecs * 2   -- 30 → 60 → 120 → 240 …
+        tickSecs = tickSecs * 2
         if tickSecs > windowSecs then return end
     end
 
-    -- Absolute game time of the left (oldest) and right (newest) edges.
     local rightSecs = nowGameSecs
     local leftSecs  = nowGameSecs - windowSecs
-
-    -- First tick at or after leftSecs that lands on a tickSecs boundary.
     local firstTick = math.ceil(leftSecs / tickSecs) * tickSecs
 
     local c     = COLOR.muted
-    local tickH = 4   -- height of tick stem in chart-local pixels
+    local tickH = 4
 
     local t = firstTick
     while t <= rightSecs do
-        -- Fractional position across the plot width (0 = left, 1 = right).
         local frac = (t - leftSecs) / windowSecs
         local xPos = cX + frac * cW
 
-        -- Tick stem
         gl.Color(c[1], c[2], c[3], (c[4] * 0.7) * alpha)
         gl.LineWidth(1.0)
         gl.BeginEnd(GL.LINES, function()
@@ -214,7 +205,6 @@ local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
             gl.Vertex(xPos, cY - tickH)
         end)
 
-        -- Label: absolute game-elapsed seconds at this tick position.
         gl.Color(c[1], c[2], c[3], (c[4] * 0.85) * alpha)
         gl.Text(formatTimestamp(math.floor(t + 0.5)), xPos, cY - tickH - 9, 8, "co")
 
@@ -293,6 +283,22 @@ local function ringSample(tid, key, numPts)
         local fi  = math.floor((i - 1) / math.max(n - 1, 1) * (count - 1) + 0.5)
         local idx = ((startIdx - 1 + fi) % HISTORY_SIZE) + 1
         pts[i] = buf[idx]
+    end
+    return pts
+end
+
+-- ringSampleFromBuffer: identical resampling logic but operates on a
+-- pre-flattened snapshot buffer (array starting at index 1, length = count)
+-- rather than a ring.  Used by drawFromSnapshot so it shares the same
+-- downsampling behaviour as the live path.
+local function ringSampleFromBuffer(flatBuf, count, numPts)
+    if count <= 0 then return {} end
+    local n = math.min(numPts, count)
+    if n <= 0 then return {} end
+    local pts = {}
+    for i = 1, n do
+        local fi  = math.floor((i - 1) / math.max(n - 1, 1) * (count - 1) + 0.5) + 1
+        pts[i] = flatBuf[fi] or 0
     end
     return pts
 end
@@ -550,6 +556,9 @@ function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     self.isHovered  = false
     self._minV = nil; self._maxV = nil; self._range = nil
     self._cX   = nil; self._cY  = nil; self._cW   = nil; self._cH = nil
+    -- Snapshot override: when non-nil, drawChartLines uses this game-clock
+    -- anchor instead of Spring.GetGameFrame() for time-axis labels.
+    self._snapshotNowGameSecs = nil
     return self
 end
 
@@ -602,12 +611,9 @@ function Chart:hasData()
     return false
 end
 
--- Return the visible time window as { windowSecs, nowGameSecs }.
---   windowSecs  – seconds of history currently held in the ring buffer
---   nowGameSecs – current game clock in fractional seconds
--- Both values are needed by drawTimeAxis to anchor tick labels to the
--- absolute game clock rather than to buffer-relative time.
--- Returns 0, 0 if no data is available yet.
+-- timeWindow: returns { windowSecs, nowGameSecs }.
+-- When _snapshotNowGameSecs is set (during drawFromSnapshot), the frozen
+-- game-clock value is returned so time-axis labels reflect capture time.
 function Chart:timeWindow()
     local s = self.series[1]
     if not s then return 0, 0 end
@@ -616,7 +622,7 @@ function Chart:timeWindow()
     local key = s.seriesKey
     if not history[tid][key] then return 0, 0 end
     local _, count = ringRange(tid, key)
-    local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
+    local nowGameSecs = self._snapshotNowGameSecs or (Spring.GetGameFrame() / GAME_FPS)
     return count / GAME_FPS, nowGameSecs
 end
 
@@ -818,6 +824,7 @@ end
 -- DRAW CHART LINES (raw every frame)
 -- v2.3: no longer depends on chrome having been built first.
 -- v2.5: draws adaptive x-axis time labels at 30-second intervals.
+-- v2.6: respects chart._snapshotNowGameSecs for frozen timestamps.
 -------------------------------------------------------------------------------
 
 local function computeRange(chart)
@@ -934,9 +941,7 @@ local function drawChartLines(chart)
         end
     end
 
-    -- ── X-axis time labels (v2.4 / v2.5) ────────────────────────────────────
-    -- timeWindow() returns the buffer duration AND the current game clock so
-    -- that tick labels reflect absolute game-elapsed time even after a reload.
+    -- ── X-axis time labels ────────────────────────────────────────────────
     local windowSecs, nowGameSecs = chart:timeWindow()
     if windowSecs >= BASE_TICK_SECS then
         drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
@@ -1378,12 +1383,11 @@ local function buildChartsAndCards()
             local _, cnt = ringRange(tid, "kills")
             return cnt >= 2
         end
-        -- timeWindow for K/D: derive from the kills buffer
         charts.kd.timeWindow = function(self)
             local tid = viewedTeamID
             if not tid or not history[tid] then return 0, 0 end
             local _, count = ringRange(tid, "kills")
-            local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
+            local nowGameSecs = self._snapshotNowGameSecs or (Spring.GetGameFrame() / GAME_FPS)
             return count / GAME_FPS, nowGameSecs
         end
     end
@@ -1417,7 +1421,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.4",
+        version           = "2.6",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         charts            = {},
@@ -1562,11 +1566,434 @@ local function debugInitState()
 end
 
 -------------------------------------------------------------------------------
+-- ══════════════════════════════════════════════════════════════════════════
+-- SNAPSHOT SYSTEM (v2.6)
+-- ══════════════════════════════════════════════════════════════════════════
+--
+-- Overview
+-- --------
+-- takeSnapshot()        Deep-copies the live ring buffers for all currently
+--                       tracked teams into a plain, self-contained table.
+--                       The snapshot is immutable with respect to the live
+--                       buffers — they continue advancing independently.
+--                       The table is safe to hold across many frames and
+--                       can be serialized to disk with serializeSnapshot().
+--
+-- drawFromSnapshot()    Renders a single named chart using frozen snapshot
+--                       data at an arbitrary screen position/scale.
+--                       Temporarily swaps the module-level history/histHead/
+--                       histFull/viewedTeamID references so the normal
+--                       drawChartLines() path is reused verbatim — all
+--                       existing line styling, fill, halo, grid, and
+--                       time-axis code runs unchanged.
+--                       The time-axis is anchored to snap.takenAtGameSecs
+--                       so labels reflect capture time, not live game clock.
+--                       Live state is fully restored before the function
+--                       returns; DrawScreen is single-threaded so there is
+--                       no re-entrancy risk.
+--
+-- serializeSnapshot()   Converts a snapshot table to a Lua-source string
+--                       via the existing serializeTable() helper.  The
+--                       string can be written to disk with io.open / VFS
+--                       and loaded back with deserializeSnapshot().
+--
+-- deserializeSnapshot() Parses a previously serialized snapshot string back
+--                       into a live snapshot table ready for drawFromSnapshot.
+--
+-- Snapshot table schema
+-- ---------------------
+-- {
+--   version          = "2.6",
+--   takenAtGameSecs  = <number>,   -- Spring.GetGameFrame()/GAME_FPS at capture
+--   takenAtFrame     = <number>,   -- raw game frame at capture
+--   teams = {
+--     [teamID] = {
+--       teamID     = <number>,
+--       playerName = <string>,
+--       color      = { r, g, b, a },
+--       series = {
+--         ["metalIncome"] = { data = { v1, v2, … vN }, count = N },
+--         ["metalUsage"]  = { … },
+--         … (all SERIES_KEYS present)
+--       },
+--     },
+--     …
+--   },
+-- }
+--
+-- The `data` array is a flat, chronologically-ordered copy (oldest → newest)
+-- of however many valid frames were in the ring buffer at capture time.
+-- count == #data always holds.
+-------------------------------------------------------------------------------
+
+-- ── takeSnapshot ─────────────────────────────────────────────────────────────
+-- Returns a snapshot table as described above.
+-- Copies only the valid portion of each ring buffer (oldest→newest), so the
+-- returned arrays are compact and unambiguous — no ring-head arithmetic needed
+-- when reading them back.
+local function takeSnapshot()
+    local gameFrame = Spring.GetGameFrame()
+    local snap = {
+        version         = "2.6",
+        takenAtGameSecs = gameFrame / GAME_FPS,
+        takenAtFrame    = gameFrame,
+        teams           = {},
+    }
+
+    for tid in pairs(allyTeams) do
+        if history[tid] then
+            local ts = {
+                teamID     = tid,
+                playerName = allyTeams[tid].playerName,
+                color      = {
+                    allyTeams[tid].color[1],
+                    allyTeams[tid].color[2],
+                    allyTeams[tid].color[3],
+                    allyTeams[tid].color[4] or 1,
+                },
+                series = {},
+            }
+
+            for _, key in ipairs(SERIES_KEYS) do
+                if history[tid][key] then
+                    local startIdx, count = ringRange(tid, key)
+                    local buf  = history[tid][key]
+                    local copy = {}
+                    -- Walk the ring in chronological order (oldest → newest).
+                    for i = 0, count - 1 do
+                        local ringIdx = ((startIdx - 1 + i) % HISTORY_SIZE) + 1
+                        copy[i + 1]   = buf[ringIdx] or 0
+                    end
+                    ts.series[key] = { data = copy, count = count }
+                else
+                    ts.series[key] = { data = {}, count = 0 }
+                end
+            end
+
+            snap.teams[tid] = ts
+        end
+    end
+
+    return snap
+end
+
+-- ── drawFromSnapshot ─────────────────────────────────────────────────────────
+-- Renders one chart using data from a previously taken snapshot.
+--
+-- Parameters:
+--   snap     (table)   – snapshot returned by takeSnapshot()
+--   teamID   (number)  – which team's data to display
+--   chartID  (string)  – key into the `charts` table, e.g. "metal", "army"
+--                        OR the chart's .id string, e.g. "chart-metal"
+--   x        (number)  – screen x of the chart's bottom-left corner
+--   y        (number)  – screen y of the chart's bottom-left corner
+--   scale    (number?) – optional scale factor; defaults to 1.0
+--
+-- The function draws the chart background, grid, and line data exactly as
+-- the live DrawScreen path does, then returns.  It does NOT touch the live
+-- display-list (chromeDirty remains unchanged) and does NOT modify any
+-- persistent widget state.
+--
+-- Multi-team charts (allyArmy / allyBuildPower): all teams present in the
+-- snapshot are rendered as separate coloured lines, matching live behaviour.
+--
+-- Returns true on success, false + error-string on failure.
+local function drawFromSnapshot(snap, teamID, chartID, x, y, scale)
+    -- ── Validate inputs ───────────────────────────────────────────────────
+    if type(snap) ~= "table" or type(snap.teams) ~= "table" then
+        return false, "drawFromSnapshot: snap is not a valid snapshot table"
+    end
+
+    -- Accept both the short key ("metal") and the full id ("chart-metal").
+    local chart = charts[chartID]
+    if not chart then
+        -- Try matching by .id string
+        for _, c in pairs(charts) do
+            if c.id == chartID then chart = c; break end
+        end
+    end
+    if not chart then
+        return false, "drawFromSnapshot: unknown chartID '"..tostring(chartID).."'"
+    end
+
+    local snapTeam = snap.teams[teamID]
+    if not snapTeam then
+        return false, string.format(
+            "drawFromSnapshot: teamID %d not present in snapshot", teamID)
+    end
+
+    scale = scale or 1.0
+
+    -- ── Build frozen ring-buffer tables from the snapshot ─────────────────
+    -- We construct history/histHead/histFull tables that look identical to
+    -- the live module-level tables so that ringRange(), ringSample(), and
+    -- Chart:getSamples() work without modification.
+    --
+    -- For each series we store the flat data array directly as the "ring"
+    -- (already in chronological order, no wrap-around), set head = count+1
+    -- (points just past the last valid entry), and mark full = false (count
+    -- is always < HISTORY_SIZE for a snapshot taken mid-game).
+    --
+    -- Multi-team charts need buffers for every team in the snapshot.
+    local frozenHistory  = {}
+    local frozenHistHead = {}
+    local frozenHistFull = {}
+
+    for tid, ts in pairs(snap.teams) do
+        frozenHistory[tid]  = {}
+        frozenHistHead[tid] = {}
+        frozenHistFull[tid] = {}
+        for _, key in ipairs(SERIES_KEYS) do
+            local sd    = ts.series[key] or { data = {}, count = 0 }
+            local count = sd.count or #sd.data
+            -- Pad to HISTORY_SIZE to keep ringRange arithmetic safe.
+            local buf   = {}
+            for i = 1, HISTORY_SIZE do buf[i] = sd.data[i] or 0 end
+            frozenHistory[tid][key]  = buf
+            frozenHistHead[tid][key] = count + 1          -- head past last entry
+            frozenHistFull[tid][key] = (count >= HISTORY_SIZE)
+        end
+    end
+
+    -- ── Stash live state, inject frozen state ────────────────────────────
+    local liveHistory      = history
+    local liveHistHead     = histHead
+    local liveHistFull     = histFull
+    local liveViewedTeamID = viewedTeamID
+
+    history      = frozenHistory
+    histHead     = frozenHistHead
+    histFull     = frozenHistFull
+    viewedTeamID = teamID
+
+    -- Override position/scale on the chart object temporarily.
+    local origX, origY, origScale           = chart.x, chart.y, chart.scale
+    local origEnabled, origVisible          = chart.enabled, chart.visible
+    local origSnapshotNow                   = chart._snapshotNowGameSecs
+
+    chart.x                    = x
+    chart.y                    = y
+    chart.scale                = scale
+    chart.enabled              = true
+    chart.visible              = true
+    -- Freeze the time-axis anchor to the capture moment.
+    chart._snapshotNowGameSecs = snap.takenAtGameSecs
+
+    -- For multi-team charts, rebuild the series list from snapshot team data
+    -- so colours and names come from the snapshot, not live allyTeams.
+    local origSeries = chart.series
+    if chart.multiTeam then
+        local newSeries = {}
+        local idx = 1
+        for tid, ts in pairs(snap.teams) do
+            local seriesKey
+            if     chart.id == "chart-ally-army"       then seriesKey = "armyValue"
+            elseif chart.id == "chart-ally-buildpower" then seriesKey = "buildPower"
+            elseif chart.id == "chart-ally-metal"      then seriesKey = "metalIncome"
+            elseif chart.id == "chart-ally-energy"     then seriesKey = "energyIncome"
+            end
+            if seriesKey then
+                newSeries[idx] = {
+                    label     = ts.playerName,
+                    color     = ts.color,
+                    seriesKey = seriesKey,
+                    teamID    = tid,
+                }
+                idx = idx + 1
+            end
+        end
+        chart.series = newSeries
+    end
+
+    -- For the K/D chart: override getSamples to read from frozen buffers.
+    -- The chart's live getSamples already closes over the module-level
+    -- `history` and `viewedTeamID` variables, so swapping those above is
+    -- sufficient — no additional override needed.
+
+    -- ── Draw ──────────────────────────────────────────────────────────────
+    -- Draw the chrome (background, border, grid, title) inline rather than
+    -- via the display list (which reflects live chart positions).
+    do
+        local w   = chart.width
+        local h   = chart.height
+        local pad = PADDING
+        local cX  = pad.left
+        local cY  = pad.bottom
+        local cW  = w - pad.left - pad.right
+        local cH  = h - pad.top  - pad.bottom
+
+        gl.PushMatrix()
+        gl.Translate(x, y, 0)
+        gl.Scale(scale, scale, 1)
+
+        -- Background + border
+        gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4])
+        drawRoundedRect(0, 0, w, h, 4, true)
+        gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4])
+        gl.LineWidth(1)
+        drawRoundedRect(0.5, 0.5, w-1, h-1, 4, false)
+
+        if not chart:hasData() then
+            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.25)
+            gl.Text("— snapshot: no data —", cX+cW/2, cY+cH/2, 10, "c")
+            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+            gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
+            gl.PopMatrix()
+        else
+            -- Compute Y range for grid labels (mirrors rebuildChromeList logic)
+            local allV = {}
+            for i = 1, #chart.series do
+                local pts = chart:getSamples(i)
+                for _, v in ipairs(pts) do
+                    if v and not (v ~= v) then allV[#allV+1] = v end
+                end
+            end
+            local minV, maxV
+            if #allV > 0 then
+                minV = allV[1]; maxV = allV[1]
+                for j = 2, #allV do
+                    local v = allV[j]
+                    if v < minV then minV = v end
+                    if v > maxV then maxV = v end
+                end
+            else
+                minV, maxV = 0, 100
+            end
+
+            if chart.chartType == "percent" then
+                minV = 0; maxV = 100
+            elseif chart.chartType == "storage" then
+                local ab = math.max(math.abs(minV), math.abs(maxV), 100)
+                local p  = ab * 0.12; minV = -(ab+p); maxV = (ab+p)
+            elseif chart.chartType == "demand" then
+                local ab = math.max(math.abs(minV), math.abs(maxV), 100)
+                local p  = ab * 0.15; minV = -(ab+p); maxV = (ab+p)
+            else
+                minV = 0
+                local p = maxV > 0 and maxV*0.12 or 100
+                maxV = maxV + p
+            end
+            local range = maxV - minV
+            if range == 0 then range = 1 end
+
+            -- Grid lines + Y labels
+            for i = 0, 4 do
+                local v    = minV + (range * i / 4)
+                local yPos = cY   + (cH   * i / 4)
+                local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
+                gl.Color(gc[1], gc[2], gc[3], gc[4])
+                gl.BeginEnd(GL.LINES, function()
+                    gl.Vertex(cX, yPos); gl.Vertex(cX+cW, yPos)
+                end)
+                gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+                gl.Text(formatYAxis(v, chart.chartType), cX-5, yPos-4, 9, "ro")
+            end
+
+            -- Zero line for demand/storage
+            if chart.chartType == "demand" or chart.chartType == "storage" then
+                local zeroY = cY + ((0 - minV) / range) * cH
+                gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45)
+                gl.LineWidth(1.0)
+                gl.BeginEnd(GL.LINES, function()
+                    gl.Vertex(cX, zeroY); gl.Vertex(cX+cW, zeroY)
+                end)
+                gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.5)
+                gl.Text("0", cX-5, zeroY-4, 9, "ro")
+            end
+
+            -- Snapshot timestamp label (top-right corner, inside chart)
+            local capLabel = string.format("⏸ %s", formatTimestamp(
+                math.floor(snap.takenAtGameSecs + 0.5)))
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.75)
+            gl.Text(capLabel, w-pad.right-2, h-pad.top-10, 9, "ro")
+
+            -- Chart title (top-left)
+            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4])
+            gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
+
+            gl.PopMatrix()
+        end
+    end
+
+    -- drawChartLines handles the actual line/fill/halo/time-axis drawing.
+    -- It opens its own PushMatrix block and reads chart.x/y/scale which we
+    -- have already set to the caller-supplied values above.
+    drawChartLines(chart)
+
+    -- ── Restore live state ────────────────────────────────────────────────
+    history      = liveHistory
+    histHead     = liveHistHead
+    histFull     = liveHistFull
+    viewedTeamID = liveViewedTeamID
+
+    chart.x                    = origX
+    chart.y                    = origY
+    chart.scale                = origScale
+    chart.enabled              = origEnabled
+    chart.visible              = origVisible
+    chart._snapshotNowGameSecs = origSnapshotNow
+    if chart.multiTeam then
+        chart.series = origSeries
+    end
+
+    return true
+end
+
+-- ── serializeSnapshot ────────────────────────────────────────────────────────
+-- Converts a snapshot table to a Lua-source string.
+-- The result can be written to disk with io.open / VFS and passed back to
+-- deserializeSnapshot() in a future session.
+--
+-- Returns the serialized string, or nil + error on failure.
+local function serializeSnapshot(snap)
+    if type(snap) ~= "table" then
+        return nil, "serializeSnapshot: argument is not a table"
+    end
+    local ok, result = pcall(function()
+        return "return " .. serializeTable(snap, 0)
+    end)
+    if not ok then
+        return nil, "serializeSnapshot: serialization failed: " .. tostring(result)
+    end
+    return result
+end
+
+-- ── deserializeSnapshot ──────────────────────────────────────────────────────
+-- Parses a previously serialized snapshot string back into a snapshot table.
+-- Returns the snapshot table, or nil + error string on failure.
+local function deserializeSnapshot(str)
+    if type(str) ~= "string" then
+        return nil, "deserializeSnapshot: argument is not a string"
+    end
+    local chunk, compileErr = loadstring(str)
+    if not chunk then
+        return nil, "deserializeSnapshot: parse error: " .. tostring(compileErr)
+    end
+    local ok, result = pcall(chunk)
+    if not ok then
+        return nil, "deserializeSnapshot: execution error: " .. tostring(result)
+    end
+    if type(result) ~= "table" then
+        return nil, "deserializeSnapshot: result is not a table"
+    end
+    -- Basic sanity checks
+    if type(result.teams) ~= "table" then
+        return nil, "deserializeSnapshot: missing or invalid 'teams' field"
+    end
+    if type(result.takenAtGameSecs) ~= "number" then
+        return nil, "deserializeSnapshot: missing or invalid 'takenAtGameSecs' field"
+    end
+    return result
+end
+
+-- ── END SNAPSHOT SYSTEM ──────────────────────────────────────────────────────
+
+-------------------------------------------------------------------------------
 -- INITIALIZE
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.5: Initialize")
+    Spring.Echo("BAR Charts v2.6: Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -1591,99 +2018,79 @@ function widget:Initialize()
     initRmlToggle()
     chromeDirty = true
 
-    -- public interface for data yoinking
+    -- ── Public interface (WG.BarCharts) ───────────────────────────────────
     WG.BarCharts = {
- 
+
         -- ── Identity / version ───────────────────────────────────────────
-        version = "2.5",
- 
+        version = "2.6",
+
         -- ── Team enumeration ─────────────────────────────────────────────
- 
+
         --- Returns a list of all currently tracked team IDs.
         -- @return table  e.g. { 0, 1, 2, 3 }
         getTrackedTeams = function()
             local out = {}
-            for tid in pairs(allyTeams) do
-                out[#out + 1] = tid
-            end
+            for tid in pairs(allyTeams) do out[#out + 1] = tid end
             table.sort(out)
             return out
         end,
- 
-        --- Returns the team ID whose data is currently shown in single-team
-        -- charts (the "viewed" team).  In a normal game this is the local
-        -- player's team; in spectator mode it is whichever team was last
-        -- selected via /barcharts view.
+
+        --- Returns the team ID currently shown in single-team charts.
         -- @return number|nil
         getViewedTeamID = function()
             return viewedTeamID
         end,
- 
+
         --- Returns true if the local client is spectating.
         -- @return boolean
         isSpectator = function()
             return isSpectator
         end,
- 
+
         -- ── Team metadata ────────────────────────────────────────────────
- 
-        --- Returns the live stats table for a team.
-        -- Fields: metalIncome, metalUsage, energyIncome, energyUsage,
-        --         damageDealt, damageTaken, armyValue, buildPower,
-        --         kills, losses, unitCount, metalLost,
-        --         buildEfficiency, metalStall, playerName, color, teamID.
-        -- The table is returned BY REFERENCE — values update every game
-        -- frame without another call.  Do NOT write to it.
+
+        --- Returns the live stats table for a team (BY REFERENCE — do NOT write).
         -- @param  teamID  number
-        -- @return table|nil   nil if teamID is not tracked
+        -- @return table|nil
         getTeamStats = function(teamID)
             return allyTeams[teamID]
         end,
- 
-        --- Convenience: returns the live stats table for the viewed team.
+
+        --- Convenience: live stats for the viewed team.
         -- @return table|nil
         getViewedTeamStats = function()
             return allyTeams[viewedTeamID]
         end,
- 
+
         -- ── Ring-buffer access ───────────────────────────────────────────
- 
-        --- Valid series key strings — pass one of these to getSamples /
-        -- getRawBuffer / getBufferInfo.
-        seriesKeys = SERIES_KEYS,   -- shared constant reference, read-only
- 
-        --- Returns a resampled array of up to `numPoints` values drawn
-        -- evenly from the ring buffer.  Index 1 is oldest, index N newest.
-        -- Returns a fresh table each call (safe to hold onto).
+
+        --- Valid series key strings.
+        seriesKeys = SERIES_KEYS,
+
+        --- Returns a resampled array of up to `numPoints` values (oldest→newest).
         -- @param  teamID     number
-        -- @param  seriesKey  string   one of WG.BarCharts.seriesKeys
-        -- @param  numPoints  number?  default RENDER_POINTS (1500)
-        -- @return table|nil  nil if teamID or seriesKey is unknown
+        -- @param  seriesKey  string
+        -- @param  numPoints  number?  default RENDER_POINTS
+        -- @return table|nil
         getSamples = function(teamID, seriesKey, numPoints)
             numPoints = numPoints or RENDER_POINTS
             if not history[teamID] then return nil end
             if not history[teamID][seriesKey] then return nil end
             return ringSample(teamID, seriesKey, numPoints)
         end,
- 
-        --- Returns { startIndex, count } describing the live ring buffer for
-        -- a team+series.  Use together with getRawBuffer if you want to
-        -- iterate the buffer yourself without the resampling step.
+
+        --- Returns startIndex, count for the live ring buffer.
         -- @param  teamID    number
         -- @param  seriesKey string
-        -- @return number startIndex, number count   (both 0 if unknown)
+        -- @return number startIndex, number count
         getBufferInfo = function(teamID, seriesKey)
             if not history[teamID] then return 0, 0 end
             if not history[teamID][seriesKey] then return 0, 0 end
             local s, c = ringRange(teamID, seriesKey)
             return s, c
         end,
- 
-        --- Returns the RAW ring-buffer table for a team+series BY REFERENCE.
-        -- Length is always HISTORY_SIZE; valid entries run from startIndex
-        -- for `count` slots (wrapping).  Use getBufferInfo for the indices.
-        -- Treat as read-only.  Faster than getSamples when you need every
-        -- point or are doing your own downsampling.
+
+        --- Returns the RAW ring-buffer table BY REFERENCE (read-only).
         -- @param  teamID    number
         -- @param  seriesKey string
         -- @return table|nil
@@ -1691,17 +2098,14 @@ function widget:Initialize()
             if not history[teamID] then return nil end
             return history[teamID][seriesKey]
         end,
- 
-        --- Returns HISTORY_SIZE (total ring-buffer capacity in frames) and
-        -- GAME_FPS so callers can convert frame counts to seconds.
+
+        --- Returns HISTORY_SIZE and GAME_FPS.
         -- @return number historySize, number gameFPS
         getBufferConstants = function()
             return HISTORY_SIZE, GAME_FPS
         end,
- 
-        --- Returns the number of game frames currently held in the buffer
-        -- for a given team+series, and the current game clock in seconds.
-        -- Useful for x-axis scaling in external renderers.
+
+        --- Returns windowSecs and nowGameSecs for a team+series.
         -- @param  teamID    number
         -- @param  seriesKey string
         -- @return number windowSecs, number nowGameSecs
@@ -1713,25 +2117,83 @@ function widget:Initialize()
             local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
             return count / GAME_FPS, nowGameSecs
         end,
- 
+
         -- ── Widget-state queries ─────────────────────────────────────────
- 
-        --- True once the widget has finished its startup wait and begun
-        -- collecting data.  External widgets should guard on this before
-        -- reading any data.
+
+        --- True once startup wait is done and data collection has begun.
         -- @return boolean
         isReady = function()
             return chartsReady
         end,
- 
+
         --- True if charts are currently visible (F9 toggle state).
         -- @return boolean
         isEnabled = function()
             return chartsEnabled
         end,
+
+        -- ── Snapshot API (v2.6) ──────────────────────────────────────────
+
+        --- Takes a snapshot of all live ring buffers at this instant.
+        --
+        -- Returns a plain table containing deep-copied buffer data for every
+        -- currently tracked team, plus metadata (version, game-clock anchor).
+        -- The snapshot is completely independent of the live buffers — they
+        -- keep advancing after the call returns.
+        --
+        -- The returned table can be passed directly to drawFromSnapshot() or
+        -- serializeSnapshot() for disk persistence.
+        --
+        -- @return table  snapshot
+        takeSnapshot = function()
+            return takeSnapshot()
+        end,
+
+        --- Renders a single chart using frozen snapshot data.
+        --
+        -- Draws the chart background, grid, line data, and time-axis at the
+        -- requested screen position using exactly the same GL code path as the
+        -- live DrawScreen render.  Time-axis labels are anchored to the
+        -- snapshot's capture time.  A small "⏸ M:SS" capture-time stamp
+        -- appears in the top-right corner.
+        --
+        -- Must be called from within a widget DrawScreen callback.
+        --
+        -- @param  snap    table    snapshot from takeSnapshot()
+        -- @param  teamID  number   which team's data to draw
+        -- @param  chartID string   "metal", "energy", "damage", "army", "kd",
+        --                          "buildEfficiency", "allyArmy",
+        --                          "allyBuildPower" — or the full id strings
+        --                          e.g. "chart-metal", "chart-ally-army"
+        -- @param  x       number   screen x (bottom-left of chart)
+        -- @param  y       number   screen y (bottom-left of chart)
+        -- @param  scale   number?  optional scale (default 1.0)
+        -- @return boolean ok, string? errMsg
+        drawFromSnapshot = function(snap, teamID, chartID, x, y, scale)
+            return drawFromSnapshot(snap, teamID, chartID, x, y, scale)
+        end,
+
+        --- Serializes a snapshot to a Lua-source string for disk persistence.
+        --
+        -- The returned string can be written with io.open(path,"w"):write(str)
+        -- or Spring VFS helpers, then restored later with deserializeSnapshot.
+        --
+        -- @param  snap  table   snapshot from takeSnapshot()
+        -- @return string|nil serialized, string? errMsg
+        serializeSnapshot = function(snap)
+            return serializeSnapshot(snap)
+        end,
+
+        --- Deserializes a snapshot string back into a snapshot table.
+        --
+        -- @param  str  string   previously produced by serializeSnapshot()
+        -- @return table|nil snapshot, string? errMsg
+        deserializeSnapshot = function(str)
+            return deserializeSnapshot(str)
+        end,
     }
 
-    Spring.Echo("BAR Charts v2.5: Initialized"
+    Spring.Echo("BAR Charts v2.6: Initialized"
         .. (isSpectator and " (SPECTATOR)" or "")
         .. ", waiting for team data…")
 end
@@ -1795,7 +2257,7 @@ function widget:GameFrame(n)
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.5: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v2.6: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
                 Spring.Echo("BAR Charts: Tracked teams:")
                 for tid, stats in pairs(allyTeams) do
@@ -1844,7 +2306,7 @@ function widget:GameStart()
         stats.buildPower      = 0
     end
     chromeDirty = true
-    Spring.Echo("BAR Charts v2.5: Game started")
+    Spring.Echo("BAR Charts v2.6: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -1930,16 +2392,10 @@ function widget:MouseRelease(mx, my, button)
     if not chartsEnabled or not chartsInteractive then return false end
     if button == 1 then
         for _, card in pairs(statCards) do
-            if card.isDragging then
-                card.isDragging = false
-                return true
-            end
+            if card.isDragging then card.isDragging = false; return true end
         end
         for _, chart in pairs(charts) do
-            if chart.isDragging then
-                chart.isDragging = false
-                return true
-            end
+            if chart.isDragging then chart.isDragging = false; return true end
         end
     end
     return false
@@ -2058,8 +2514,48 @@ function widget:TextCommand(command)
         setPillVisible(true)
         Spring.Echo("BAR Charts: Pill visible")
         return true
+    elseif command == "barcharts snap" then
+        -- Quick test command: take a snapshot and echo its metadata.
+        if not chartsReady then
+            Spring.Echo("BAR Charts: Not ready yet — cannot take snapshot")
+            return true
+        end
+        local snap = takeSnapshot()
+        local teamCount, totalFrames = 0, 0
+        for tid, ts in pairs(snap.teams) do
+            teamCount = teamCount + 1
+            local s = ts.series["metalIncome"]
+            if s then totalFrames = totalFrames + s.count end
+        end
+        Spring.Echo(string.format(
+            "BAR Charts: Snapshot taken at %.1fs  teams=%d  metalIncome frames (total across teams)=%d",
+            snap.takenAtGameSecs, teamCount, totalFrames))
+        return true
+    elseif command == "barcharts snap save" then
+        -- Save snapshot to disk as Lua source.
+        if not chartsReady then
+            Spring.Echo("BAR Charts: Not ready yet — cannot take snapshot")
+            return true
+        end
+        local snap = takeSnapshot()
+        local str, err = serializeSnapshot(snap)
+        if not str then
+            Spring.Echo("BAR Charts: Snapshot serialization failed: "..tostring(err))
+            return true
+        end
+        local path = "bar_charts_snapshot.lua"
+        local f = io.open(path, "w")
+        if f then
+            f:write(str)
+            f:close()
+            Spring.Echo("BAR Charts: Snapshot saved to "..path
+                .." ("..#str.." bytes)")
+        else
+            Spring.Echo("BAR Charts: Could not open "..path.." for writing")
+        end
+        return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.5 Debug ===")
+        Spring.Echo("=== BAR Charts v2.6 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
@@ -2144,9 +2640,9 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Shutdown()
-    WG.BarCharts = nil -- shut down public interface
+    WG.BarCharts = nil
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.5: Shutdown")
+    Spring.Echo("BAR Charts v2.6: Shutdown")
 end
