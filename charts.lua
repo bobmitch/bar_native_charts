@@ -802,89 +802,86 @@ local function rebuildLinesList()
 
         for _, chart in pairs(charts) do
             local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
-            if not show or not chart.enabled then goto continue_chart end
-            if not chart:hasData() then goto continue_chart end
+            if show and chart.enabled and chart:hasData() then
+                local mn, mx, r = computeRange(chart)
+                if mn then
+                    local cX = PADDING.left
+                    local cY = PADDING.bottom
+                    local cW = chart.width  - PADDING.left - PADDING.right
+                    local cH = chart.height - PADDING.top  - PADDING.bottom
 
-            local mn, mx, r = computeRange(chart)
-            if not mn then goto continue_chart end
+                    chart._cX = cX; chart._cY = cY
+                    chart._cW = cW; chart._cH = cH
 
-            local cX = PADDING.left
-            local cY = PADDING.bottom
-            local cW = chart.width  - PADDING.left - PADDING.right
-            local cH = chart.height - PADDING.top  - PADDING.bottom
+                    local am = 1.0
+                    local function toY(v) return cY + ((v - mn) / r) * cH end
 
-            chart._cX = cX; chart._cY = cY
-            chart._cW = cW; chart._cH = cH
+                    gl.PushMatrix()
+                    gl.Translate(chart.x, chart.y, 0)
+                    gl.Scale(chart.scale, chart.scale, 1)
 
-            local am = 1.0
-            local function toY(v) return cY + ((v - mn) / r) * cH end
+                    -- ── Data lines ────────────────────────────────────────────────
+                    for si, s in ipairs(chart.series) do
+                        local pts  = chart:getSamples(si)
+                        local nPts = #pts
+                        if nPts >= 2 then
+                            local clr      = s.color
+                            local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
+                                             and toY(0) or cY
 
-            gl.PushMatrix()
-            gl.Translate(chart.x, chart.y, 0)
-            gl.Scale(chart.scale, chart.scale, 1)
+                            if chart.chartType ~= "multi" then
+                                gl.Color(clr[1], clr[2], clr[3], 0.15*am)
+                                gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+                                    for i, v in ipairs(pts) do
+                                        if v and not (v ~= v) then
+                                            local x = cX + ((i-1)/(nPts-1)) * cW
+                                            gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
+                                        end
+                                    end
+                                end)
+                            end
 
-            -- ── Data lines ────────────────────────────────────────────────
-            for si, s in ipairs(chart.series) do
-                local pts  = chart:getSamples(si)
-                local nPts = #pts
-                if nPts >= 2 then
-                    local clr      = s.color
-                    local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
-                                     and toY(0) or cY
-
-                    if chart.chartType ~= "multi" then
-                        gl.Color(clr[1], clr[2], clr[3], 0.15*am)
-                        gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-                            for i, v in ipairs(pts) do
-                                if v and not (v ~= v) then
-                                    local x = cX + ((i-1)/(nPts-1)) * cW
-                                    gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
+                            -- halo pass
+                            gl.Color(clr[1], clr[2], clr[3], 0.25*am)
+                            gl.LineWidth(3.5)
+                            gl.BeginEnd(GL.LINE_STRIP, function()
+                                for i, v in ipairs(pts) do
+                                    if v and not (v ~= v) then
+                                        local x = cX + ((i-1)/(nPts-1)) * cW
+                                        gl.Vertex(x, toY(v))
+                                    end
                                 end
-                            end
-                        end)
-                    end
+                            end)
+                            -- crisp core
+                            gl.Color(clr[1], clr[2], clr[3], 1.0*am)
+                            gl.LineWidth(1.0)
+                            gl.BeginEnd(GL.LINE_STRIP, function()
+                                for i, v in ipairs(pts) do
+                                    if v and not (v ~= v) then
+                                        local x = cX + ((i-1)/(nPts-1)) * cW
+                                        gl.Vertex(x, toY(v))
+                                    end
+                                end
+                            end)
 
-                    -- halo pass
-                    gl.Color(clr[1], clr[2], clr[3], 0.25*am)
-                    gl.LineWidth(3.5)
-                    gl.BeginEnd(GL.LINE_STRIP, function()
-                        for i, v in ipairs(pts) do
-                            if v and not (v ~= v) then
-                                local x = cX + ((i-1)/(nPts-1)) * cW
-                                gl.Vertex(x, toY(v))
+                            local last = pts[nPts]
+                            if last and not (last ~= last) then
+                                gl.Color(clr[1], clr[2], clr[3], 0.8*am)
+                                gl.PointSize(6)
+                                gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
                             end
                         end
-                    end)
-                    -- crisp core
-                    gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-                    gl.LineWidth(1.0)
-                    gl.BeginEnd(GL.LINE_STRIP, function()
-                        for i, v in ipairs(pts) do
-                            if v and not (v ~= v) then
-                                local x = cX + ((i-1)/(nPts-1)) * cW
-                                gl.Vertex(x, toY(v))
-                            end
-                        end
-                    end)
-
-                    local last = pts[nPts]
-                    if last and not (last ~= last) then
-                        gl.Color(clr[1], clr[2], clr[3], 0.8*am)
-                        gl.PointSize(6)
-                        gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
                     end
+
+                    -- ── X-axis time labels ────────────────────────────────────────
+                    local windowSecs, nowGameSecs = chart:timeWindow()
+                    if windowSecs >= BASE_TICK_SECS then
+                        drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
+                    end
+
+                    gl.PopMatrix()
                 end
             end
-
-            -- ── X-axis time labels ────────────────────────────────────────
-            local windowSecs, nowGameSecs = chart:timeWindow()
-            if windowSecs >= BASE_TICK_SECS then
-                drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
-            end
-
-            gl.PopMatrix()
-
-            ::continue_chart::
         end
     end)
 
