@@ -1,15 +1,30 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.5 by FilthyMitch
+    v2.6 by FilthyMitch
 
     History window : exactly 120 in-game seconds = 3 600 game frames at 30 fps
     Sampling       : one data point pushed every game frame (30/s)
-    Rendering      : chrome (bg/grid/labels) in a display list, rebuilt only
-                     on structural changes; line geometry drawn raw every
-                     DrawScreen call — always current regardless of GPU fps
+    Rendering      : THREE display lists now cover all geometry:
+                       chromeList  — bg, grid, labels, borders; rebuilt on
+                                     layout changes (drag, scale, enable)
+                       linesList   — line strips, fills, time axis; rebuilt at
+                                     most MAX_CHART_FPS times per second
+                       overlayList — stall warnings, hover highlights; rebuilt
+                                     whenever hover state or stall status changes
+                     DrawScreen calls gl.CallList × 3 — essentially free on GPU.
     Player switch  : ALL teams buffered simultaneously (player and spectator);
                      switching view is an O(1) pointer swap (no copy, no gap)
+
+    GPU optimisation (v2.6):
+      Previously drawChartLines() was called raw every DrawScreen — at 144 hz
+      that meant ringSample() math + full GL geometry for all 8 charts ran
+      144 times per second even though game data only changes 30 times per
+      second.  v2.6 moves all line geometry into a display list (linesList)
+      that is rebuilt at most MAX_CHART_FPS times per wall-clock second.
+      At the default of 10 fps this is a ~14× reduction at 144 hz monitor
+      refresh, on top of the display-list GPU savings.  Set MAX_CHART_FPS = 30
+      to rebuild as fast as game data arrives; set 1 for extreme potato mode.
 
     Spectator mode :
       Detected via Spring.GetSpectatingState() at init and re-checked each
@@ -25,38 +40,11 @@
         (b) it has a human leader who is NOT spectating, OR
         (c) it has no valid leader (Gaia-like) but already has live units.
       Dead/resigned teams are always excluded.
-      The `active` flag from GetPlayerInfo is intentionally NOT used as a gate
-      because in single-player and early-join scenarios the local player can
-      appear active=false even though they are a legitimate participant.
 
-    Line-chart rendering (v2.3 fix):
-      drawChartLines() no longer depends on chart._range being pre-populated
-      by rebuildChromeList().  It computes layout from PADDING constants
-      directly and sets chromeDirty=true the first time data arrives so the
-      grid/labels get a fresh rebuild.  This fixes the "awaiting data" stuck
-      state when the widget is loaded mid-game.
-
-    Snap placement (v2.3):
-      Charts and cards snap to a 20px world-coordinate grid continuously
-      while dragging, so the element always shows exactly where it will land.
-      Scale is intentionally NOT factored into snap — all stored x/y values
-      are in world coordinates and the grid must be consistent across elements
-      at different scales so they can align with each other.
-
-    X-axis timestamps (v2.4 / v2.5):
-      drawChartLines() draws time labels along the bottom of every chart.
-      Labels mark 30-second game-clock boundaries (e.g. :30, 1:00, 1:30 …).
-      Tick density is adaptive: the interval doubles (30→60→120→240 s …)
-      until adjacent labels are at least MIN_TICK_PX apart in chart pixels.
-      Labels are drawn inside the chart's PushMatrix/Scale block so they
-      always match the chart's current scale setting.
-
-      v2.5 game-clock fix:
-      Tick positions and labels are now derived from Spring.GetGameFrame()
-      rather than from the ring-buffer frame count.  This means timestamps
-      remain correct after a mid-game widget reload: the right edge of the
-      plot is always "now" in game time and tick labels show the actual
-      elapsed minutes:seconds since game start, not since the widget loaded.
+    X-axis timestamps (v2.5):
+      Tick positions and labels are derived from Spring.GetGameFrame() so they
+      remain correct after a mid-game widget reload.  Adaptive tick interval
+      doubles (30→60→120→240 s …) until adjacent labels are MIN_TICK_PX apart.
 
 ═══════════════════════════════════════════════════════════════════════════
 ]]
@@ -64,7 +52,7 @@
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.5)",
+        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.6)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -100,8 +88,18 @@ local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
 local HISTORY_SECONDS = 600
-local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 3600 frames
-local RENDER_POINTS   = 1500
+local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 18000 frames
+local RENDER_POINTS   = 300   -- v2.6: reduced from 1500; imperceptible at normal scales
+
+-- ── Performance tuning ────────────────────────────────────────────────────
+-- MAX_CHART_FPS controls how many times per real-world second the line
+-- geometry display list is rebuilt.  Reducing this saves GPU/CPU without
+-- affecting the data stored in the ring buffer.
+--   30  → rebuild as fast as game data arrives (matches GAME_FPS)
+--   10  → default; smooth for slowly-changing data, good on mid-range GPUs
+--    1  → extreme potato mode; data updates once per second visually
+-- Range: 1–30.  Values above 30 are clamped to 30 (no benefit beyond game FPS).
+local MAX_CHART_FPS = 10
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
@@ -112,15 +110,10 @@ local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
 local CARD_WIDTH   = 140
 local CARD_HEIGHT  = 70
 
--- Snap grid constant.
 local SNAP_GRID = 20
 
--- X-axis timestamp constants.
--- BASE_TICK_SECS: the finest granularity we ever try to draw (30 s).
--- MIN_TICK_PX: minimum pixel gap (in scaled chart space) between adjacent
--- tick labels before we coarsen to the next doubling step.
 local BASE_TICK_SECS = 30
-local MIN_TICK_PX    = 44   -- enough room for a ~":30" / "1:00" label at 9pt
+local MIN_TICK_PX    = 44
 
 local COLOR = {
     bg        = {0.031, 0.047, 0.078, 0.72},
@@ -148,8 +141,6 @@ end
 -- X-AXIS TIMESTAMP HELPERS
 -------------------------------------------------------------------------------
 
--- Format a whole number of seconds as "M:SS" or ":SS".
--- Examples:  0→":00"  30→":30"  60→"1:00"  90→"1:30"  120→"2:00"
 local function formatTimestamp(secs)
     local m = math.floor(secs / 60)
     local s = secs % 60
@@ -160,53 +151,28 @@ local function formatTimestamp(secs)
     end
 end
 
--- Draw time-axis tick marks and labels along the bottom of a chart.
--- Must be called inside a PushMatrix / Translate(chart.x, chart.y) /
--- Scale(chart.scale, chart.scale, 1) block so coordinates are in the
--- chart's local space.
---
--- Parameters (all in chart-local pixels unless noted):
---   cX, cW       – plot area left edge and width
---   cY           – plot area bottom edge (baseline for tick stems)
---   windowSecs   – how many seconds of history the ring buffer currently holds
---   nowGameSecs  – current game clock in seconds (Spring.GetGameFrame()/GAME_FPS)
---   alpha        – master opacity (matches the rest of the chart)
---
--- v2.5: tick positions and labels are anchored to the absolute game clock so
--- that timestamps remain correct after a mid-game widget reload.  The right
--- edge of the plot is always "now" (nowGameSecs); the left edge represents
--- (nowGameSecs - windowSecs).  Ticks are placed at every multiple of
--- tickSecs that falls within that interval, and labelled with the absolute
--- game-elapsed time at that tick position.
 local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
     if windowSecs <= 0 then return end
 
-    -- Adaptive tick interval: start at BASE_TICK_SECS and double until
-    -- adjacent ticks are at least MIN_TICK_PX apart in chart-local pixels.
     local tickSecs = BASE_TICK_SECS
     local pxPerSec = cW / windowSecs
     while (tickSecs * pxPerSec) < MIN_TICK_PX do
-        tickSecs = tickSecs * 2   -- 30 → 60 → 120 → 240 …
+        tickSecs = tickSecs * 2
         if tickSecs > windowSecs then return end
     end
 
-    -- Absolute game time of the left (oldest) and right (newest) edges.
     local rightSecs = nowGameSecs
     local leftSecs  = nowGameSecs - windowSecs
-
-    -- First tick at or after leftSecs that lands on a tickSecs boundary.
     local firstTick = math.ceil(leftSecs / tickSecs) * tickSecs
 
     local c     = COLOR.muted
-    local tickH = 4   -- height of tick stem in chart-local pixels
+    local tickH = 4
 
     local t = firstTick
     while t <= rightSecs do
-        -- Fractional position across the plot width (0 = left, 1 = right).
         local frac = (t - leftSecs) / windowSecs
         local xPos = cX + frac * cW
 
-        -- Tick stem
         gl.Color(c[1], c[2], c[3], (c[4] * 0.7) * alpha)
         gl.LineWidth(1.0)
         gl.BeginEnd(GL.LINES, function()
@@ -214,7 +180,6 @@ local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
             gl.Vertex(xPos, cY - tickH)
         end)
 
-        -- Label: absolute game-elapsed seconds at this tick position.
         gl.Color(c[1], c[2], c[3], (c[4] * 0.85) * alpha)
         gl.Text(formatTimestamp(math.floor(t + 0.5)), xPos, cY - tickH - 9, 8, "co")
 
@@ -304,15 +269,30 @@ local buildEffState   = {}
 local charts    = {}
 local statCards = {}
 
-local chromeDisplayList = nil
-local chromeDirty       = true
-local hoverDisplayList  = nil
+-- ── Display lists ─────────────────────────────────────────────────────────
+-- chromeList  : bg panels, grid lines, Y-axis labels, chart titles, card frames
+-- linesList   : all line/fill geometry for every chart; rate-limited by MAX_CHART_FPS
+-- overlayList : stall warnings, hover highlights, edit-mode badge
+local chromeDisplayList  = nil
+local linesDisplayList   = nil
+local overlayDisplayList = nil
+
+local chromeDirty  = true   -- set on: drag, scale, enable/hide, view switch, resize
+local linesDirty   = true   -- set on: every GameFrame (new data arrived)
+local overlayDirty = true   -- set on: stall status change, hover state change
+
+-- Wall-clock time of the last linesList rebuild.
+-- Compared against (1 / MAX_CHART_FPS) to rate-limit rebuilds.
+local linesLastRebuildTime = nil
 
 local frameCounter       = 0
 local FULL_SCAN_INTERVAL = GAME_FPS
 
 local chartsReadyWaitFrames = 0
 local READY_WAIT_FRAMES     = GAME_FPS * 3
+
+-- Previous stall state per team — used to detect changes that require overlayDirty.
+local prevStallState = {}
 
 -------------------------------------------------------------------------------
 -- RMLUI TOGGLE
@@ -351,7 +331,8 @@ end
 local function onToggleClick(event)
     chartsInteractive = not chartsInteractive
     syncPillState()
-    chromeDirty = true
+    chromeDirty  = true
+    overlayDirty = true
     Spring.Echo("BAR Charts: " .. (chartsInteractive and "EDIT mode ON" or "LOCKED"))
 end
 
@@ -493,9 +474,7 @@ local function sampleBuildEfficiencyForTeam(tid)
         end
     end
 
-    if effCount == 0 then
-        return 0
-    end
+    if effCount == 0 then return 0 end
     return (effSum / effCount) * 100
 end
 
@@ -575,6 +554,7 @@ function Chart:rebuildMultiTeamSeries()
         end
     end
     chromeDirty = true
+    linesDirty  = true
 end
 
 function Chart:isMouseOver(mx, my)
@@ -602,12 +582,6 @@ function Chart:hasData()
     return false
 end
 
--- Return the visible time window as { windowSecs, nowGameSecs }.
---   windowSecs  – seconds of history currently held in the ring buffer
---   nowGameSecs – current game clock in fractional seconds
--- Both values are needed by drawTimeAxis to anchor tick labels to the
--- absolute game clock rather than to buffer-relative time.
--- Returns 0, 0 if no data is available yet.
 function Chart:timeWindow()
     local s = self.series[1]
     if not s then return 0, 0 end
@@ -620,7 +594,7 @@ function Chart:timeWindow()
     return count / GAME_FPS, nowGameSecs
 end
 
--- ── StatCard ──────────────────────────────────────────────────────────────────
+-- ── StatCard ─────────────────────────────────────────────────────────────
 
 local StatCard = {}
 StatCard.__index = StatCard
@@ -659,9 +633,52 @@ end
 -------------------------------------------------------------------------------
 
 local function freeLists()
-    if chromeDisplayList then gl.DeleteList(chromeDisplayList); chromeDisplayList = nil end
-    if hoverDisplayList  then gl.DeleteList(hoverDisplayList);  hoverDisplayList  = nil end
+    if chromeDisplayList  then gl.DeleteList(chromeDisplayList);  chromeDisplayList  = nil end
+    if linesDisplayList   then gl.DeleteList(linesDisplayList);   linesDisplayList   = nil end
+    if overlayDisplayList then gl.DeleteList(overlayDisplayList); overlayDisplayList = nil end
 end
+
+-- ── computeRange ─────────────────────────────────────────────────────────
+-- Shared by both the chrome builder (for grid labels) and the lines builder.
+-- Returns minV, maxV, range, or nil if no data.
+
+local function computeRange(chart)
+    local mn, mx
+    for i = 1, #chart.series do
+        local pts = chart:getSamples(i)
+        for _, v in ipairs(pts) do
+            if v and not (v ~= v) then
+                if mn == nil or v < mn then mn = v end
+                if mx == nil or v > mx then mx = v end
+            end
+        end
+    end
+    if mn == nil then return nil end
+
+    if chart.chartType == "percent" then
+        mn = 0; mx = 100
+    elseif chart.chartType == "storage" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab*0.12; mn = -(ab+p); mx = (ab+p)
+    elseif chart.chartType == "demand" then
+        local ab = math.max(math.abs(mn), math.abs(mx), 100)
+        local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
+    else
+        mn = 0
+        local p = mx > 0 and mx*0.12 or 100
+        mx = mx + p
+    end
+    local r = mx - mn
+    if r == 0 then r = 1 end
+    chart._minV = mn; chart._maxV = mx; chart._range = r
+    return mn, mx, r
+end
+
+-------------------------------------------------------------------------------
+-- CHROME DISPLAY LIST
+-- Background panels, grid lines, Y-axis labels, chart titles, card frames.
+-- Rebuilt on: drag/scale/enable/hide/resize/view-switch.
+-------------------------------------------------------------------------------
 
 local function rebuildChromeList()
     if chromeDisplayList then gl.DeleteList(chromeDisplayList) end
@@ -700,14 +717,14 @@ local function rebuildChromeList()
         for _, chart in pairs(charts) do
             local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
             if show then
-                local w    = chart.width
-                local h    = chart.height
-                local pad  = PADDING
-                local cX   = pad.left
-                local cY   = pad.bottom
-                local cW   = w - pad.left - pad.right
-                local cH   = h - pad.top  - pad.bottom
-                local am   = (not chart.enabled and chartsInteractive) and 0.35 or 1.0
+                local w   = chart.width
+                local h   = chart.height
+                local pad = PADDING
+                local cX  = pad.left
+                local cY  = pad.bottom
+                local cW  = w - pad.left - pad.right
+                local cH  = h - pad.top  - pad.bottom
+                local am  = (not chart.enabled and chartsInteractive) and 0.35 or 1.0
 
                 gl.PushMatrix()
                 gl.Translate(chart.x, chart.y, 0)
@@ -728,86 +745,45 @@ local function rebuildChromeList()
                     gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
                     gl.PopMatrix()
                 else
-                    local allV = {}
-                    for i = 1, #chart.series do
-                        local pts = chart:getSamples(i)
-                        for _, v in ipairs(pts) do
-                            if v and not (v ~= v) then allV[#allV+1] = v end
-                        end
-                    end
-                    local minV, maxV
-                    if #allV > 0 then
-                        minV = allV[1]; maxV = allV[1]
-                        for j = 2, #allV do
-                            local v = allV[j]
-                            if v < minV then minV = v end
-                            if v > maxV then maxV = v end
-                        end
+                    local mn, mx, r = computeRange(chart)
+                    if not mn then
+                        gl.PopMatrix()
                     else
-                        minV, maxV = 0, 100
-                    end
+                        -- Grid lines + Y labels
+                        for i = 0, 4 do
+                            local v    = mn + (r * i / 4)
+                            local yPos = cY + (cH * i / 4)
+                            local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
+                            gl.Color(gc[1], gc[2], gc[3], gc[4]*am)
+                            gl.BeginEnd(GL.LINES, function()
+                                gl.Vertex(cX, yPos); gl.Vertex(cX+cW, yPos)
+                            end)
+                            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
+                            gl.Text(formatYAxis(v, chart.chartType), cX-5, yPos-4, 9, "ro")
+                        end
 
-                    if chart.chartType == "percent" then
-                        minV = 0; maxV = 100
-                    elseif chart.chartType == "storage" then
-                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
-                        local p  = ab * 0.12
-                        minV = -(ab+p); maxV = (ab+p)
-                    elseif chart.chartType == "demand" then
-                        local ab = math.max(math.abs(minV), math.abs(maxV), 100)
-                        local p  = ab * 0.15
-                        minV = -(ab+p); maxV = (ab+p)
-                    else
-                        minV = 0
-                        local p = maxV > 0 and maxV*0.12 or 100
-                        maxV = maxV + p
-                    end
-                    local range = maxV - minV
-                    if range == 0 then range = 1 end
+                        -- Zero line for demand/storage
+                        if chart.chartType == "demand" or chart.chartType == "storage" then
+                            local zeroY = cY + ((0 - mn) / r) * cH
+                            gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45*am)
+                            gl.LineWidth(1.0)
+                            gl.BeginEnd(GL.LINES, function()
+                                gl.Vertex(cX, zeroY); gl.Vertex(cX+cW, zeroY)
+                            end)
+                            gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.5*am)
+                            gl.Text("0", cX-5, zeroY-4, 9, "ro")
+                        end
 
-                    chart._minV = minV; chart._maxV = maxV; chart._range = range
-                    chart._cX   = cX;  chart._cY   = cY
-                    chart._cW   = cW;  chart._cH   = cH
-
-                    -- Grid lines + Y labels
-                    for i = 0, 4 do
-                        local v    = minV + (range * i / 4)
-                        local yPos = cY   + (cH   * i / 4)
-                        local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
-                        gl.Color(gc[1], gc[2], gc[3], gc[4]*am)
-                        gl.BeginEnd(GL.LINES, function()
-                            gl.Vertex(cX, yPos); gl.Vertex(cX+cW, yPos)
-                        end)
+                        -- Chart title
                         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
-                        gl.Text(formatYAxis(v, chart.chartType), cX-5, yPos-4, 9, "ro")
+                        gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
+
+                        gl.PopMatrix()
                     end
-
-                    -- Zero line for demand/storage
-                    if chart.chartType == "demand" or chart.chartType == "storage" then
-                        local zeroY = cY + ((0 - minV) / range) * cH
-                        gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45*am)
-                        gl.LineWidth(1.0)
-                        gl.BeginEnd(GL.LINES, function()
-                            gl.Vertex(cX, zeroY); gl.Vertex(cX+cW, zeroY)
-                        end)
-                        gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.5*am)
-                        gl.Text("0", cX-5, zeroY-4, 9, "ro")
-                    end
-
-                    -- Chart title
-                    gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
-                    gl.Text(chart.icon.."  "..chart.label, pad.left+2, h-pad.top-10, 10, "o")
-
-                    gl.PopMatrix()
                 end
             end
         end
 
-        -- Edit-mode hint
-        if chartsInteractive then
-            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.55)
-            gl.Text("✏ EDIT MODE", vsx-150, 45, 11, "o")
-        end
         gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], 0.4)
         gl.Text("F9: Toggle  |  /barcharts view <name>", vsx-240, 30, 11, "o")
     end)
@@ -815,180 +791,203 @@ local function rebuildChromeList()
 end
 
 -------------------------------------------------------------------------------
--- DRAW CHART LINES (raw every frame)
--- v2.3: no longer depends on chrome having been built first.
--- v2.5: draws adaptive x-axis time labels at 30-second intervals.
+-- LINES DISPLAY LIST
+-- All line/fill geometry for every chart, plus time-axis ticks.
+-- Rebuilt at most MAX_CHART_FPS times per real-world second.
 -------------------------------------------------------------------------------
 
-local function computeRange(chart)
-    local mn, mx
-    for i = 1, #chart.series do
-        local pts = chart:getSamples(i)
-        for _, v in ipairs(pts) do
-            if v and not (v ~= v) then
-                if mn == nil or v < mn then mn = v end
-                if mx == nil or v > mx then mx = v end
-            end
-        end
-    end
-    if mn == nil then return nil end
+local function rebuildLinesList()
+    if linesDisplayList then gl.DeleteList(linesDisplayList) end
+    linesDisplayList = gl.CreateList(function()
 
-    if chart.chartType == "percent" then
-        mn = 0; mx = 100
-    elseif chart.chartType == "storage" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab*0.12; mn = -(ab+p); mx = (ab+p)
-    elseif chart.chartType == "demand" then
-        local ab = math.max(math.abs(mn), math.abs(mx), 100)
-        local p  = ab*0.15; mn = -(ab+p); mx = (ab+p)
-    else
-        mn = 0
-        local p = mx > 0 and mx*0.12 or 100
-        mx = mx + p
-    end
-    local r = mx - mn
-    if r == 0 then r = 1 end
-    chart._minV = mn; chart._maxV = mx; chart._range = r
-    return mn, mx, r
-end
+        for _, chart in pairs(charts) do
+            local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
+            if not show or not chart.enabled then goto continue_chart end
+            if not chart:hasData() then goto continue_chart end
 
-local function drawChartLines(chart)
-    local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
-    if not show or not chart.enabled then return end
-    if not chart:hasData() then return end
+            local mn, mx, r = computeRange(chart)
+            if not mn then goto continue_chart end
 
-    local mn, mx, r = computeRange(chart)
-    if not mn then return end
+            local cX = PADDING.left
+            local cY = PADDING.bottom
+            local cW = chart.width  - PADDING.left - PADDING.right
+            local cH = chart.height - PADDING.top  - PADDING.bottom
 
-    local cX = PADDING.left
-    local cY = PADDING.bottom
-    local cW = chart.width  - PADDING.left - PADDING.right
-    local cH = chart.height - PADDING.top  - PADDING.bottom
+            chart._cX = cX; chart._cY = cY
+            chart._cW = cW; chart._cH = cH
 
-    chart._cX = cX; chart._cY = cY
-    chart._cW = cW; chart._cH = cH
+            local am = 1.0
+            local function toY(v) return cY + ((v - mn) / r) * cH end
 
-    if chromeDirty == false and chart._range ~= nil then
-        -- already in sync
-    else
-        chromeDirty = true
-    end
-
-    local am = 1.0
-    local function toY(v) return cY + ((v - mn) / r) * cH end
-
-    gl.PushMatrix()
-    gl.Translate(chart.x, chart.y, 0)
-    gl.Scale(chart.scale, chart.scale, 1)
-
-    -- ── Data lines ────────────────────────────────────────────────────────
-    for si, s in ipairs(chart.series) do
-        local pts  = chart:getSamples(si)
-        local nPts = #pts
-        if nPts >= 2 then
-            local clr = s.color
-            local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
-                             and toY(0) or cY
-
-            if chart.chartType ~= "multi" then
-                gl.Color(clr[1], clr[2], clr[3], 0.15*am)
-                gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-                    for i, v in ipairs(pts) do
-                        if v and not (v ~= v) then
-                            local x = cX + ((i-1)/(nPts-1)) * cW
-                            gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
-                        end
-                    end
-                end)
-            end
-
-            -- soft halo pass
-            gl.Color(clr[1], clr[2], clr[3], 0.25*am)
-            gl.LineWidth(3.5)
-            gl.BeginEnd(GL.LINE_STRIP, function()
-                for i, v in ipairs(pts) do
-                    if v and not (v ~= v) then
-                        local x = cX + ((i-1)/(nPts-1)) * cW
-                        gl.Vertex(x, toY(v))
-                    end
-                end
-            end)
-            -- crisp core pass
-            gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-            gl.LineWidth(1.0)
-            gl.BeginEnd(GL.LINE_STRIP, function()
-                for i, v in ipairs(pts) do
-                    if v and not (v ~= v) then
-                        local x = cX + ((i-1)/(nPts-1)) * cW
-                        gl.Vertex(x, toY(v))
-                    end
-                end
-            end)
-
-            local last = pts[nPts]
-            if last and not (last ~= last) then
-                gl.Color(clr[1], clr[2], clr[3], 0.8*am)
-                gl.PointSize(6)
-                gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
-            end
-        end
-    end
-
-    -- ── X-axis time labels (v2.4 / v2.5) ────────────────────────────────────
-    -- timeWindow() returns the buffer duration AND the current game clock so
-    -- that tick labels reflect absolute game-elapsed time even after a reload.
-    local windowSecs, nowGameSecs = chart:timeWindow()
-    if windowSecs >= BASE_TICK_SECS then
-        drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
-    end
-
-    -- ── Per-view overlays ─────────────────────────────────────────────────
-    local pad    = PADDING
-    local w      = chart.width
-    local h      = chart.height
-    local vStats = allyTeams[viewedTeamID]
-
-    if chart.id == "chart-build-efficiency" then
-        local stall = vStats and vStats.metalStall or 0
-        if stall == 2 then
-            gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
-            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
-        elseif stall == 1 then
-            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
-            gl.Text("⚠ STALL", w-pad.right-2, h-pad.top-10, 10, "ro")
-        end
-    end
-
-    gl.PopMatrix()
-end
-
-local function drawCardValues()
-    for _, card in pairs(statCards) do
-        local show = (card.enabled and card.visible) or (not card.enabled and chartsInteractive)
-        if show and card.enabled then
             gl.PushMatrix()
-            gl.Translate(card.x, card.y, 0)
-            gl.Scale(card.scale, card.scale, 1)
+            gl.Translate(chart.x, chart.y, 0)
+            gl.Scale(chart.scale, chart.scale, 1)
 
-            local c = card.color
-            gl.Color(c[1], c[2], c[3], 1.0)
-            gl.Text(formatNumber(math.floor(card.displayValue+0.5)), CARD_WIDTH/2+5, 10, 20, "co")
+            -- ── Data lines ────────────────────────────────────────────────
+            for si, s in ipairs(chart.series) do
+                local pts  = chart:getSamples(si)
+                local nPts = #pts
+                if nPts >= 2 then
+                    local clr      = s.color
+                    local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
+                                     and toY(0) or cY
 
-            if card.id == "card-build-efficiency" then
-                local vStats = allyTeams[viewedTeamID]
-                local stall  = vStats and vStats.metalStall or 0
-                if stall == 2 then
-                    gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
-                    gl.Text("⚠ STALL", CARD_WIDTH-6, CARD_HEIGHT-18, 9, "ro")
-                elseif stall == 1 then
-                    gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
-                    gl.Text("⚠ STALL", CARD_WIDTH-6, CARD_HEIGHT-18, 9, "ro")
+                    if chart.chartType ~= "multi" then
+                        gl.Color(clr[1], clr[2], clr[3], 0.15*am)
+                        gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+                            for i, v in ipairs(pts) do
+                                if v and not (v ~= v) then
+                                    local x = cX + ((i-1)/(nPts-1)) * cW
+                                    gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
+                                end
+                            end
+                        end)
+                    end
+
+                    -- halo pass
+                    gl.Color(clr[1], clr[2], clr[3], 0.25*am)
+                    gl.LineWidth(3.5)
+                    gl.BeginEnd(GL.LINE_STRIP, function()
+                        for i, v in ipairs(pts) do
+                            if v and not (v ~= v) then
+                                local x = cX + ((i-1)/(nPts-1)) * cW
+                                gl.Vertex(x, toY(v))
+                            end
+                        end
+                    end)
+                    -- crisp core
+                    gl.Color(clr[1], clr[2], clr[3], 1.0*am)
+                    gl.LineWidth(1.0)
+                    gl.BeginEnd(GL.LINE_STRIP, function()
+                        for i, v in ipairs(pts) do
+                            if v and not (v ~= v) then
+                                local x = cX + ((i-1)/(nPts-1)) * cW
+                                gl.Vertex(x, toY(v))
+                            end
+                        end
+                    end)
+
+                    local last = pts[nPts]
+                    if last and not (last ~= last) then
+                        gl.Color(clr[1], clr[2], clr[3], 0.8*am)
+                        gl.PointSize(6)
+                        gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
+                    end
                 end
+            end
+
+            -- ── X-axis time labels ────────────────────────────────────────
+            local windowSecs, nowGameSecs = chart:timeWindow()
+            if windowSecs >= BASE_TICK_SECS then
+                drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
             end
 
             gl.PopMatrix()
+
+            ::continue_chart::
         end
-    end
+    end)
+
+    linesDirty            = false
+    linesLastRebuildTime  = Spring.GetTimer()
+end
+
+-------------------------------------------------------------------------------
+-- OVERLAY DISPLAY LIST
+-- Stall warnings inside chart panels, stat card values, edit-mode badge.
+-- Rebuilt when: stall state changes, hover changes, chartsInteractive toggles.
+-- Note: card *values* (the big number) are drawn here too since they change
+-- every game frame — keeping them here means they update at linesDirty rate
+-- rather than chromeList rate, without needing their own extra list.
+-------------------------------------------------------------------------------
+
+local function rebuildOverlayList()
+    if overlayDisplayList then gl.DeleteList(overlayDisplayList) end
+    overlayDisplayList = gl.CreateList(function()
+
+        -- ── Stat card values ──────────────────────────────────────────────
+        for _, card in pairs(statCards) do
+            local show = (card.enabled and card.visible) or (not card.enabled and chartsInteractive)
+            if show and card.enabled then
+                gl.PushMatrix()
+                gl.Translate(card.x, card.y, 0)
+                gl.Scale(card.scale, card.scale, 1)
+
+                local c = card.color
+                gl.Color(c[1], c[2], c[3], 1.0)
+                gl.Text(formatNumber(math.floor(card.displayValue+0.5)), CARD_WIDTH/2+5, 10, 20, "co")
+
+                if card.id == "card-build-efficiency" then
+                    local vStats = allyTeams[viewedTeamID]
+                    local stall  = vStats and vStats.metalStall or 0
+                    if stall == 2 then
+                        gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+                        gl.Text("! STALL", CARD_WIDTH-6, CARD_HEIGHT-18, 9, "ro")
+                    elseif stall == 1 then
+                        gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+                        gl.Text("! STALL", CARD_WIDTH-6, CARD_HEIGHT-18, 9, "ro")
+                    end
+                end
+
+                gl.PopMatrix()
+            end
+        end
+
+        -- ── Per-chart overlays (stall warning inside build-efficiency) ────
+        local vStats = allyTeams[viewedTeamID]
+        local stall  = vStats and vStats.metalStall or 0
+
+        for _, chart in pairs(charts) do
+            local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
+            if show and chart.enabled and chart.id == "chart-build-efficiency" then
+                gl.PushMatrix()
+                gl.Translate(chart.x, chart.y, 0)
+                gl.Scale(chart.scale, chart.scale, 1)
+
+                if stall == 2 then
+                    gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
+                    gl.Text("! STALL", chart.width-PADDING.right-2, chart.height-PADDING.top-10, 10, "ro")
+                elseif stall == 1 then
+                    gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
+                    gl.Text("! STALL", chart.width-PADDING.right-2, chart.height-PADDING.top-10, 10, "ro")
+                end
+
+                gl.PopMatrix()
+            end
+        end
+
+        -- ── Hover highlights ──────────────────────────────────────────────
+        for _, chart in pairs(charts) do
+            if chart.isHovered or (chartsInteractive and chart.isDragging) then
+                gl.PushMatrix()
+                gl.Translate(chart.x, chart.y, 0)
+                gl.Scale(chart.scale, chart.scale, 1)
+                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
+                gl.LineWidth(2.0)
+                drawRoundedRect(0.5, 0.5, chart.width-1, chart.height-1, 4, false)
+                gl.PopMatrix()
+            end
+        end
+        for _, card in pairs(statCards) do
+            if card.isHovered or (chartsInteractive and card.isDragging) then
+                gl.PushMatrix()
+                gl.Translate(card.x, card.y, 0)
+                gl.Scale(card.scale, card.scale, 1)
+                gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
+                gl.LineWidth(2.0)
+                drawRoundedRect(0.5, 0.5, CARD_WIDTH-1, CARD_HEIGHT-1, 4, false)
+                gl.PopMatrix()
+            end
+        end
+
+        -- ── Edit-mode badge ───────────────────────────────────────────────
+        if chartsInteractive then
+            gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.55)
+            gl.Text("EDIT MODE", vsx-150, 45, 11, "o")
+        end
+
+    end)
+    overlayDirty = false
 end
 
 -------------------------------------------------------------------------------
@@ -1261,6 +1260,8 @@ local function collectStats(gameFrame)
         end
     end
 
+    local stallChanged = false
+
     for tid, stats in pairs(allyTeams) do
         local ml, ms, mpull, minc, mexp = Spring.GetTeamResources(tid, "metal")
         local el, es, epull, einc, eexp = Spring.GetTeamResources(tid, "energy")
@@ -1273,14 +1274,21 @@ local function collectStats(gameFrame)
 
             local pull    = mpull or 0
             local expense = mexp  or 0
+            local newStall
             if pull > 1 then
                 local ratio = expense / pull
-                if     ratio < 0.60 then stats.metalStall = 2
-                elseif ratio < 0.98 then stats.metalStall = 1
-                else                     stats.metalStall = 0 end
+                if     ratio < 0.60 then newStall = 2
+                elseif ratio < 0.98 then newStall = 1
+                else                     newStall = 0 end
             else
-                stats.metalStall = 0
+                newStall = 0
             end
+
+            if newStall ~= (prevStallState[tid] or 0) then
+                prevStallState[tid] = newStall
+                stallChanged = true
+            end
+            stats.metalStall = newStall
         end
 
         if history[tid] then
@@ -1300,6 +1308,13 @@ local function collectStats(gameFrame)
 
     for _, card in pairs(statCards) do card:update() end
 
+    -- New data arrived this frame — mark lines dirty.
+    linesDirty = true
+
+    -- Stall warnings changed — mark overlay dirty.
+    if stallChanged then overlayDirty = true end
+
+    -- First time data arrives, chrome needs a rebuild so grid labels appear.
     if not chromeDirty then
         for _, chart in pairs(charts) do
             if chart.enabled and chart._range == nil and chart:hasData() then
@@ -1378,7 +1393,6 @@ local function buildChartsAndCards()
             local _, cnt = ringRange(tid, "kills")
             return cnt >= 2
         end
-        -- timeWindow for K/D: derive from the kills buffer
         charts.kd.timeWindow = function(self)
             local tid = viewedTeamID
             if not tid or not history[tid] then return 0, 0 end
@@ -1388,7 +1402,7 @@ local function buildChartsAndCards()
         end
     end
 
-    -- ── Stat Cards ─────────────────────────────────────────────────────────
+    -- ── Stat Cards ──────────────────────────────────────────────────────────
     local cardY    = vsy - 650
     local cardStep = 80
     local col1X    = vsx - 350
@@ -1417,9 +1431,10 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.4",
+        version           = "2.6",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
+        maxChartFps       = MAX_CHART_FPS,
         charts            = {},
         cards             = {},
     }
@@ -1461,6 +1476,9 @@ local function loadConfig()
     end
     if result.enabled           ~= nil then chartsEnabled     = result.enabled           end
     if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
+    if result.maxChartFps       ~= nil then
+        MAX_CHART_FPS = math.max(1, math.min(30, result.maxChartFps))
+    end
     return result.charts or {}, result.cards or {}
 end
 
@@ -1511,10 +1529,12 @@ local function switchView(targetTeamID)
     if charts.allyArmy       then charts.allyArmy:rebuildMultiTeamSeries()       end
     if charts.allyBuildPower then charts.allyBuildPower:rebuildMultiTeamSeries() end
 
-    chromeDirty = true
+    chromeDirty  = true
+    linesDirty   = true
+    overlayDirty = true
 
     Spring.Echo(string.format(
-        "BAR Charts: viewedTeamID is now %d ('%s')  chromeDirty=true",
+        "BAR Charts: viewedTeamID is now %d ('%s')",
         viewedTeamID, allyTeams[viewedTeamID].playerName))
 end
 
@@ -1566,7 +1586,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.5: Initialize")
+    Spring.Echo("BAR Charts v2.6: Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -1584,155 +1604,75 @@ function widget:Initialize()
     builderUnits          = {}
     buildEffState         = {}
     maxMetalUseCache      = {}
+    prevStallState        = {}
+    linesLastRebuildTime  = nil
+
     resetBuildEffForTeam(nil)
     buildChartsAndCards()
     local chartCfg, cardCfg = loadConfig()
     applyConfig(chartCfg, cardCfg)
     initRmlToggle()
-    chromeDirty = true
+
+    chromeDirty  = true
+    linesDirty   = true
+    overlayDirty = true
 
     -- public interface for data yoinking
     WG.BarCharts = {
- 
-        -- ── Identity / version ───────────────────────────────────────────
-        version = "2.5",
- 
-        -- ── Team enumeration ─────────────────────────────────────────────
- 
-        --- Returns a list of all currently tracked team IDs.
-        -- @return table  e.g. { 0, 1, 2, 3 }
+        version = "2.6",
+
         getTrackedTeams = function()
             local out = {}
-            for tid in pairs(allyTeams) do
-                out[#out + 1] = tid
-            end
+            for tid in pairs(allyTeams) do out[#out + 1] = tid end
             table.sort(out)
             return out
         end,
- 
-        --- Returns the team ID whose data is currently shown in single-team
-        -- charts (the "viewed" team).  In a normal game this is the local
-        -- player's team; in spectator mode it is whichever team was last
-        -- selected via /barcharts view.
-        -- @return number|nil
-        getViewedTeamID = function()
-            return viewedTeamID
-        end,
- 
-        --- Returns true if the local client is spectating.
-        -- @return boolean
-        isSpectator = function()
-            return isSpectator
-        end,
- 
-        -- ── Team metadata ────────────────────────────────────────────────
- 
-        --- Returns the live stats table for a team.
-        -- Fields: metalIncome, metalUsage, energyIncome, energyUsage,
-        --         damageDealt, damageTaken, armyValue, buildPower,
-        --         kills, losses, unitCount, metalLost,
-        --         buildEfficiency, metalStall, playerName, color, teamID.
-        -- The table is returned BY REFERENCE — values update every game
-        -- frame without another call.  Do NOT write to it.
-        -- @param  teamID  number
-        -- @return table|nil   nil if teamID is not tracked
-        getTeamStats = function(teamID)
-            return allyTeams[teamID]
-        end,
- 
-        --- Convenience: returns the live stats table for the viewed team.
-        -- @return table|nil
-        getViewedTeamStats = function()
-            return allyTeams[viewedTeamID]
-        end,
- 
-        -- ── Ring-buffer access ───────────────────────────────────────────
- 
-        --- Valid series key strings — pass one of these to getSamples /
-        -- getRawBuffer / getBufferInfo.
-        seriesKeys = SERIES_KEYS,   -- shared constant reference, read-only
- 
-        --- Returns a resampled array of up to `numPoints` values drawn
-        -- evenly from the ring buffer.  Index 1 is oldest, index N newest.
-        -- Returns a fresh table each call (safe to hold onto).
-        -- @param  teamID     number
-        -- @param  seriesKey  string   one of WG.BarCharts.seriesKeys
-        -- @param  numPoints  number?  default RENDER_POINTS (1500)
-        -- @return table|nil  nil if teamID or seriesKey is unknown
+
+        getViewedTeamID    = function() return viewedTeamID end,
+        isSpectator        = function() return isSpectator end,
+        getTeamStats       = function(teamID) return allyTeams[teamID] end,
+        getViewedTeamStats = function() return allyTeams[viewedTeamID] end,
+
+        seriesKeys = SERIES_KEYS,
+
         getSamples = function(teamID, seriesKey, numPoints)
             numPoints = numPoints or RENDER_POINTS
             if not history[teamID] then return nil end
             if not history[teamID][seriesKey] then return nil end
             return ringSample(teamID, seriesKey, numPoints)
         end,
- 
-        --- Returns { startIndex, count } describing the live ring buffer for
-        -- a team+series.  Use together with getRawBuffer if you want to
-        -- iterate the buffer yourself without the resampling step.
-        -- @param  teamID    number
-        -- @param  seriesKey string
-        -- @return number startIndex, number count   (both 0 if unknown)
+
         getBufferInfo = function(teamID, seriesKey)
             if not history[teamID] then return 0, 0 end
             if not history[teamID][seriesKey] then return 0, 0 end
             local s, c = ringRange(teamID, seriesKey)
             return s, c
         end,
- 
-        --- Returns the RAW ring-buffer table for a team+series BY REFERENCE.
-        -- Length is always HISTORY_SIZE; valid entries run from startIndex
-        -- for `count` slots (wrapping).  Use getBufferInfo for the indices.
-        -- Treat as read-only.  Faster than getSamples when you need every
-        -- point or are doing your own downsampling.
-        -- @param  teamID    number
-        -- @param  seriesKey string
-        -- @return table|nil
+
         getRawBuffer = function(teamID, seriesKey)
             if not history[teamID] then return nil end
             return history[teamID][seriesKey]
         end,
- 
-        --- Returns HISTORY_SIZE (total ring-buffer capacity in frames) and
-        -- GAME_FPS so callers can convert frame counts to seconds.
-        -- @return number historySize, number gameFPS
-        getBufferConstants = function()
-            return HISTORY_SIZE, GAME_FPS
-        end,
- 
-        --- Returns the number of game frames currently held in the buffer
-        -- for a given team+series, and the current game clock in seconds.
-        -- Useful for x-axis scaling in external renderers.
-        -- @param  teamID    number
-        -- @param  seriesKey string
-        -- @return number windowSecs, number nowGameSecs
+
+        getBufferConstants = function() return HISTORY_SIZE, GAME_FPS end,
+
         getTimeWindow = function(teamID, seriesKey)
-            if not history[teamID] or not history[teamID][seriesKey] then
-                return 0, 0
-            end
+            if not history[teamID] or not history[teamID][seriesKey] then return 0, 0 end
             local _, count    = ringRange(teamID, seriesKey)
             local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
             return count / GAME_FPS, nowGameSecs
         end,
- 
-        -- ── Widget-state queries ─────────────────────────────────────────
- 
-        --- True once the widget has finished its startup wait and begun
-        -- collecting data.  External widgets should guard on this before
-        -- reading any data.
-        -- @return boolean
-        isReady = function()
-            return chartsReady
-        end,
- 
-        --- True if charts are currently visible (F9 toggle state).
-        -- @return boolean
-        isEnabled = function()
-            return chartsEnabled
-        end,
+
+        isReady   = function() return chartsReady end,
+        isEnabled = function() return chartsEnabled end,
+
+        -- v2.6: expose render cadence to external widgets
+        getMaxChartFps = function() return MAX_CHART_FPS end,
     }
 
-    Spring.Echo("BAR Charts v2.5: Initialized"
+    Spring.Echo("BAR Charts v2.6: Initialized"
         .. (isSpectator and " (SPECTATOR)" or "")
+        .. string.format(", MAX_CHART_FPS=%d, RENDER_POINTS=%d", MAX_CHART_FPS, RENDER_POINTS)
         .. ", waiting for team data…")
 end
 
@@ -1742,21 +1682,10 @@ end
 
 local function pollLocalTeam()
     if not chartsReady then return end
-
     local teamID = Spring.GetLocalTeamID()
     if teamID == nil then return end
     if teamID == viewedTeamID then return end
-
-    Spring.Echo(string.format(
-        "BAR Charts [poll] GetLocalTeamID=%d  (current viewedTeamID=%s)",
-        teamID, tostring(viewedTeamID)))
-
-    if not allyTeams[teamID] then
-        Spring.Echo(string.format(
-            "BAR Charts [poll] teamID=%d NOT in tracked set — ignoring",
-            teamID))
-        return
-    end
+    if not allyTeams[teamID] then return end
 
     local oldStats = allyTeams[viewedTeamID]
     Spring.Echo(string.format(
@@ -1767,6 +1696,8 @@ local function pollLocalTeam()
 
     viewedTeamID = teamID
     chromeDirty  = true
+    linesDirty   = true
+    overlayDirty = true
 end
 
 function widget:Update(dt)
@@ -1792,16 +1723,18 @@ function widget:GameFrame(n)
                 chartsReady  = true
                 frameCounter = 0
                 chromeDirty  = true
+                linesDirty   = true
+                overlayDirty = true
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.5: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v2.6: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
                 Spring.Echo("BAR Charts: Tracked teams:")
                 for tid, stats in pairs(allyTeams) do
                     Spring.Echo(string.format("  teamID=%-3d  '%s'%s",
                         tid, stats.playerName,
-                        (tid == viewedTeamID) and "  ◀ default view" or ""))
+                        (tid == viewedTeamID) and "  <- default view" or ""))
                 end
             end
         end
@@ -1835,6 +1768,8 @@ function widget:GameStart()
     history               = {}
     histHead              = {}
     histFull              = {}
+    prevStallState        = {}
+    linesLastRebuildTime  = nil
     for _, stats in pairs(allyTeams) do
         stats.armyValue       = 0; stats.unitCount      = 0
         stats.kills           = 0; stats.losses         = 0
@@ -1843,42 +1778,51 @@ function widget:GameStart()
         stats.metalStall      = 0; stats.totalBP        = 0
         stats.buildPower      = 0
     end
-    chromeDirty = true
-    Spring.Echo("BAR Charts v2.5: Game started")
+    chromeDirty  = true
+    linesDirty   = true
+    overlayDirty = true
+    Spring.Echo("BAR Charts v2.6: Game started")
 end
 
 -------------------------------------------------------------------------------
 -- RENDERING
+-- DrawScreen: check dirty flags, rebuild only what needs it, call three lists.
+-- Lines list is rate-limited by MAX_CHART_FPS via wall-clock comparison.
 -------------------------------------------------------------------------------
 
 function widget:DrawScreen()
     if not chartsEnabled then return end
-    if chromeDirty then rebuildChromeList() end
-    if chromeDisplayList then gl.CallList(chromeDisplayList) end
-    for _, chart in pairs(charts) do drawChartLines(chart) end
-    drawCardValues()
-    for _, chart in pairs(charts) do
-        if chart.isHovered or (chartsInteractive and chart.isDragging) then
-            gl.PushMatrix()
-            gl.Translate(chart.x, chart.y, 0)
-            gl.Scale(chart.scale, chart.scale, 1)
-            gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
-            gl.LineWidth(2.0)
-            drawRoundedRect(0.5, 0.5, chart.width-1, chart.height-1, 4, false)
-            gl.PopMatrix()
+
+    -- Chrome: layout changes (drag, scale, enable, resize)
+    if chromeDirty then
+        rebuildChromeList()
+    end
+
+    -- Lines: new game data — rate-limited to MAX_CHART_FPS rebuilds/second.
+    -- linesLastRebuildTime nil means we've never built it yet; do so immediately.
+    if linesDirty then
+        local minInterval = 1.0 / math.max(1, math.min(30, MAX_CHART_FPS))
+        local doRebuild   = (linesLastRebuildTime == nil)
+        if not doRebuild then
+            local elapsed = Spring.DiffTimers(Spring.GetTimer(), linesLastRebuildTime)
+            doRebuild = (elapsed >= minInterval)
+        end
+        if doRebuild then
+            rebuildLinesList()
+            -- overlay card values depend on the same data cadence
+            overlayDirty = true
         end
     end
-    for _, card in pairs(statCards) do
-        if card.isHovered or (chartsInteractive and card.isDragging) then
-            gl.PushMatrix()
-            gl.Translate(card.x, card.y, 0)
-            gl.Scale(card.scale, card.scale, 1)
-            gl.Color(COLOR.borderHot[1], COLOR.borderHot[2], COLOR.borderHot[3], 0.8)
-            gl.LineWidth(2.0)
-            drawRoundedRect(0.5, 0.5, CARD_WIDTH-1, CARD_HEIGHT-1, 4, false)
-            gl.PopMatrix()
-        end
+
+    -- Overlay: stall warnings, hover highlights, card values
+    if overlayDirty then
+        rebuildOverlayList()
     end
+
+    -- Call all three lists — essentially free, just replays GPU commands.
+    if chromeDisplayList  then gl.CallList(chromeDisplayList)  end
+    if linesDisplayList   then gl.CallList(linesDisplayList)   end
+    if overlayDisplayList then gl.CallList(overlayDisplayList) end
 end
 
 -------------------------------------------------------------------------------
@@ -1917,10 +1861,13 @@ function widget:MousePress(mx, my, button)
         elem.isDragging = true
         elem.dragStartX = mx - elem.x
         elem.dragStartY = my - elem.y
+        overlayDirty = true
         return true
     elseif button == 3 then
         elem.enabled = not elem.enabled
         chromeDirty  = true
+        linesDirty   = true
+        overlayDirty = true
         return true
     end
     return false
@@ -1930,16 +1877,10 @@ function widget:MouseRelease(mx, my, button)
     if not chartsEnabled or not chartsInteractive then return false end
     if button == 1 then
         for _, card in pairs(statCards) do
-            if card.isDragging then
-                card.isDragging = false
-                return true
-            end
+            if card.isDragging then card.isDragging = false; overlayDirty = true; return true end
         end
         for _, chart in pairs(charts) do
-            if chart.isDragging then
-                chart.isDragging = false
-                return true
-            end
+            if chart.isDragging then chart.isDragging = false; overlayDirty = true; return true end
         end
     end
     return false
@@ -1953,27 +1894,36 @@ function widget:MouseMove(mx, my, dx, dy)
                 card.x      = snapTo(mx - card.dragStartX)
                 card.y      = snapTo(my - card.dragStartY)
                 chromeDirty = true
+                linesDirty  = true
+                overlayDirty = true
                 return true
             end
         end
         for _, chart in pairs(charts) do
             if chart.isDragging then
-                chart.x     = snapTo(mx - chart.dragStartX)
-                chart.y     = snapTo(my - chart.dragStartY)
-                chromeDirty = true
+                chart.x      = snapTo(mx - chart.dragStartX)
+                chart.y      = snapTo(my - chart.dragStartY)
+                chromeDirty  = true
+                linesDirty   = true
+                overlayDirty = true
                 return true
             end
         end
     end
+
     local changed = false
     for id, card in pairs(statCards) do
         local h = chartsInteractive and card:isMouseOver(mx, my) or false
-        if h ~= card.isHovered then changed = true end; card.isHovered = h
+        if h ~= card.isHovered then changed = true end
+        card.isHovered = h
     end
     for id, chart in pairs(charts) do
         local h = chartsInteractive and chart:isMouseOver(mx, my) or false
-        if h ~= chart.isHovered then changed = true end; chart.isHovered = h
+        if h ~= chart.isHovered then changed = true end
+        chart.isHovered = h
     end
+    if changed then overlayDirty = true end
+
     if not chartsInteractive then return false end
     for _, c in pairs(statCards) do if c.isHovered then return true end end
     for _, c in pairs(charts)    do if c.isHovered then return true end end
@@ -1985,14 +1935,20 @@ function widget:MouseWheel(up, value)
     local mx, my = Spring.GetMouseState()
     for _, card in pairs(statCards) do
         if card:isMouseOver(mx, my) then
-            card.scale  = up and math.min(2.0, card.scale+0.1) or math.max(0.5, card.scale-0.1)
-            chromeDirty = true; return true
+            card.scale   = up and math.min(2.0, card.scale+0.1) or math.max(0.5, card.scale-0.1)
+            chromeDirty  = true
+            linesDirty   = true
+            overlayDirty = true
+            return true
         end
     end
     for _, chart in pairs(charts) do
         if chart:isMouseOver(mx, my) then
-            chart.scale = up and math.min(2.0, chart.scale+0.1) or math.max(0.5, chart.scale-0.1)
-            chromeDirty = true; return true
+            chart.scale  = up and math.min(2.0, chart.scale+0.1) or math.max(0.5, chart.scale-0.1)
+            chromeDirty  = true
+            linesDirty   = true
+            overlayDirty = true
+            return true
         end
     end
     return false
@@ -2004,7 +1960,9 @@ function widget:ViewResize()
     local rx, ry = vsx/ox, vsy/oy
     for _, c in pairs(charts)    do c.x = c.x*rx; c.y = c.y*ry end
     for _, c in pairs(statCards) do c.x = c.x*rx; c.y = c.y*ry end
-    chromeDirty = true
+    chromeDirty  = true
+    linesDirty   = true
+    overlayDirty = true
 end
 
 -------------------------------------------------------------------------------
@@ -2030,10 +1988,23 @@ function widget:TextCommand(command)
             Spring.Echo("BAR Charts: Active participant teams"
                 .. (isSpectator and " (spectator)" or " (allies)") .. ":")
             for tid, stats in pairs(allyTeams) do
-                local marker = (tid == viewedTeamID) and " ◀ viewing" or ""
+                local marker = (tid == viewedTeamID) and " <- viewing" or ""
                 local mine   = (myTeamID and tid == myTeamID) and " (you)" or ""
                 Spring.Echo(string.format("  %d  %s%s%s", tid, stats.playerName, mine, marker))
             end
+        end
+        return true
+    end
+
+    -- /barcharts fps <1-30>  — change render cadence at runtime
+    if command:sub(1, 12) == "barcharts fps" then
+        local arg = command:sub(14)
+        local n   = tonumber(arg)
+        if n then
+            MAX_CHART_FPS = math.max(1, math.min(30, math.floor(n)))
+            Spring.Echo(string.format("BAR Charts: MAX_CHART_FPS set to %d", MAX_CHART_FPS))
+        else
+            Spring.Echo(string.format("BAR Charts: MAX_CHART_FPS = %d  (use /barcharts fps <1-30>)", MAX_CHART_FPS))
         end
         return true
     end
@@ -2047,7 +2018,8 @@ function widget:TextCommand(command)
     elseif command == "barcharts edit" then
         chartsInteractive = not chartsInteractive
         syncPillState()
-        chromeDirty = true
+        chromeDirty  = true
+        overlayDirty = true
         Spring.Echo("BAR Charts: " .. (chartsInteractive and "EDIT mode ON" or "LOCKED"))
         return true
     elseif command == "barcharts hidepill" then
@@ -2059,11 +2031,15 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: Pill visible")
         return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.5 Debug ===")
+        Spring.Echo("=== BAR Charts v2.6 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
+        Spring.Echo(string.format("MAX_CHART_FPS=%d  (set via /barcharts fps <1-30>)",
+            MAX_CHART_FPS))
+        Spring.Echo(string.format("dirty flags: chrome=%s  lines=%s  overlay=%s",
+            tostring(chromeDirty), tostring(linesDirty), tostring(overlayDirty)))
         Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
             tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
         Spring.Echo(string.format("SNAP_GRID=%dpx  BASE_TICK_SECS=%ds  MIN_TICK_PX=%dpx",
@@ -2072,7 +2048,7 @@ function widget:TextCommand(command)
         for tid, stats in pairs(allyTeams) do
             local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
             local head = history[tid] and histHead[tid] and histHead[tid]["metalIncome"] or 0
-            local viewing = (tid == viewedTeamID) and " ◀" or ""
+            local viewing = (tid == viewedTeamID) and " <-" or ""
             local mine    = (tid == myTeamID)     and " (you)" or ""
             Spring.Echo(string.format("  [%d] %s%s%s  metal=%.0f/%.0f  army=%.0f  full=%s head=%d",
                 tid, stats.playerName, mine, viewing,
@@ -2144,9 +2120,9 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Shutdown()
-    WG.BarCharts = nil -- shut down public interface
+    WG.BarCharts = nil
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.5: Shutdown")
+    Spring.Echo("BAR Charts v2.6: Shutdown")
 end
