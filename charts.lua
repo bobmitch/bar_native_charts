@@ -99,7 +99,7 @@ local RENDER_POINTS   = 300   -- v2.6: reduced from 1500; imperceptible at norma
 --   10  → default; smooth for slowly-changing data, good on mid-range GPUs
 --    1  → extreme potato mode; data updates once per second visually
 -- Range: 1–30.  Values above 30 are clamped to 30 (no benefit beyond game FPS).
-local MAX_CHART_FPS = 10
+local MAX_CHART_FPS = 30
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
@@ -1473,9 +1473,7 @@ local function loadConfig()
     end
     if result.enabled           ~= nil then chartsEnabled     = result.enabled           end
     if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
-    if result.maxChartFps       ~= nil then
-        MAX_CHART_FPS = math.max(1, math.min(30, result.maxChartFps))
-    end
+
     return result.charts or {}, result.cards or {}
 end
 
