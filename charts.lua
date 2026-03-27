@@ -1798,19 +1798,24 @@ function widget:DrawScreen()
         rebuildChromeList()
     end
 
-    -- Lines: new game data — rate-limited to MAX_CHART_FPS rebuilds/second.
-    -- linesLastRebuildTime nil means we've never built it yet; do so immediately.
-    if linesDirty then
+    -- Lines: rebuilt at most MAX_CHART_FPS times per real-world second.
+    -- The timer gate runs unconditionally every DrawScreen — it is the sole
+    -- arbiter of render cadence.  linesDirty is a separate concern: it flags
+    -- that new ring-buffer data exists since the last rebuild.  We only call
+    -- rebuildLinesList() when BOTH conditions are true: enough wall-clock time
+    -- has elapsed AND there is actually new data to show.  This means:
+    --   * At MAX_CHART_FPS=1 the list rebuilds once per second regardless of
+    --     monitor refresh rate or game frame rate.
+    --   * At MAX_CHART_FPS=30 it rebuilds up to 30×/s but never more.
+    --   * If no new data has arrived (linesDirty=false) the cached list is
+    --     replayed even if the timer would have allowed a rebuild.
+    do
         local minInterval = 1.0 / math.max(1, math.min(30, MAX_CHART_FPS))
-        local doRebuild   = (linesLastRebuildTime == nil)
-        if not doRebuild then
-            local elapsed = Spring.DiffTimers(Spring.GetTimer(), linesLastRebuildTime)
-            doRebuild = (elapsed >= minInterval)
-        end
-        if doRebuild then
-            rebuildLinesList()
-            -- overlay card values depend on the same data cadence
-            overlayDirty = true
+        local timeReady   = (linesLastRebuildTime == nil)
+                         or (Spring.DiffTimers(Spring.GetTimer(), linesLastRebuildTime) >= minInterval)
+        if timeReady and linesDirty then
+            rebuildLinesList()       -- clears linesDirty, updates linesLastRebuildTime
+            overlayDirty = true      -- card values refresh at the same cadence
         end
     end
 
