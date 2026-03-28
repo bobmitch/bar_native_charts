@@ -653,7 +653,11 @@ local function sampleBuildEfficiencyForTeam(tid)
             end
         end
     end
-    if effCount == 0 then return 0 end
+    if effCount == 0 then
+        local builderCount = 0
+        for _ in pairs(teamBuilders) do builderCount = builderCount + 1 end
+        return builderCount <= 1 and 100 or 0
+    end
     return (effSum / effCount) * 100
 end
 
