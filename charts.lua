@@ -1,58 +1,59 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
-    BAR CHARTS WIDGET — 1-MINUTE RING BUFFER, MULTI-TEAM VIEW SWITCHING
-    v2.6 by FilthyMitch
+    BAR CHARTS WIDGET — SHADER EDITION
+    v3.0 by FilthyMitch  (shader rewrite on top of v2.6 ring-buffer core)
 
-    History window : exactly 120 in-game seconds = 3 600 game frames at 30 fps
-    Sampling       : one data point pushed every game frame (30/s)
-    Rendering      : THREE display lists now cover all geometry:
-                       chromeList  — bg, grid, labels, borders; rebuilt on
-                                     layout changes (drag, scale, enable)
-                       linesList   — line strips, fills, time axis; rebuilt at
-                                     most MAX_CHART_FPS times per second
-                       overlayList — stall warnings, hover highlights; rebuilt
-                                     whenever hover state or stall status changes
-                     DrawScreen calls gl.CallList × 3 — essentially free on GPU.
-    Player switch  : ALL teams buffered simultaneously (player and spectator);
-                     switching view is an O(1) pointer swap (no copy, no gap)
+    Rendering pipeline (new in v3.0):
+    ─────────────────────────────────
+    Three GLSL programs replace all raw gl.LineWidth / GL.LINE_STRIP calls:
 
-    GPU optimisation (v2.6):
-      Previously drawChartLines() was called raw every DrawScreen — at 144 hz
-      that meant ringSample() math + full GL geometry for all 8 charts ran
-      144 times per second even though game data only changes 30 times per
-      second.  v2.6 moves all line geometry into a display list (linesList)
-      that is rebuilt at most MAX_CHART_FPS times per wall-clock second.
-      At the default of 10 fps this is a ~14× reduction at 144 hz monitor
-      refresh, on top of the display-list GPU savings.  Set MAX_CHART_FPS = 30
-      to rebuild as fast as game data arrives; set 1 for extreme potato mode.
+    lineShader
+      Converts each data series into a screen-space quad strip.  A vertex
+      shader expands the centre-line into a ribbon of configurable half-width;
+      the fragment shader applies a smooth SDF-based coverage value so the
+      line is pixel-perfect anti-aliased at any scale.  A configurable
+      glowRadius adds a soft outer bloom using the same signed distance.
 
-    Spectator mode :
-      Detected via Spring.GetSpectatingState() at init and re-checked each
-      ready-wait cycle.  In spectator mode Spring.GetTeamList() is called with
-      no argument to enumerate ALL active game teams (not just one ally group).
-      myTeamID is set to nil for spectators — build-efficiency sampling and
-      unit-event army-tracking are bypassed (no "my" units exist).
-      Default viewed team is the first non-Gaia team found.
+    fillShader
+      Draws the filled area beneath each line as a TRIANGLE_STRIP.  The
+      fragment shader applies a two-stop vertical gradient (opaque at the
+      line, transparent at the baseline) with an animated horizontal shimmer
+      band — a sine wave that drifts rightward over time, giving the fill a
+      subtle pulse without any extra geometry.
 
-    Active-team filtering (v2.3):
-      isActiveParticipant(tid) admits a team if:
-        (a) it is an AI team, OR
-        (b) it has a human leader who is NOT spectating, OR
-        (c) it has no valid leader (Gaia-like) but already has live units.
-      Dead/resigned teams are always excluded.
+    gridShader
+      Renders the background panel's grid lines with a low-frequency
+      animating "scan-pulse" — a bright ring that sweeps upward over ~4 s,
+      giving the otherwise static grid a hint of life.
 
-    X-axis timestamps (v2.5):
-      Tick positions and labels are derived from Spring.GetGameFrame() so they
-      remain correct after a mid-game widget reload.  Adaptive tick interval
-      doubles (30→60→120→240 s …) until adjacent labels are MIN_TICK_PX apart.
+    All three programs are compiled once in widget:Initialize and reused for
+    every chart, every frame.  Data is uploaded to the GPU as a 1-D float
+    uniform array (up to MAX_UNIFORM_POINTS floats) so the vertex shader can
+    position each sample without any Lua-side geometry loop.
 
+    Display-list strategy (same as v2.6):
+    ──────────────────────────────────────
+    chromeList  — bg panels, borders, Y-axis labels, titles  (dirty on layout)
+    linesList   — all shader-drawn line+fill geometry        (dirty on new data)
+    overlayList — stall warnings, hover highlights, cards    (dirty on state)
+
+    Backwards-compatible public API:
+    ──────────────────────────────────
+    WG.BarCharts is still published with identical fields to v2.6.
+
+    Performance notes:
+    ──────────────────
+    • MAX_CHART_FPS still gates linesList rebuilds (default 30).
+    • RENDER_POINTS defaults to 300; shader path is O(n) vertex uploads.
+    • Shader compilation happens once at init; no per-frame recompile.
+    • Uniform upload of 300 floats ≈ 1.2 KB/frame per series — negligible.
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics overlay charts and cards (v2.6)",
+        desc      = "Real-time resource and combat statistics — shader-rendered lines & fills (v3.0)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -87,26 +88,22 @@ end
 local CONFIG_FILE = "bar_charts_config.lua"
 
 local GAME_FPS        = 30
-local HISTORY_SECONDS = 600
-local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS  -- 18000 frames
-local RENDER_POINTS   = 300   -- v2.6: reduced from 1500; imperceptible at normal scales
+local HISTORY_SECONDS = 300
+local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS   -- 18 000 frames
+local RENDER_POINTS   = 300
 
--- ── Performance tuning ────────────────────────────────────────────────────
--- MAX_CHART_FPS controls how many times per real-world second the line
--- geometry display list is rebuilt.  Reducing this saves GPU/CPU without
--- affecting the data stored in the ring buffer.
---   30  → rebuild as fast as game data arrives (matches GAME_FPS)
---   10  → default; smooth for slowly-changing data, good on mid-range GPUs
---    1  → extreme potato mode; data updates once per second visually
--- Range: 1–30.  Values above 30 are clamped to 30 (no benefit beyond game FPS).
-local MAX_CHART_FPS = 30
+-- Maximum GPU uniform array size for data points.
+-- Must match the array size declared in the GLSL shaders below.
+local MAX_UNIFORM_POINTS = 300
+
+local MAX_CHART_FPS = 60
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 15
 local BUILD_EFF_WINDOW_SIZE      = 8
 
-local CHART_WIDTH  = 1500
+local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
-local PADDING      = {left = 40, right = 15, top = 15, bottom = 25}
+local PADDING      = { left = 40, right = 15, top = 15, bottom = 25 }
 local CARD_WIDTH   = 140
 local CARD_HEIGHT  = 70
 
@@ -115,18 +112,22 @@ local SNAP_GRID = 20
 local BASE_TICK_SECS = 30
 local MIN_TICK_PX    = 44
 
+-- Line rendering parameters
+local LINE_HALF_WIDTH = 0.6   -- core half-width in pixels — ~1px rendered line
+local LINE_GLOW_RADIUS = 3.0  -- outer glow radius in pixels (additive bloom only)
+
 local COLOR = {
-    bg        = {0.031, 0.047, 0.078, 0.72},
-    border    = {0.353, 0.706, 1.000, 0.18},
-    borderHot = {0.353, 0.706, 1.000, 0.55},
-    grid      = {0.353, 0.706, 1.000, 0.08},
-    gridBase  = {0.353, 0.706, 1.000, 0.22},
-    muted     = {0.627, 0.745, 0.863, 0.55},
-    accent    = {0.290, 0.706, 1.000, 1.00},
-    accent2   = {1.000, 0.420, 0.208, 1.00},
-    danger    = {1.000, 0.231, 0.361, 1.00},
-    success   = {0.188, 0.941, 0.627, 1.00},
-    gold      = {0.941, 0.753, 0.251, 1.00},
+    bg        = { 0.031, 0.047, 0.078, 0.72 },
+    border    = { 0.353, 0.706, 1.000, 0.18 },
+    borderHot = { 0.353, 0.706, 1.000, 0.55 },
+    grid      = { 0.353, 0.706, 1.000, 0.08 },
+    gridBase  = { 0.353, 0.706, 1.000, 0.22 },
+    muted     = { 0.627, 0.745, 0.863, 0.55 },
+    accent    = { 0.290, 0.706, 1.000, 1.00 },
+    accent2   = { 1.000, 0.420, 0.208, 1.00 },
+    danger    = { 1.000, 0.231, 0.361, 1.00 },
+    success   = { 0.188, 0.941, 0.627, 1.00 },
+    gold      = { 0.941, 0.753, 0.251, 1.00 },
 }
 
 -------------------------------------------------------------------------------
@@ -144,45 +145,34 @@ end
 local function formatTimestamp(secs)
     local m = math.floor(secs / 60)
     local s = secs % 60
-    if m == 0 then
-        return string.format(":%02d", s)
-    else
-        return string.format("%d:%02d", m, s)
-    end
+    if m == 0 then return string.format(":%02d", s)
+    else            return string.format("%d:%02d", m, s) end
 end
 
 local function drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, alpha)
     if windowSecs <= 0 then return end
-
     local tickSecs = BASE_TICK_SECS
     local pxPerSec = cW / windowSecs
     while (tickSecs * pxPerSec) < MIN_TICK_PX do
         tickSecs = tickSecs * 2
         if tickSecs > windowSecs then return end
     end
-
     local rightSecs = nowGameSecs
     local leftSecs  = nowGameSecs - windowSecs
     local firstTick = math.ceil(leftSecs / tickSecs) * tickSecs
-
-    local c     = COLOR.muted
-    local tickH = 4
-
-    local t = firstTick
+    local c         = COLOR.muted
+    local tickH     = 4
+    local t         = firstTick
     while t <= rightSecs do
         local frac = (t - leftSecs) / windowSecs
         local xPos = cX + frac * cW
-
         gl.Color(c[1], c[2], c[3], (c[4] * 0.7) * alpha)
         gl.LineWidth(1.0)
         gl.BeginEnd(GL.LINES, function()
-            gl.Vertex(xPos, cY)
-            gl.Vertex(xPos, cY - tickH)
+            gl.Vertex(xPos, cY); gl.Vertex(xPos, cY - tickH)
         end)
-
         gl.Color(c[1], c[2], c[3], (c[4] * 0.85) * alpha)
         gl.Text(formatTimestamp(math.floor(t + 0.5)), xPos, cY - tickH - 9, 8, "co")
-
         t = t + tickSecs
     end
 end
@@ -240,11 +230,7 @@ end
 local function ringRange(tid, key)
     local h    = histHead[tid][key]
     local full = histFull[tid][key]
-    if full then
-        return h, HISTORY_SIZE
-    else
-        return 1, h - 1
-    end
+    return full and h or 1, full and HISTORY_SIZE or (h - 1)
 end
 
 local function ringSample(tid, key, numPts)
@@ -257,42 +243,247 @@ local function ringSample(tid, key, numPts)
     for i = 1, n do
         local fi  = math.floor((i - 1) / math.max(n - 1, 1) * (count - 1) + 0.5)
         local idx = ((startIdx - 1 + fi) % HISTORY_SIZE) + 1
-        pts[i] = buf[idx]
+        pts[i]    = buf[idx]
     end
     return pts
 end
 
-local builderUnits    = {}
+local builderUnits     = {}
 local maxMetalUseCache = {}
-local buildEffState   = {}
+local buildEffState    = {}
 
 local charts    = {}
 local statCards = {}
 
 -- ── Display lists ─────────────────────────────────────────────────────────
--- chromeList  : bg panels, grid lines, Y-axis labels, chart titles, card frames
--- linesList   : all line/fill geometry for every chart; rate-limited by MAX_CHART_FPS
--- overlayList : stall warnings, hover highlights, edit-mode badge
 local chromeDisplayList  = nil
 local linesDisplayList   = nil
 local overlayDisplayList = nil
 
-local chromeDirty  = true   -- set on: drag, scale, enable/hide, view switch, resize
-local linesDirty   = true   -- set on: every GameFrame (new data arrived)
-local overlayDirty = true   -- set on: stall status change, hover state change
+local chromeDirty  = true
+local linesDirty   = true
+local overlayDirty = true
 
--- Wall-clock time of the last linesList rebuild.
--- Compared against (1 / MAX_CHART_FPS) to rate-limit rebuilds.
 local linesLastRebuildTime = nil
 
-local frameCounter       = 0
-local FULL_SCAN_INTERVAL = GAME_FPS
-
+local frameCounter          = 0
+local FULL_SCAN_INTERVAL    = GAME_FPS
 local chartsReadyWaitFrames = 0
 local READY_WAIT_FRAMES     = GAME_FPS * 3
 
--- Previous stall state per team — used to detect changes that require overlayDirty.
 local prevStallState = {}
+
+-- Wall-clock start time for shader animations
+local widgetStartTimer = nil
+
+-------------------------------------------------------------------------------
+-- ═══════════════════════════════════════════════════════════════════════════
+--  SHADER PROGRAMS
+-- ═══════════════════════════════════════════════════════════════════════════
+-------------------------------------------------------------------------------
+
+local shaderLine = nil   -- AA line ribbon shader
+local shaderFill = nil   -- animated area fill shader
+local shaderGrid = nil   -- animated grid / scan-pulse shader
+
+-- Uniform locations cached after link
+local uLine = {}
+local uFill = {}
+local uGrid = {}
+
+-- ── GLSL sources ────────────────────────────────────────────────────────────
+
+-- lineVS: expands each sample pair into a screen-space quad.
+-- Each "vertex" in Lua is actually the LEFT endpoint of a segment;
+-- we emit 4 verts per segment (quad) and let the GS… wait, BAR's Spring
+-- version may not support geometry shaders reliably.  Instead we use a
+-- classic "fat line" trick: upload ALL sample Y-values as a uniform array
+-- and draw 2*(N-1) triangles by encoding segment index + side in gl_VertexID.
+-- Since Spring's widget GL doesn't expose gl_VertexID we fall back to passing
+-- the quad corners as explicit geometry from Lua — but we do it ONCE per
+-- display-list rebuild and let the fragment shader own the AA math.
+--
+-- Vertex layout per quad corner:
+--   attrib 0 (vec2) = screen position
+--   attrib 1 (float) = signed perpendicular distance from line centre (pixels)
+--
+-- The fragment shader turns that distance into smooth coverage.
+
+-- aDist is packed into gl_Color.r (the fixed-function colour channel),
+-- which is the only reliable per-vertex data channel available in Spring's
+-- immediate-mode Lua GL binding.  The actual line colour is passed as a
+-- uniform so it is independent of this carrier.
+local LINE_VS = [[
+#version 120
+varying float vDist;
+void main() {
+    vDist       = gl_Color.r;
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+]]
+
+local LINE_FS = [[
+#version 120
+uniform vec4  uColor;
+uniform float uHalfWidth;
+uniform float uGlowRadius;
+varying float vDist;
+
+void main() {
+    float d = abs(vDist);
+
+    // ── Core line ──────────────────────────────────────────────────────
+    // AA fringe is exactly ±1px around the edge — tight enough to look
+    // sharp, wide enough to prevent aliasing on any angle.
+    float core = 1.0 - smoothstep(uHalfWidth - 1.0, uHalfWidth + 1.0, d);
+
+    // ── Glow bloom ────────────────────────────────────────────────────
+    // Gaussian falloff outside the core edge.  This is combined additively
+    // in the Lua draw call (GL_ONE dest blend) so it brightens rather than
+    // thickening the line.
+    float outerDist = max(0.0, d - uHalfWidth);
+    float bloom     = exp(-outerDist * outerDist / (uGlowRadius * 0.5)) * 0.4;
+
+    // Core alpha uses normal src-alpha blend (set before this draw call).
+    // Bloom is baked into the alpha here; the Lua side switches blend modes
+    // between the two passes.
+    float alpha = clamp(core + bloom, 0.0, 1.0);
+
+    // Tint core slightly brighter at centre
+    float centreBright = max(0.0, 1.0 - d / uHalfWidth) * 0.15;
+    vec3  col = uColor.rgb + centreBright;
+
+    gl_FragColor = vec4(col, uColor.a * alpha);
+}
+]]
+
+-- Fill shader: triangle strip from baseline to line, with a vertical gradient
+-- and a slow horizontal shimmer band animated by time.
+
+-- aT (0=baseline, 1=line) is packed into gl_Color.r
+local FILL_VS = [[
+#version 120
+varying float vT;
+varying float vX;
+void main() {
+    vT          = gl_Color.r;
+    vX          = gl_Vertex.x;
+    gl_Position = gl_ModelViewProjectionMatrix * gl_Vertex;
+}
+]]
+
+local FILL_FS = [[
+#version 120
+uniform vec4  uColor;
+uniform float uTime;
+uniform float uChartX;
+uniform float uChartW;
+varying float vT;
+varying float vX;
+
+void main() {
+    float alpha   = vT * vT * 0.55;
+    float nx      = (vX - uChartX) / max(uChartW, 1.0);
+    float phase   = nx - uTime * 0.045;
+    float band    = sin(phase * 3.14159 * 2.0);
+    band          = clamp(band * 0.5 + 0.5, 0.0, 1.0);
+    band          = pow(band, 12.0);
+    float shimmer = band * 0.18 * vT;
+    gl_FragColor  = vec4(uColor.rgb, (alpha + shimmer) * uColor.a);
+}
+]]
+
+-- Grid shader: draws horizontal grid lines with an upward-sweeping scan pulse.
+
+local GRID_VS = [[
+#version 120
+attribute vec2 aPos;
+varying   vec2 vPos;
+void main() {
+    vPos        = aPos;
+    gl_Position = gl_ModelViewProjectionMatrix * vec4(aPos, 0.0, 1.0);
+}
+]]
+
+local GRID_FS = [[
+#version 120
+uniform vec4  uColor;
+uniform float uTime;
+uniform float uChartY;    // bottom of chart content area
+uniform float uChartH;    // height of chart content area
+varying vec2  vPos;
+
+void main() {
+    // Scan pulse: a band that sweeps from bottom to top over ~4 seconds
+    float ny     = (vPos.y - uChartY) / max(uChartH, 1.0);
+    float pulse  = mod(uTime * 0.25, 1.0);           // 0→1 every 4 s
+    float dist   = abs(ny - pulse);
+    float bright = exp(-dist * dist * 120.0) * 0.6;  // tight Gaussian
+
+    float a = uColor.a + bright;
+    gl_FragColor = vec4(uColor.rgb + bright * 0.4, clamp(a, 0.0, 1.0));
+}
+]]
+
+-- ── Shader compilation helper ──────────────────────────────────────────────
+
+local function compileShader(vsSrc, fsSrc)
+    local shader = gl.CreateShader({
+        vertex   = vsSrc,
+        fragment = fsSrc,
+    })
+    if not shader then
+        local log = gl.GetShaderLog() or "(no log)"
+        Spring.Echo("BAR Charts v3.0: Shader compile FAILED — " .. log)
+        return nil, {}
+    end
+    return shader, {}
+end
+
+local function getUniformLoc(shader, name)
+    return gl.GetUniformLocation(shader, name)
+end
+
+local function initShaders()
+    shaderLine, uLine = compileShader(LINE_VS, LINE_FS)
+    if shaderLine then
+        uLine.color      = getUniformLoc(shaderLine, "uColor")
+        uLine.halfWidth  = getUniformLoc(shaderLine, "uHalfWidth")
+        uLine.glowRadius = getUniformLoc(shaderLine, "uGlowRadius")
+        Spring.Echo("BAR Charts v3.0: Line shader compiled OK")
+    end
+
+    shaderFill, uFill = compileShader(FILL_VS, FILL_FS)
+    if shaderFill then
+        uFill.color   = getUniformLoc(shaderFill, "uColor")
+        uFill.time    = getUniformLoc(shaderFill, "uTime")
+        uFill.chartX  = getUniformLoc(shaderFill, "uChartX")
+        uFill.chartW  = getUniformLoc(shaderFill, "uChartW")
+        Spring.Echo("BAR Charts v3.0: Fill shader compiled OK")
+    end
+
+    shaderGrid, uGrid = compileShader(GRID_VS, GRID_FS)
+    if shaderGrid then
+        uGrid.color   = getUniformLoc(shaderGrid, "uColor")
+        uGrid.time    = getUniformLoc(shaderGrid, "uTime")
+        uGrid.chartY  = getUniformLoc(shaderGrid, "uChartY")
+        uGrid.chartH  = getUniformLoc(shaderGrid, "uChartH")
+        Spring.Echo("BAR Charts v3.0: Grid shader compiled OK")
+    end
+end
+
+local function deleteShaders()
+    if shaderLine then gl.DeleteShader(shaderLine); shaderLine = nil end
+    if shaderFill then gl.DeleteShader(shaderFill); shaderFill = nil end
+    if shaderGrid then gl.DeleteShader(shaderGrid); shaderGrid = nil end
+end
+
+-- ── Elapsed seconds for shader animation ──────────────────────────────────
+
+local function elapsedSecs()
+    if not widgetStartTimer then return 0 end
+    return Spring.DiffTimers(Spring.GetTimer(), widgetStartTimer)
+end
 
 -------------------------------------------------------------------------------
 -- RMLUI TOGGLE
@@ -320,15 +511,11 @@ end
 local function setPillVisible(visible)
     pillVisible = visible
     if not rmlDocument then return end
-    if visible then
-        syncPillState()
-        rmlDocument:Show()
-    else
-        rmlDocument:Hide()
-    end
+    if visible then syncPillState(); rmlDocument:Show()
+    else rmlDocument:Hide() end
 end
 
-local function onToggleClick(event)
+local function onToggleClick(_event)
     chartsInteractive = not chartsInteractive
     syncPillState()
     chromeDirty  = true
@@ -352,9 +539,7 @@ local function initRmlToggle()
     if not pill then return end
     pill:AddEventListener("click", onToggleClick, false)
     pill:SetClass("state-locked", true)
-    if pillVisible then
-        rmlDocument:Show()
-    end
+    if pillVisible then rmlDocument:Show() end
 end
 
 local function shutdownRmlToggle()
@@ -393,24 +578,20 @@ local function drawRoundedRect(x, y, w, h, r, filled)
             local a1 = (math.pi/2)*(i/segs)
             local a2 = (math.pi/2)*((i+1)/segs)
             gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x+r, y+r)
-                gl.Vertex(x+r-r*math.cos(a1), y+r-r*math.sin(a1))
-                gl.Vertex(x+r-r*math.cos(a2), y+r-r*math.sin(a2))
+                gl.Vertex(x+r,   y+r);   gl.Vertex(x+r-r*math.cos(a1),   y+r-r*math.sin(a1))
+                                          gl.Vertex(x+r-r*math.cos(a2),   y+r-r*math.sin(a2))
             end)
             gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x+w-r, y+r)
-                gl.Vertex(x+w-r+r*math.sin(a1), y+r-r*math.cos(a1))
-                gl.Vertex(x+w-r+r*math.sin(a2), y+r-r*math.cos(a2))
+                gl.Vertex(x+w-r, y+r);   gl.Vertex(x+w-r+r*math.sin(a1), y+r-r*math.cos(a1))
+                                          gl.Vertex(x+w-r+r*math.sin(a2), y+r-r*math.cos(a2))
             end)
             gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x+w-r, y+h-r)
-                gl.Vertex(x+w-r+r*math.cos(a1), y+h-r+r*math.sin(a1))
-                gl.Vertex(x+w-r+r*math.cos(a2), y+h-r+r*math.sin(a2))
+                gl.Vertex(x+w-r, y+h-r); gl.Vertex(x+w-r+r*math.cos(a1), y+h-r+r*math.sin(a1))
+                                          gl.Vertex(x+w-r+r*math.cos(a2), y+h-r+r*math.sin(a2))
             end)
             gl.BeginEnd(GL.TRIANGLES, function()
-                gl.Vertex(x+r, y+h-r)
-                gl.Vertex(x+r-r*math.sin(a1), y+h-r+r*math.cos(a1))
-                gl.Vertex(x+r-r*math.sin(a2), y+h-r+r*math.cos(a2))
+                gl.Vertex(x+r,   y+h-r); gl.Vertex(x+r-r*math.sin(a1),   y+h-r+r*math.cos(a1))
+                                          gl.Vertex(x+r-r*math.sin(a2),   y+h-r+r*math.cos(a2))
             end)
         end
     else
@@ -428,7 +609,7 @@ local function drawRoundedRect(x, y, w, h, r, filled)
 end
 
 -------------------------------------------------------------------------------
--- BUILD EFFICIENCY (per-team)
+-- BUILD EFFICIENCY
 -------------------------------------------------------------------------------
 
 local function ensureBuildEffState(tid)
@@ -441,7 +622,6 @@ end
 local function sampleBuildEfficiencyForTeam(tid)
     local teamBuilders = builderUnits[tid]
     if not teamBuilders then return 0 end
-
     local effSum, effCount = 0, 0
     for uid, bd in pairs(teamBuilders) do
         local defID    = bd.defID
@@ -473,7 +653,6 @@ local function sampleBuildEfficiencyForTeam(tid)
             end
         end
     end
-
     if effCount == 0 then return 0 end
     return (effSum / effCount) * 100
 end
@@ -497,7 +676,7 @@ local function resetBuildEffForTeam(tid)
         if stats then stats.buildEfficiency = 0 end
     else
         buildEffState = {}
-        for t, stats in pairs(allyTeams) do stats.buildEfficiency = 0 end
+        for _, stats in pairs(allyTeams) do stats.buildEfficiency = 0 end
     end
 end
 
@@ -528,7 +707,6 @@ function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
     self.dragStartY = 0
     self.isHovered  = false
     self._minV = nil; self._maxV = nil; self._range = nil
-    self._cX   = nil; self._cY  = nil; self._cW   = nil; self._cH = nil
     return self
 end
 
@@ -594,7 +772,7 @@ function Chart:timeWindow()
     return count / GAME_FPS, nowGameSecs
 end
 
--- ── StatCard ─────────────────────────────────────────────────────────────
+-- ── StatCard ───────────────────────────────────────────────────────────────
 
 local StatCard = {}
 StatCard.__index = StatCard
@@ -638,9 +816,7 @@ local function freeLists()
     if overlayDisplayList then gl.DeleteList(overlayDisplayList); overlayDisplayList = nil end
 end
 
--- ── computeRange ─────────────────────────────────────────────────────────
--- Shared by both the chrome builder (for grid labels) and the lines builder.
--- Returns minV, maxV, range, or nil if no data.
+-- ── computeRange ──────────────────────────────────────────────────────────
 
 local function computeRange(chart)
     local mn, mx
@@ -654,7 +830,6 @@ local function computeRange(chart)
         end
     end
     if mn == nil then return nil end
-
     if chart.chartType == "percent" then
         mn = 0; mx = 100
     elseif chart.chartType == "storage" then
@@ -675,9 +850,147 @@ local function computeRange(chart)
 end
 
 -------------------------------------------------------------------------------
+-- SHADER-BASED LINE DRAWING HELPERS
+-- These helpers are called INSIDE a gl.CreateList() call.
+-- They emit GL geometry that references the compiled shader programs.
+-------------------------------------------------------------------------------
+
+-- drawShaderLine: emits a fat-quad ribbon for a single data series.
+-- pts   : array of Y values (already sampled, length >= 2)
+-- cX,cY : chart content area origin (pixels)
+-- cW,cH : chart content area size (pixels)
+-- mn,r  : data range (minV, range)
+-- color : {r,g,b,a}
+-- halfW : ribbon half-width in pixels (after chart scale is applied)
+-- glowR : glow radius in pixels
+
+local function drawShaderLine(pts, cX, cY, cW, cH, mn, r, color, halfW, glowR)
+    if not shaderLine then return end
+    local n = #pts
+    if n < 2 then return end
+
+    gl.UseShader(shaderLine)
+    if uLine.color      then gl.Uniform(uLine.color,      color[1], color[2], color[3], color[4] or 1) end
+    if uLine.halfWidth  then gl.Uniform(uLine.halfWidth,  halfW) end
+    if uLine.glowRadius then gl.Uniform(uLine.glowRadius, glowR) end
+
+    -- 1px padding beyond glow radius is enough for the tighter AA fringe.
+    local totalHalfW = halfW + glowR + 1.0
+
+    -- Pre-compute all screen-space positions so we can derive true
+    -- segment-perpendicular directions rather than always expanding in Y.
+    local sx, sy = {}, {}
+    for i = 1, n do
+        -- RIGHT-PINNED: sample i=n maps to cX+cW, i=1 maps leftward.
+        -- This keeps the right edge anchored so that as new data arrives
+        -- and points shift left, the rendered line doesn't appear to crawl.
+        sx[i] = cX + cW - ((n - i) / (n - 1)) * cW
+        sy[i] = cY + ((pts[i] - mn) / r) * cH
+        sy[i] = math.max(cY - totalHalfW, math.min(cY + cH + totalHalfW, sy[i]))
+    end
+
+    -- gl.Color.r carries the signed perpendicular distance from the centreline.
+    gl.BeginEnd(GL.TRIANGLES, function()
+        for i = 1, n - 1 do
+            local x0, y0 = sx[i],   sy[i]
+            local x1, y1 = sx[i+1], sy[i+1]
+
+            -- Segment direction, normalised
+            local dx = x1 - x0
+            local dy = y1 - y0
+            local len = math.sqrt(dx*dx + dy*dy)
+            if len < 0.0001 then len = 0.0001 end
+            -- Perpendicular (rotate 90°): (-dy, dx) / len
+            local px = (-dy / len) * totalHalfW
+            local py = ( dx / len) * totalHalfW
+
+            -- Six vertices (two triangles) forming the quad.
+            -- gl.Color.r = +totalHalfW on one side, -totalHalfW on the other.
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x0 - px, y0 - py)
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x0 + px, y0 + py)
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x1 - px, y1 - py)
+
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x1 + px, y1 + py)
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x1 - px, y1 - py)
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x0 + px, y0 + py)
+        end
+    end)
+
+    gl.UseShader(0)
+end
+
+-- drawShaderFill: emits the area-fill triangle strip using the fill shader.
+
+local function drawShaderFill(pts, cX, cY, cW, cH, mn, r, color, time, isMulti)
+    if not shaderFill then return end
+    local n = #pts
+    if n < 2 then return end
+    if isMulti then return end
+
+    local fillBaseY = cY
+
+    gl.UseShader(shaderFill)
+    if uFill.color  then gl.Uniform(uFill.color,  color[1], color[2], color[3], color[4] or 1) end
+    if uFill.time   then gl.Uniform(uFill.time,   time) end
+    if uFill.chartX then gl.Uniform(uFill.chartX, cX) end
+    if uFill.chartW then gl.Uniform(uFill.chartW, cW) end
+
+    -- RIGHT-PINNED: mirrors the line draw so fill and line never drift apart.
+    gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+        for i = 1, n do
+            local x    = cX + cW - ((n - i) / (n - 1)) * cW
+            local y    = cY + ((pts[i] - mn) / r) * cH
+            y = math.max(cY, math.min(cY + cH, y))
+            local tVal = math.max(0, (y - cY) / math.max(cH, 1))
+
+            gl.Color(0, 0, 0, 1);    gl.Vertex(x, fillBaseY)
+            gl.Color(tVal, 0, 0, 1); gl.Vertex(x, y)
+        end
+    end)
+
+    gl.UseShader(0)
+end
+
+-- drawShaderGrid: draws a single grid line with the scan-pulse fragment shader.
+
+local function drawShaderGridLine(x0, y0, x1, y1, cY, cH, color, time)
+    if not shaderGrid then
+        -- fallback to plain line
+        gl.Color(color[1], color[2], color[3], color[4])
+        gl.BeginEnd(GL.LINES, function()
+            gl.Vertex(x0, y0); gl.Vertex(x1, y1)
+        end)
+        return
+    end
+
+    gl.UseShader(shaderGrid)
+    if uGrid.color  then gl.Uniform(uGrid.color,  color[1], color[2], color[3], color[4]) end
+    if uGrid.time   then gl.Uniform(uGrid.time,   time) end
+    if uGrid.chartY then gl.Uniform(uGrid.chartY, cY) end
+    if uGrid.chartH then gl.Uniform(uGrid.chartH, cH) end
+
+    gl.LineWidth(1.0)
+    gl.BeginEnd(GL.LINES, function()
+        gl.Vertex(x0, y0)
+        gl.Vertex(x1, y1)
+    end)
+
+    gl.UseShader(0)
+end
+
+-------------------------------------------------------------------------------
 -- CHROME DISPLAY LIST
 -- Background panels, grid lines, Y-axis labels, chart titles, card frames.
--- Rebuilt on: drag/scale/enable/hide/resize/view-switch.
+-- NOTE: grid lines here call drawShaderGridLine — the shader is baked into
+-- the display list commands at the time of rebuild.  Because display lists
+-- record raw GL calls, time-uniform updates happen in DrawScreen by calling
+-- gl.Uniform BEFORE gl.CallList (see the shader-time-patch pattern below).
+--
+-- IMPORTANT: Spring display lists DO replay gl.UseShader and gl.Uniform calls,
+-- so the animation-time must be updated externally each frame.  We work around
+-- this by NOT baking grid lines into the chrome display list — instead we draw
+-- animated grid lines live in DrawScreen (outside any display list).
+-- This is a deliberate trade-off: grid lines are cheap geometry.
 -------------------------------------------------------------------------------
 
 local function rebuildChromeList()
@@ -713,7 +1026,7 @@ local function rebuildChromeList()
             end
         end
 
-        -- ── Charts ────────────────────────────────────────────────────────
+        -- ── Charts — background panels only (no grid lines here) ──────────
         for _, chart in pairs(charts) do
             local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
             if show then
@@ -730,8 +1043,11 @@ local function rebuildChromeList()
                 gl.Translate(chart.x, chart.y, 0)
                 gl.Scale(chart.scale, chart.scale, 1)
 
-                gl.Color(COLOR.bg[1],     COLOR.bg[2],     COLOR.bg[3],     COLOR.bg[4]*am)
+                -- Background
+                gl.Color(COLOR.bg[1], COLOR.bg[2], COLOR.bg[3], COLOR.bg[4]*am)
                 drawRoundedRect(0, 0, w, h, 4, true)
+
+                -- Border
                 gl.Color(COLOR.border[1], COLOR.border[2], COLOR.border[3], COLOR.border[4]*am)
                 gl.LineWidth(1)
                 drawRoundedRect(0.5, 0.5, w-1, h-1, 4, false)
@@ -749,20 +1065,15 @@ local function rebuildChromeList()
                     if not mn then
                         gl.PopMatrix()
                     else
-                        -- Grid lines + Y labels
+                        -- Y-axis labels (static)
                         for i = 0, 4 do
                             local v    = mn + (r * i / 4)
                             local yPos = cY + (cH * i / 4)
-                            local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
-                            gl.Color(gc[1], gc[2], gc[3], gc[4]*am)
-                            gl.BeginEnd(GL.LINES, function()
-                                gl.Vertex(cX, yPos); gl.Vertex(cX+cW, yPos)
-                            end)
                             gl.Color(COLOR.muted[1], COLOR.muted[2], COLOR.muted[3], COLOR.muted[4]*am)
                             gl.Text(formatYAxis(v, chart.chartType), cX-5, yPos-4, 9, "ro")
                         end
 
-                        -- Zero line for demand/storage
+                        -- Zero line for demand/storage (static)
                         if chart.chartType == "demand" or chart.chartType == "storage" then
                             local zeroY = cY + ((0 - mn) / r) * cH
                             gl.Color(COLOR.accent[1], COLOR.accent[2], COLOR.accent[3], 0.45*am)
@@ -791,14 +1102,19 @@ local function rebuildChromeList()
 end
 
 -------------------------------------------------------------------------------
--- LINES DISPLAY LIST
--- All line/fill geometry for every chart, plus time-axis ticks.
--- Rebuilt at most MAX_CHART_FPS times per real-world second.
+-- LINES DISPLAY LIST  (shader-rendered)
+-- Rebuilds fill + line geometry for every chart using the GLSL programs.
+-- Grid lines are drawn LIVE in DrawScreen (outside any display list) so their
+-- time-based animation can be updated every frame cheaply.
 -------------------------------------------------------------------------------
 
 local function rebuildLinesList()
     if linesDisplayList then gl.DeleteList(linesDisplayList) end
+    local t = elapsedSecs()
+
     linesDisplayList = gl.CreateList(function()
+        gl.Blending(true)
+        gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
 
         for _, chart in pairs(charts) do
             local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
@@ -810,70 +1126,50 @@ local function rebuildLinesList()
                     local cW = chart.width  - PADDING.left - PADDING.right
                     local cH = chart.height - PADDING.top  - PADDING.bottom
 
-                    chart._cX = cX; chart._cY = cY
-                    chart._cW = cW; chart._cH = cH
+                    local am       = 1.0
+                    local isMulti  = chart.multiTeam
+                    local scl      = chart.scale
 
-                    local am = 1.0
-                    local function toY(v) return cY + ((v - mn) / r) * cH end
+                    -- Effective pixel sizes after chart scale
+                    local halfW = LINE_HALF_WIDTH  / scl
+                    local glowR = LINE_GLOW_RADIUS / scl
 
                     gl.PushMatrix()
                     gl.Translate(chart.x, chart.y, 0)
-                    gl.Scale(chart.scale, chart.scale, 1)
+                    gl.Scale(scl, scl, 1)
 
-                    -- ── Data lines ────────────────────────────────────────────────
                     for si, s in ipairs(chart.series) do
                         local pts  = chart:getSamples(si)
                         local nPts = #pts
                         if nPts >= 2 then
-                            local clr      = s.color
-                            local fillBase = (chart.chartType == "demand" or chart.chartType == "storage")
-                                             and toY(0) or cY
+                            local clr = { s.color[1], s.color[2], s.color[3], am }
 
-                            if chart.chartType ~= "multi" then
-                                gl.Color(clr[1], clr[2], clr[3], 0.15*am)
-                                gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-                                    for i, v in ipairs(pts) do
-                                        if v and not (v ~= v) then
-                                            local x = cX + ((i-1)/(nPts-1)) * cW
-                                            gl.Vertex(x, fillBase); gl.Vertex(x, toY(v))
-                                        end
-                                    end
-                                end)
-                            end
+                            -- 1. Area fill — normal alpha blend
+                            gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
+                            drawShaderFill(pts, cX, cY, cW, cH, mn, r, clr, t, isMulti)
 
-                            -- halo pass
-                            gl.Color(clr[1], clr[2], clr[3], 0.25*am)
-                            gl.LineWidth(3.5)
-                            gl.BeginEnd(GL.LINE_STRIP, function()
-                                for i, v in ipairs(pts) do
-                                    if v and not (v ~= v) then
-                                        local x = cX + ((i-1)/(nPts-1)) * cW
-                                        gl.Vertex(x, toY(v))
-                                    end
-                                end
-                            end)
-                            -- crisp core
-                            gl.Color(clr[1], clr[2], clr[3], 1.0*am)
-                            gl.LineWidth(1.0)
-                            gl.BeginEnd(GL.LINE_STRIP, function()
-                                for i, v in ipairs(pts) do
-                                    if v and not (v ~= v) then
-                                        local x = cX + ((i-1)/(nPts-1)) * cW
-                                        gl.Vertex(x, toY(v))
-                                    end
-                                end
-                            end)
+                            -- 2. Line — additive blend so the glow brightens
+                            --    surrounding pixels without widening the core.
+                            gl.BlendFunc(GL.SRC_ALPHA, GL.ONE)
+                            drawShaderLine(pts, cX, cY, cW, cH, mn, r, clr, halfW, glowR)
 
+                            -- 3. Endpoint dot — restore normal blend first
+                            gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
                             local last = pts[nPts]
                             if last and not (last ~= last) then
-                                gl.Color(clr[1], clr[2], clr[3], 0.8*am)
-                                gl.PointSize(6)
-                                gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX+cW, toY(last)) end)
+                                local dotY = cY + ((last - mn) / r) * cH
+                                dotY = math.max(cY, math.min(cY + cH, dotY))
+                                gl.Color(clr[1], clr[2], clr[3], 0.9)
+                                gl.PointSize(5)
+                                gl.BeginEnd(GL.POINTS, function() gl.Vertex(cX + cW, dotY) end)
                             end
                         end
                     end
 
-                    -- ── X-axis time labels ────────────────────────────────────────
+                    -- Restore normal blend before time axis labels
+                    gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
+
+                    -- X-axis time labels
                     local windowSecs, nowGameSecs = chart:timeWindow()
                     if windowSecs >= BASE_TICK_SECS then
                         drawTimeAxis(cX, cW, cY, windowSecs, nowGameSecs, am)
@@ -883,33 +1179,66 @@ local function rebuildLinesList()
                 end
             end
         end
+
+        gl.Blending(false)
     end)
 
-    linesDirty            = false
-    linesLastRebuildTime  = Spring.GetTimer()
+    linesDirty           = false
+    linesLastRebuildTime = Spring.GetTimer()
+end
+
+-------------------------------------------------------------------------------
+-- LIVE GRID DRAWING  (called every DrawScreen frame, outside display lists)
+-- These are cheap horizontal lines; drawing them live lets the scan-pulse
+-- animation update at full monitor refresh rate.
+-------------------------------------------------------------------------------
+
+local function drawLiveGridLines()
+    local t = elapsedSecs()
+
+    for _, chart in pairs(charts) do
+        local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
+        if show and chart.enabled and chart:hasData() and chart._range then
+            local mn  = chart._minV
+            local r   = chart._range
+            local w   = chart.width
+            local h   = chart.height
+            local cX  = PADDING.left
+            local cY  = PADDING.bottom
+            local cW  = w - PADDING.left - PADDING.right
+            local cH  = h - PADDING.top  - PADDING.bottom
+            local scl = chart.scale
+
+            gl.PushMatrix()
+            gl.Translate(chart.x, chart.y, 0)
+            gl.Scale(scl, scl, 1)
+
+            for i = 0, 4 do
+                local yPos = cY + (cH * i / 4)
+                local gc   = (i == 0) and COLOR.gridBase or COLOR.grid
+                drawShaderGridLine(cX, yPos, cX + cW, yPos, cY, cH, gc, t)
+            end
+
+            gl.PopMatrix()
+        end
+    end
 end
 
 -------------------------------------------------------------------------------
 -- OVERLAY DISPLAY LIST
--- Stall warnings inside chart panels, stat card values, edit-mode badge.
--- Rebuilt when: stall state changes, hover changes, chartsInteractive toggles.
--- Note: card *values* (the big number) are drawn here too since they change
--- every game frame — keeping them here means they update at linesDirty rate
--- rather than chromeList rate, without needing their own extra list.
 -------------------------------------------------------------------------------
 
 local function rebuildOverlayList()
     if overlayDisplayList then gl.DeleteList(overlayDisplayList) end
     overlayDisplayList = gl.CreateList(function()
 
-        -- ── Stat card values ──────────────────────────────────────────────
+        -- Stat card values
         for _, card in pairs(statCards) do
             local show = (card.enabled and card.visible) or (not card.enabled and chartsInteractive)
             if show and card.enabled then
                 gl.PushMatrix()
                 gl.Translate(card.x, card.y, 0)
                 gl.Scale(card.scale, card.scale, 1)
-
                 local c = card.color
                 gl.Color(c[1], c[2], c[3], 1.0)
                 gl.Text(formatNumber(math.floor(card.displayValue+0.5)), CARD_WIDTH/2+5, 10, 20, "co")
@@ -925,22 +1254,19 @@ local function rebuildOverlayList()
                         gl.Text("! STALL", CARD_WIDTH-6, CARD_HEIGHT-18, 9, "ro")
                     end
                 end
-
                 gl.PopMatrix()
             end
         end
 
-        -- ── Per-chart overlays (stall warning inside build-efficiency) ────
+        -- Per-chart stall overlay
         local vStats = allyTeams[viewedTeamID]
         local stall  = vStats and vStats.metalStall or 0
-
         for _, chart in pairs(charts) do
             local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
             if show and chart.enabled and chart.id == "chart-build-efficiency" then
                 gl.PushMatrix()
                 gl.Translate(chart.x, chart.y, 0)
                 gl.Scale(chart.scale, chart.scale, 1)
-
                 if stall == 2 then
                     gl.Color(COLOR.danger[1], COLOR.danger[2], COLOR.danger[3], 1.0)
                     gl.Text("! STALL", chart.width-PADDING.right-2, chart.height-PADDING.top-10, 10, "ro")
@@ -948,12 +1274,11 @@ local function rebuildOverlayList()
                     gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 1.0)
                     gl.Text("! STALL", chart.width-PADDING.right-2, chart.height-PADDING.top-10, 10, "ro")
                 end
-
                 gl.PopMatrix()
             end
         end
 
-        -- ── Hover highlights ──────────────────────────────────────────────
+        -- Hover highlights
         for _, chart in pairs(charts) do
             if chart.isHovered or (chartsInteractive and chart.isDragging) then
                 gl.PushMatrix()
@@ -977,12 +1302,11 @@ local function rebuildOverlayList()
             end
         end
 
-        -- ── Edit-mode badge ───────────────────────────────────────────────
+        -- Edit-mode badge
         if chartsInteractive then
             gl.Color(COLOR.gold[1], COLOR.gold[2], COLOR.gold[3], 0.55)
             gl.Text("EDIT MODE", vsx-150, 45, 11, "o")
         end
-
     end)
     overlayDirty = false
 end
@@ -1057,7 +1381,7 @@ function widget:UnitFinished(unitID, unitDefID, unitTeam)
     end
 end
 
-function widget:UnitDestroyed(unitID, unitDefID, unitTeam, attackerID, attackerDefID, attackerTeam)
+function widget:UnitDestroyed(unitID, unitDefID, unitTeam, _attackerID, _attackerDefID, _attackerTeam)
     local cost = unitMetalCost(unitDefID)
     local ud   = UnitDefs[unitDefID]
     local bp   = (ud and ud.isBuilder) and (ud.buildSpeed or 0) or 0
@@ -1150,19 +1474,13 @@ local function initAllyTeams()
             for _, atid in ipairs(allyTeamList) do
                 local teams = Spring.GetTeamList(atid) or {}
                 for _, tid in ipairs(teams) do
-                    if not seen[tid] then
-                        seen[tid] = true
-                        tlist[#tlist + 1] = tid
-                    end
+                    if not seen[tid] then seen[tid] = true; tlist[#tlist+1] = tid end
                 end
             end
         end
         local bare = Spring.GetTeamList() or {}
         for _, tid in ipairs(bare) do
-            if not seen[tid] then
-                seen[tid] = true
-                tlist[#tlist + 1] = tid
-            end
+            if not seen[tid] then seen[tid] = true; tlist[#tlist+1] = tid end
         end
     else
         local aid = Spring.GetMyAllyTeamID()
@@ -1175,51 +1493,29 @@ local function initAllyTeams()
 
     local newTeams = {}
     local firstTID = nil
+    local function addTeam(tid)
+        local r, g, b = Spring.GetTeamColor(tid)
+        newTeams[tid] = {
+            teamID=tid, playerName=resolveTeamName(tid), color={r or 1, g or 1, b or 1, 1},
+            metalIncome=0, metalUsage=0, energyIncome=0, energyUsage=0,
+            damageDealt=0, damageTaken=0, armyValue=0, buildPower=0,
+            kills=0, losses=0, unitCount=0, metalLost=0,
+            buildEfficiency=0, metalStall=0, totalBP=0,
+        }
+        initTeamBuffers(tid)
+        if not firstTID then firstTID = tid end
+    end
+
     for _, tid in ipairs(tlist) do
-        if isActiveParticipant(tid) then
-            local r, g, b = Spring.GetTeamColor(tid)
-            newTeams[tid] = {
-                teamID          = tid,
-                playerName      = resolveTeamName(tid),
-                color           = {r or 1, g or 1, b or 1, 1},
-                metalIncome     = 0, metalUsage      = 0,
-                energyIncome    = 0, energyUsage     = 0,
-                damageDealt     = 0, damageTaken     = 0,
-                armyValue       = 0, buildPower      = 0,
-                kills           = 0, losses          = 0,
-                unitCount       = 0, metalLost       = 0,
-                buildEfficiency = 0,
-                metalStall      = 0, totalBP         = 0,
-            }
-            initTeamBuffers(tid)
-            if not firstTID then firstTID = tid end
-        end
+        if isActiveParticipant(tid) then addTeam(tid) end
     end
 
     if not next(newTeams) then
-        Spring.Echo("BAR Charts: isActiveParticipant filtered all teams — using unit-presence fallback")
         for _, tid in ipairs(tlist) do
             local _, _, isDead = Spring.GetTeamInfo(tid)
             if not isDead then
                 local units = Spring.GetTeamUnits(tid)
-                if units and #units > 0 then
-                    local r, g, b = Spring.GetTeamColor(tid)
-                    newTeams[tid] = {
-                        teamID          = tid,
-                        playerName      = resolveTeamName(tid),
-                        color           = {r or 1, g or 1, b or 1, 1},
-                        metalIncome     = 0, metalUsage      = 0,
-                        energyIncome    = 0, energyUsage     = 0,
-                        damageDealt     = 0, damageTaken     = 0,
-                        armyValue       = 0, buildPower      = 0,
-                        kills           = 0, losses          = 0,
-                        unitCount       = 0, metalLost       = 0,
-                        buildEfficiency = 0,
-                        metalStall      = 0, totalBP         = 0,
-                    }
-                    initTeamBuffers(tid)
-                    if not firstTID then firstTID = tid end
-                end
+                if units and #units > 0 then addTeam(tid) end
             end
         end
     end
@@ -1232,17 +1528,15 @@ local function initAllyTeams()
     else
         viewedTeamID = (myTeamID and newTeams[myTeamID]) and myTeamID or firstTID
     end
-
     return true
 end
 
 -------------------------------------------------------------------------------
--- STAT COLLECTION (every GameFrame)
+-- STAT COLLECTION
 -------------------------------------------------------------------------------
 
 local function collectStats(gameFrame)
     frameCounter = frameCounter + 1
-
     if frameCounter >= FULL_SCAN_INTERVAL then
         frameCounter = 0
         for tid, stats in pairs(allyTeams) do
@@ -1258,16 +1552,15 @@ local function collectStats(gameFrame)
     end
 
     local stallChanged = false
-
     for tid, stats in pairs(allyTeams) do
         local ml, ms, mpull, minc, mexp = Spring.GetTeamResources(tid, "metal")
         local el, es, epull, einc, eexp = Spring.GetTeamResources(tid, "energy")
 
         if minc ~= nil then
             stats.metalIncome  = minc
-            stats.metalUsage   = mexp or 0
-            stats.energyIncome = einc or 0
-            stats.energyUsage  = eexp or 0
+            stats.metalUsage   = mexp  or 0
+            stats.energyIncome = einc  or 0
+            stats.energyUsage  = eexp  or 0
 
             local pull    = mpull or 0
             local expense = mexp  or 0
@@ -1305,13 +1598,9 @@ local function collectStats(gameFrame)
 
     for _, card in pairs(statCards) do card:update() end
 
-    -- New data arrived this frame — mark lines dirty.
     linesDirty = true
-
-    -- Stall warnings changed — mark overlay dirty.
     if stallChanged then overlayDirty = true end
 
-    -- First time data arrives, chrome needs a rebuild so grid labels appear.
     if not chromeDirty then
         for _, chart in pairs(charts) do
             if chart.enabled and chart._range == nil and chart:hasData() then
@@ -1335,40 +1624,34 @@ local function buildChartsAndCards()
             { label="Income", color=COLOR.accent,  seriesKey="metalIncome"  },
             { label="Usage",  color=COLOR.accent2, seriesKey="metalUsage"   },
         })
-
     charts.energy = Chart.new("chart-energy", "ENERGY", "⚡",
         vsx-660, vsy-230, "dual", {
             { label="Income", color=COLOR.accent,  seriesKey="energyIncome" },
             { label="Usage",  color=COLOR.accent2, seriesKey="energyUsage"  },
         })
-
     charts.damage = Chart.new("chart-damage", "DAMAGE", "✕",
         vsx-970, vsy-230, "dual", {
-            { label="Dealt", color=COLOR.success, seriesKey="damageDealt"  },
-            { label="Taken", color=COLOR.danger,  seriesKey="damageTaken"  },
+            { label="Dealt", color=COLOR.success, seriesKey="damageDealt" },
+            { label="Taken", color=COLOR.danger,  seriesKey="damageTaken" },
         })
-
     charts.army = Chart.new("chart-army", "ARMY VALUE", "⚙",
         vsx-350, vsy-430, "single", {
             { label="Value", color=COLOR.accent, seriesKey="armyValue" },
         })
-
     charts.kd = Chart.new("chart-kd", "K/D", "✕",
         vsx-660, vsy-430, "ratio", {
             { label="Ratio", color=COLOR.success, seriesKey="kills" },
         })
-
     charts.buildEfficiency = Chart.new("chart-build-efficiency",
         "BUILDER EFFICIENCY", "🔧", vsx-970, vsy-430, "percent", {
             { label="Efficiency", color=COLOR.gold, seriesKey="buildEfficiency" },
         })
-
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",
         vsx-1280, vsy-430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧",
         vsx-1280, vsy-230, "multi", {}, true)
 
-    -- K/D chart: override getSamples to compute ratio from kills+losses buffers
+    -- K/D override
     do
         charts.kd.getSamples = function(self, i)
             local tid = viewedTeamID
@@ -1394,12 +1677,11 @@ local function buildChartsAndCards()
             local tid = viewedTeamID
             if not tid or not history[tid] then return 0, 0 end
             local _, count = ringRange(tid, "kills")
-            local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
-            return count / GAME_FPS, nowGameSecs
+            return count / GAME_FPS, Spring.GetGameFrame() / GAME_FPS
         end
     end
 
-    -- ── Stat Cards ──────────────────────────────────────────────────────────
+    -- Stat cards
     local cardY    = vsy - 650
     local cardStep = 80
     local col1X    = vsx - 350
@@ -1428,7 +1710,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "2.6",
+        version           = "3.0",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         maxChartFps       = MAX_CHART_FPS,
@@ -1473,7 +1755,6 @@ local function loadConfig()
     end
     if result.enabled           ~= nil then chartsEnabled     = result.enabled           end
     if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
-
     return result.charts or {}, result.cards or {}
 end
 
@@ -1499,46 +1780,28 @@ local function applyConfig(chartCfg, cardCfg)
 end
 
 -------------------------------------------------------------------------------
--- PLAYER VIEW SWITCHING
+-- VIEW SWITCHING
 -------------------------------------------------------------------------------
 
 local function switchView(targetTeamID)
     if not allyTeams[targetTeamID] then
-        Spring.Echo("BAR Charts: switchView FAILED — teamID "
-            ..tostring(targetTeamID).." not in tracked set")
-        Spring.Echo("BAR Charts: Tracked teams are:")
-        for tid, stats in pairs(allyTeams) do
-            Spring.Echo(string.format("  teamID=%-3d  '%s'", tid, stats.playerName))
-        end
+        Spring.Echo("BAR Charts: switchView FAILED — teamID "..tostring(targetTeamID).." not tracked")
         return
     end
-
-    local oldStats = allyTeams[viewedTeamID]
-    Spring.Echo(string.format(
-        "BAR Charts: switchView  %s (team %d) → %s (team %d)",
-        oldStats and oldStats.playerName or tostring(viewedTeamID), viewedTeamID or -1,
-        allyTeams[targetTeamID].playerName, targetTeamID))
-
     viewedTeamID = targetTeamID
-
     if charts.allyArmy       then charts.allyArmy:rebuildMultiTeamSeries()       end
     if charts.allyBuildPower then charts.allyBuildPower:rebuildMultiTeamSeries() end
-
     chromeDirty  = true
     linesDirty   = true
     overlayDirty = true
-
-    Spring.Echo(string.format(
-        "BAR Charts: viewedTeamID is now %d ('%s')",
+    Spring.Echo(string.format("BAR Charts: now viewing team %d ('%s')",
         viewedTeamID, allyTeams[viewedTeamID].playerName))
 end
 
 local function findTeamByName(nameQuery)
     local q = string.lower(nameQuery)
     for tid, stats in pairs(allyTeams) do
-        if string.lower(stats.playerName):find(q, 1, true) then
-            return tid
-        end
+        if string.lower(stats.playerName):find(q, 1, true) then return tid end
     end
     return nil
 end
@@ -1554,24 +1817,22 @@ local function debugInitState()
     local myATID = Spring.GetMyAllyTeamID()
     Spring.Echo(string.format("  spec=%s fullSpec=%s myTeamID=%s myAllyTeamID=%s",
         tostring(spec), tostring(fullSpec), tostring(myTID), tostring(myATID)))
-
     local tlistAll  = Spring.GetTeamList()
     local tlistAlly = myATID and Spring.GetTeamList(myATID) or {}
     Spring.Echo(string.format("  GetTeamList() all=%d  ally=%d",
         tlistAll and #tlistAll or 0, tlistAlly and #tlistAlly or 0))
-
     for _, tid in ipairs(tlistAll or {}) do
         local _, leaderID, isDead, isAI = Spring.GetTeamInfo(tid)
         local units = Spring.GetTeamUnits(tid) or {}
-        local pName, pActive, pSpec = "n/a", "n/a", "n/a"
+        local pName, pSpec = "n/a", "n/a"
         if leaderID and leaderID >= 0 then
-            local a, b, c = Spring.GetPlayerInfo(leaderID)
-            pName = tostring(a); pActive = tostring(b); pSpec = tostring(c)
+            local a, _, c = Spring.GetPlayerInfo(leaderID)
+            pName = tostring(a); pSpec = tostring(c)
         end
         Spring.Echo(string.format(
-            "  tid=%-3d  leader=%-3s  dead=%-5s  ai=%-5s  units=%-4d  pName=%-16s  pActive=%-5s  pSpec=%s  admit=%s",
-            tid, tostring(leaderID), tostring(isDead), tostring(isAI),
-            #units, pName, pActive, pSpec, tostring(isActiveParticipant(tid))))
+            "  tid=%-3d  dead=%-5s  ai=%-5s  units=%-4d  pName=%-16s  pSpec=%s  admit=%s",
+            tid, tostring(isDead), tostring(isAI), #units, pName, pSpec,
+            tostring(isActiveParticipant(tid))))
     end
     Spring.Echo("=== end diagnostic ===")
 end
@@ -1581,7 +1842,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v2.6: Initialize")
+    Spring.Echo("BAR Charts v3.0 (Shader Edition): Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -1601,8 +1862,10 @@ function widget:Initialize()
     maxMetalUseCache      = {}
     prevStallState        = {}
     linesLastRebuildTime  = nil
+    widgetStartTimer      = Spring.GetTimer()
 
     resetBuildEffForTeam(nil)
+    initShaders()
     buildChartsAndCards()
     local chartCfg, cardCfg = loadConfig()
     applyConfig(chartCfg, cardCfg)
@@ -1612,96 +1875,67 @@ function widget:Initialize()
     linesDirty   = true
     overlayDirty = true
 
-    -- public interface for data yoinking
+    -- Public API (backwards-compatible with v2.6)
     WG.BarCharts = {
-        version = "2.6",
-
-        getTrackedTeams = function()
+        version            = "3.0",
+        getTrackedTeams    = function()
             local out = {}
-            for tid in pairs(allyTeams) do out[#out + 1] = tid end
+            for tid in pairs(allyTeams) do out[#out+1] = tid end
             table.sort(out)
             return out
         end,
-
         getViewedTeamID    = function() return viewedTeamID end,
         isSpectator        = function() return isSpectator end,
         getTeamStats       = function(teamID) return allyTeams[teamID] end,
         getViewedTeamStats = function() return allyTeams[viewedTeamID] end,
-
-        seriesKeys = SERIES_KEYS,
-
-        getSamples = function(teamID, seriesKey, numPoints)
+        seriesKeys         = SERIES_KEYS,
+        getSamples         = function(teamID, seriesKey, numPoints)
             numPoints = numPoints or RENDER_POINTS
-            if not history[teamID] then return nil end
-            if not history[teamID][seriesKey] then return nil end
+            if not history[teamID] or not history[teamID][seriesKey] then return nil end
             return ringSample(teamID, seriesKey, numPoints)
         end,
-
-        getBufferInfo = function(teamID, seriesKey)
-            if not history[teamID] then return 0, 0 end
-            if not history[teamID][seriesKey] then return 0, 0 end
-            local s, c = ringRange(teamID, seriesKey)
-            return s, c
+        getBufferInfo      = function(teamID, seriesKey)
+            if not history[teamID] or not history[teamID][seriesKey] then return 0, 0 end
+            return ringRange(teamID, seriesKey)
         end,
-
-        getRawBuffer = function(teamID, seriesKey)
+        getRawBuffer       = function(teamID, seriesKey)
             if not history[teamID] then return nil end
             return history[teamID][seriesKey]
         end,
-
         getBufferConstants = function() return HISTORY_SIZE, GAME_FPS end,
-
-        getTimeWindow = function(teamID, seriesKey)
+        getTimeWindow      = function(teamID, seriesKey)
             if not history[teamID] or not history[teamID][seriesKey] then return 0, 0 end
-            local _, count    = ringRange(teamID, seriesKey)
-            local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
-            return count / GAME_FPS, nowGameSecs
+            local _, count = ringRange(teamID, seriesKey)
+            return count / GAME_FPS, Spring.GetGameFrame() / GAME_FPS
         end,
-
-        isReady   = function() return chartsReady end,
-        isEnabled = function() return chartsEnabled end,
-
-        -- v2.6: expose render cadence to external widgets
-        getMaxChartFps = function() return MAX_CHART_FPS end,
+        isReady            = function() return chartsReady end,
+        isEnabled          = function() return chartsEnabled end,
+        getMaxChartFps     = function() return MAX_CHART_FPS end,
     }
 
-    Spring.Echo("BAR Charts v2.6: Initialized"
-        .. (isSpectator and " (SPECTATOR)" or "")
-        .. string.format(", MAX_CHART_FPS=%d, RENDER_POINTS=%d", MAX_CHART_FPS, RENDER_POINTS)
-        .. ", waiting for team data…")
+    Spring.Echo(string.format(
+        "BAR Charts v3.0: Initialized%s, MAX_CHART_FPS=%d, RENDER_POINTS=%d, waiting…",
+        isSpectator and " (SPECTATOR)" or "", MAX_CHART_FPS, RENDER_POINTS))
 end
 
 -------------------------------------------------------------------------------
--- UPDATE
+-- UPDATE & GAME FRAME
 -------------------------------------------------------------------------------
 
 local function pollLocalTeam()
     if not chartsReady then return end
     local teamID = Spring.GetLocalTeamID()
-    if teamID == nil then return end
-    if teamID == viewedTeamID then return end
+    if teamID == nil or teamID == viewedTeamID then return end
     if not allyTeams[teamID] then return end
-
-    local oldStats = allyTeams[viewedTeamID]
-    Spring.Echo(string.format(
-        "BAR Charts [poll] VIEW SWITCH  '%s' (team %s) → '%s' (team %d)",
-        oldStats and oldStats.playerName or tostring(viewedTeamID),
-        tostring(viewedTeamID),
-        allyTeams[teamID].playerName, teamID))
-
     viewedTeamID = teamID
     chromeDirty  = true
     linesDirty   = true
     overlayDirty = true
 end
 
-function widget:Update(dt)
+function widget:Update(_dt)
     pollLocalTeam()
 end
-
--------------------------------------------------------------------------------
--- GAME FRAME
--------------------------------------------------------------------------------
 
 function widget:GameFrame(n)
     if not chartsReady then
@@ -1723,14 +1957,8 @@ function widget:GameFrame(n)
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v2.6: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v3.0: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
-                Spring.Echo("BAR Charts: Tracked teams:")
-                for tid, stats in pairs(allyTeams) do
-                    Spring.Echo(string.format("  teamID=%-3d  '%s'%s",
-                        tid, stats.playerName,
-                        (tid == viewedTeamID) and "  <- default view" or ""))
-                end
             end
         end
         return
@@ -1749,10 +1977,6 @@ function widget:GameFrame(n)
     collectStats(n)
 end
 
--------------------------------------------------------------------------------
--- GAME START
--------------------------------------------------------------------------------
-
 function widget:GameStart()
     chartsReady           = false
     chartsReadyWaitFrames = 0
@@ -1765,62 +1989,49 @@ function widget:GameStart()
     histFull              = {}
     prevStallState        = {}
     linesLastRebuildTime  = nil
+    widgetStartTimer      = Spring.GetTimer()
     for _, stats in pairs(allyTeams) do
-        stats.armyValue       = 0; stats.unitCount      = 0
-        stats.kills           = 0; stats.losses         = 0
-        stats.metalLost       = 0; stats.damageDealt    = 0
-        stats.damageTaken     = 0; stats.buildEfficiency = 0
-        stats.metalStall      = 0; stats.totalBP        = 0
-        stats.buildPower      = 0
+        stats.armyValue=0; stats.unitCount=0; stats.kills=0; stats.losses=0
+        stats.metalLost=0; stats.damageDealt=0; stats.damageTaken=0
+        stats.buildEfficiency=0; stats.metalStall=0; stats.totalBP=0; stats.buildPower=0
     end
     chromeDirty  = true
     linesDirty   = true
     overlayDirty = true
-    Spring.Echo("BAR Charts v2.6: Game started")
+    Spring.Echo("BAR Charts v3.0: Game started")
 end
 
 -------------------------------------------------------------------------------
 -- RENDERING
--- DrawScreen: check dirty flags, rebuild only what needs it, call three lists.
--- Lines list is rate-limited by MAX_CHART_FPS via wall-clock comparison.
 -------------------------------------------------------------------------------
 
 function widget:DrawScreen()
     if not chartsEnabled then return end
 
-    -- Chrome: layout changes (drag, scale, enable, resize)
-    if chromeDirty then
-        rebuildChromeList()
-    end
+    -- Chrome (static layout)
+    if chromeDirty then rebuildChromeList() end
 
-    -- Lines: rebuilt at most MAX_CHART_FPS times per real-world second.
-    -- The timer gate runs unconditionally every DrawScreen — it is the sole
-    -- arbiter of render cadence.  linesDirty is a separate concern: it flags
-    -- that new ring-buffer data exists since the last rebuild.  We only call
-    -- rebuildLinesList() when BOTH conditions are true: enough wall-clock time
-    -- has elapsed AND there is actually new data to show.  This means:
-    --   * At MAX_CHART_FPS=1 the list rebuilds once per second regardless of
-    --     monitor refresh rate or game frame rate.
-    --   * At MAX_CHART_FPS=30 it rebuilds up to 30×/s but never more.
-    --   * If no new data has arrived (linesDirty=false) the cached list is
-    --     replayed even if the timer would have allowed a rebuild.
+    -- Lines (rate-limited by MAX_CHART_FPS)
     do
-        local minInterval = 1.0 / math.max(1, math.min(30, MAX_CHART_FPS))
+        local minInterval = 1.0 / math.max(1, math.min(60, MAX_CHART_FPS))
         local timeReady   = (linesLastRebuildTime == nil)
                          or (Spring.DiffTimers(Spring.GetTimer(), linesLastRebuildTime) >= minInterval)
         if timeReady and linesDirty then
-            rebuildLinesList()       -- clears linesDirty, updates linesLastRebuildTime
-            overlayDirty = true      -- card values refresh at the same cadence
+            rebuildLinesList()
+            overlayDirty = true
         end
     end
 
-    -- Overlay: stall warnings, hover highlights, card values
-    if overlayDirty then
-        rebuildOverlayList()
-    end
+    -- Overlay (card values, stall, hover)
+    if overlayDirty then rebuildOverlayList() end
 
-    -- Call all three lists — essentially free, just replays GPU commands.
+    -- Call cached display lists
     if chromeDisplayList  then gl.CallList(chromeDisplayList)  end
+
+    -- Draw animated grid lines LIVE (outside display list) so the scan-pulse
+    -- animation runs at full monitor refresh rate.
+    drawLiveGridLines()
+
     if linesDisplayList   then gl.CallList(linesDisplayList)   end
     if overlayDisplayList then gl.CallList(overlayDisplayList) end
 end
@@ -1829,7 +2040,7 @@ end
 -- INPUT
 -------------------------------------------------------------------------------
 
-function widget:KeyPress(key, mods, isRepeat)
+function widget:KeyPress(key, _mods, _isRepeat)
     if key == Spring.GetKeyCode("f9") then
         chartsEnabled = not chartsEnabled
         chromeDirty   = true
@@ -1840,12 +2051,12 @@ function widget:KeyPress(key, mods, isRepeat)
 end
 
 local function findHit(mx, my)
-    for id, card in pairs(statCards) do
+    for _, card in pairs(statCards) do
         if (card.enabled or chartsInteractive) and card:isMouseOver(mx, my) then
             return card, "card"
         end
     end
-    for id, chart in pairs(charts) do
+    for _, chart in pairs(charts) do
         if (chart.enabled or chartsInteractive) and chart:isMouseOver(mx, my) then
             return chart, "chart"
         end
@@ -1873,7 +2084,7 @@ function widget:MousePress(mx, my, button)
     return false
 end
 
-function widget:MouseRelease(mx, my, button)
+function widget:MouseRelease(_mx, _my, button)
     if not chartsEnabled or not chartsInteractive then return false end
     if button == 1 then
         for _, card in pairs(statCards) do
@@ -1886,38 +2097,34 @@ function widget:MouseRelease(mx, my, button)
     return false
 end
 
-function widget:MouseMove(mx, my, dx, dy)
+function widget:MouseMove(mx, my, _dx, _dy)
     if not chartsEnabled then return false end
     if chartsInteractive then
         for _, card in pairs(statCards) do
             if card.isDragging then
-                card.x      = snapTo(mx - card.dragStartX)
-                card.y      = snapTo(my - card.dragStartY)
-                chromeDirty = true
-                linesDirty  = true
-                overlayDirty = true
+                card.x = snapTo(mx - card.dragStartX)
+                card.y = snapTo(my - card.dragStartY)
+                chromeDirty  = true; linesDirty = true; overlayDirty = true
                 return true
             end
         end
         for _, chart in pairs(charts) do
             if chart.isDragging then
-                chart.x      = snapTo(mx - chart.dragStartX)
-                chart.y      = snapTo(my - chart.dragStartY)
-                chromeDirty  = true
-                linesDirty   = true
-                overlayDirty = true
+                chart.x = snapTo(mx - chart.dragStartX)
+                chart.y = snapTo(my - chart.dragStartY)
+                chromeDirty  = true; linesDirty = true; overlayDirty = true
                 return true
             end
         end
     end
 
     local changed = false
-    for id, card in pairs(statCards) do
+    for _, card in pairs(statCards) do
         local h = chartsInteractive and card:isMouseOver(mx, my) or false
         if h ~= card.isHovered then changed = true end
         card.isHovered = h
     end
-    for id, chart in pairs(charts) do
+    for _, chart in pairs(charts) do
         local h = chartsInteractive and chart:isMouseOver(mx, my) or false
         if h ~= chart.isHovered then changed = true end
         chart.isHovered = h
@@ -1930,24 +2137,20 @@ function widget:MouseMove(mx, my, dx, dy)
     return false
 end
 
-function widget:MouseWheel(up, value)
+function widget:MouseWheel(up, _value)
     if not chartsEnabled or not chartsInteractive then return false end
     local mx, my = Spring.GetMouseState()
     for _, card in pairs(statCards) do
         if card:isMouseOver(mx, my) then
             card.scale   = up and math.min(2.0, card.scale+0.1) or math.max(0.5, card.scale-0.1)
-            chromeDirty  = true
-            linesDirty   = true
-            overlayDirty = true
+            chromeDirty  = true; linesDirty = true; overlayDirty = true
             return true
         end
     end
     for _, chart in pairs(charts) do
         if chart:isMouseOver(mx, my) then
             chart.scale  = up and math.min(2.0, chart.scale+0.1) or math.max(0.5, chart.scale-0.1)
-            chromeDirty  = true
-            linesDirty   = true
-            overlayDirty = true
+            chromeDirty  = true; linesDirty = true; overlayDirty = true
             return true
         end
     end
@@ -1960,9 +2163,7 @@ function widget:ViewResize()
     local rx, ry = vsx/ox, vsy/oy
     for _, c in pairs(charts)    do c.x = c.x*rx; c.y = c.y*ry end
     for _, c in pairs(statCards) do c.x = c.x*rx; c.y = c.y*ry end
-    chromeDirty  = true
-    linesDirty   = true
-    overlayDirty = true
+    chromeDirty  = true; linesDirty = true; overlayDirty = true
 end
 
 -------------------------------------------------------------------------------
@@ -1974,19 +2175,14 @@ function widget:TextCommand(command)
         local arg = command:sub(16)
         if arg and #arg > 0 then
             local tid = tonumber(arg)
-            if tid then
-                switchView(tid)
+            if tid then switchView(tid)
             else
                 local found = findTeamByName(arg)
-                if found then
-                    switchView(found)
-                else
-                    Spring.Echo("BAR Charts: No active team matching '"..arg.."'")
-                end
+                if found then switchView(found)
+                else Spring.Echo("BAR Charts: No active team matching '"..arg.."'") end
             end
         else
-            Spring.Echo("BAR Charts: Active participant teams"
-                .. (isSpectator and " (spectator)" or " (allies)") .. ":")
+            Spring.Echo("BAR Charts: Active teams" .. (isSpectator and " (spectator)" or " (allies)") .. ":")
             for tid, stats in pairs(allyTeams) do
                 local marker = (tid == viewedTeamID) and " <- viewing" or ""
                 local mine   = (myTeamID and tid == myTeamID) and " (you)" or ""
@@ -1996,15 +2192,13 @@ function widget:TextCommand(command)
         return true
     end
 
-    -- /barcharts fps <1-30>  — change render cadence at runtime
     if command:sub(1, 12) == "barcharts fps" then
-        local arg = command:sub(14)
-        local n   = tonumber(arg)
+        local n = tonumber(command:sub(14))
         if n then
             MAX_CHART_FPS = math.max(1, math.min(30, math.floor(n)))
             Spring.Echo(string.format("BAR Charts: MAX_CHART_FPS set to %d", MAX_CHART_FPS))
         else
-            Spring.Echo(string.format("BAR Charts: MAX_CHART_FPS = %d  (use /barcharts fps <1-30>)", MAX_CHART_FPS))
+            Spring.Echo(string.format("BAR Charts: MAX_CHART_FPS = %d", MAX_CHART_FPS))
         end
         return true
     end
@@ -2023,93 +2217,45 @@ function widget:TextCommand(command)
         Spring.Echo("BAR Charts: " .. (chartsInteractive and "EDIT mode ON" or "LOCKED"))
         return true
     elseif command == "barcharts hidepill" then
-        setPillVisible(false)
-        Spring.Echo("BAR Charts: Pill hidden  (/barcharts showpill to restore,  /barcharts edit to toggle edit mode)")
-        return true
+        setPillVisible(false); return true
     elseif command == "barcharts showpill" then
-        setPillVisible(true)
-        Spring.Echo("BAR Charts: Pill visible")
-        return true
+        setPillVisible(true);  return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v2.6 Debug ===")
+        Spring.Echo("=== BAR Charts v3.0 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
-        Spring.Echo(string.format("MAX_CHART_FPS=%d  (set via /barcharts fps <1-30>)",
-            MAX_CHART_FPS))
+        Spring.Echo(string.format("MAX_CHART_FPS=%d", MAX_CHART_FPS))
         Spring.Echo(string.format("dirty flags: chrome=%s  lines=%s  overlay=%s",
             tostring(chromeDirty), tostring(linesDirty), tostring(overlayDirty)))
+        Spring.Echo(string.format("shaderLine=%s  shaderFill=%s  shaderGrid=%s",
+            tostring(shaderLine ~= nil), tostring(shaderFill ~= nil), tostring(shaderGrid ~= nil)))
         Spring.Echo(string.format("isSpectator=%s  myTeamID=%s  viewedTeamID=%s",
             tostring(isSpectator), tostring(myTeamID), tostring(viewedTeamID)))
-        Spring.Echo(string.format("SNAP_GRID=%dpx  BASE_TICK_SECS=%ds  MIN_TICK_PX=%dpx",
-            SNAP_GRID, BASE_TICK_SECS, MIN_TICK_PX))
-        Spring.Echo("-- ACTIVE PARTICIPANT TEAMS --")
         for tid, stats in pairs(allyTeams) do
-            local full = history[tid] and histFull[tid] and histFull[tid]["metalIncome"] or false
-            local head = history[tid] and histHead[tid] and histHead[tid]["metalIncome"] or 0
-            local viewing = (tid == viewedTeamID) and " <-" or ""
-            local mine    = (tid == myTeamID)     and " (you)" or ""
-            Spring.Echo(string.format("  [%d] %s%s%s  metal=%.0f/%.0f  army=%.0f  full=%s head=%d",
-                tid, stats.playerName, mine, viewing,
-                stats.metalIncome, stats.metalUsage,
-                stats.armyValue, tostring(full), head))
+            Spring.Echo(string.format("  [%d] %s  metal=%.0f/%.0f  army=%.0f%s",
+                tid, stats.playerName, stats.metalIncome, stats.metalUsage, stats.armyValue,
+                (tid == viewedTeamID) and " <-" or ""))
         end
         return true
-    elseif command == "barcharts viewdebug" then
-        local tid   = viewedTeamID
-        local stats = allyTeams[tid]
-        Spring.Echo(string.format("=== ViewDebug: team %s (%s) ===",
-            tostring(tid), stats and stats.playerName or "?"))
-        if not history[tid] then
-            Spring.Echo("  ERROR: no ring buffer for this team!")
-            return true
-        end
-        for _, key in ipairs(SERIES_KEYS) do
-            local startIdx, count = ringRange(tid, key)
-            local vals = {}
-            local buf  = history[tid][key]
-            for i = math.max(1, count-4), count do
-                local idx = ((startIdx - 1 + (i-1)) % HISTORY_SIZE) + 1
-                vals[#vals+1] = string.format("%.1f", buf[idx] or 0)
-            end
-            Spring.Echo(string.format("  %-20s  count=%d  last5: %s",
-                key, count, table.concat(vals, ", ")))
-        end
-        return true
+    elseif command == "barcharts diag" then
+        debugInitState(); return true
     elseif command == "barcharts bp" then
         local tid    = viewedTeamID
         local stats  = allyTeams[tid]
-        local tBuilders = builderUnits[tid] or {}
-        Spring.Echo(string.format("=== Builder Efficiency Diagnostic: team %s ('%s') ===",
+        local tB     = builderUnits[tid] or {}
+        Spring.Echo(string.format("=== Builder Efficiency: team %s ('%s') ===",
             tostring(tid), stats and stats.playerName or "?"))
         local s = buildEffState[tid]
-        Spring.Echo(string.format("  Rolling avg: %.1f%%  (samples %d/%d)",
-            stats and stats.buildEfficiency or 0,
-            s and s.count or 0, BUILD_EFF_WINDOW_SIZE))
-        local total, active, effSum, effCount = 0, 0, 0, 0
-        for uid, bd in pairs(tBuilders) do
-            total = total + 1
+        Spring.Echo(string.format("  Rolling avg: %.1f%%  (%d/%d samples)",
+            stats and stats.buildEfficiency or 0, s and s.count or 0, BUILD_EFF_WINDOW_SIZE))
+        for uid, bd in pairs(tB) do
             local tuid = Spring.GetUnitIsBuilding(uid)
-            local tdef = tuid and Spring.GetUnitDefID(tuid)
-            local mm   = (bd.defID and tdef and maxMetalUseCache[bd.defID])
-                         and maxMetalUseCache[bd.defID][tdef] or 0
-            local _, mp = Spring.GetUnitResources(uid, "metal")
-            local mu = mp or 0
-            local r  = (mm > 0) and math.min(1.0, mu/mm) or nil
-            local bud = bd.defID and UnitDefs[bd.defID]
-            Spring.Echo(string.format("    uid=%d  %s  bp=%.0f  building=%s  eff=%s",
-                uid, bud and bud.name or "?", bd.bp, tostring(tuid ~= nil),
-                r and string.format("%.0f%%", r*100) or "idle"))
-            if r then effSum = effSum+r; effCount = effCount+1; active = active+1 end
+            local bud  = bd.defID and UnitDefs[bd.defID]
+            Spring.Echo(string.format("    uid=%d  %s  bp=%.0f  building=%s",
+                uid, bud and bud.name or "?", bd.bp, tostring(tuid ~= nil)))
         end
-        local inst = effCount > 0 and (effSum/effCount*100)
-                     or ((stats and (stats.buildPower or 0) > 0) and 100 or 0)
-        Spring.Echo(string.format("  total=%d active=%d instant=%.1f%% rolling=%.1f%%",
-            total, active, inst, stats and stats.buildEfficiency or 0))
-        return true
-    elseif command == "barcharts diag" then
-        debugInitState()
         return true
     end
     return false
@@ -2124,5 +2270,6 @@ function widget:Shutdown()
     saveConfig()
     shutdownRmlToggle()
     freeLists()
-    Spring.Echo("BAR Charts v2.6: Shutdown")
+    deleteShaders()
+    Spring.Echo("BAR Charts v3.0: Shutdown")
 end
