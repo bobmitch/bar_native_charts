@@ -143,8 +143,8 @@ local MAX_UNIFORM_POINTS = 300
 
 local MAX_CHART_FPS = 60
 
-local BUILD_EFF_TICKS_PER_SAMPLE = 5
-local BUILD_EFF_WINDOW_SIZE      = 3
+local BUILD_EFF_TICKS_PER_SAMPLE = 10
+local BUILD_EFF_WINDOW_SIZE      = 6
 
 local CHART_WIDTH  = 300
 local CHART_HEIGHT = 180
@@ -158,8 +158,8 @@ local BASE_TICK_SECS = 30
 local MIN_TICK_PX    = 44
 
 -- Line rendering parameters
-local LINE_HALF_WIDTH = 0.6   -- core half-width in pixels — ~1px rendered line
-local LINE_GLOW_RADIUS = 3.0  -- outer glow radius in pixels (additive bloom only)
+local LINE_HALF_WIDTH = 0.2   -- core half-width in pixels — ~1px rendered line
+local LINE_GLOW_RADIUS = 1.5  -- outer glow radius in pixels (additive bloom only)
 
 local COLOR = {
     bg        = { 0.031, 0.047, 0.078, 0.72 },
@@ -309,41 +309,35 @@ end
 --   computeRange; ringSample itself trusts the buffer is clean (ringPush only
 --   ever writes real numbers).
 -- ─────────────────────────────────────────────────────────────────────────────
+local DISPLAY_WINDOW_FRAMES = GAME_FPS * HISTORY_SECONDS  -- can be altered for display purposes
+
 local function ringSample(tid, key, numPts)
     local startIdx, count = ringRange(tid, key)
     if count <= 0 then return {} end
     local buf = history[tid][key]
-    local n   = math.min(numPts, count)
-    if n <= 0 then return {} end
 
-    local pts = {}
+    -- Use a fixed window so the mapping doesn't drift as count grows
+    local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
+    local windowStart = (startIdx - 1 + (count - windowCount)) % HISTORY_SIZE
 
-    if n == 1 then
-        -- Degenerate case: only one sample, or caller asked for one point.
-        local idx = ((startIdx - 1) % HISTORY_SIZE) + 1
-        pts[1]    = buf[idx]
+    local n = math.min(numPts, windowCount)
+    if n <= 1 then
+        local idx = (windowStart % HISTORY_SIZE) + 1
+        pts = { buf[idx] }
         return pts
     end
 
-    local countM1 = count - 1   -- pre-compute, used every iteration
+    local pts    = {}
+    local countM1 = windowCount - 1
 
     for i = 1, n do
-        -- Continuous float position in [0, countM1]
-        local fi = (i - 1) / (n - 1) * countM1
-
-        -- Split into integer and fractional parts
-        local lo = math.floor(fi)
-        local t  = fi - lo   -- in [0, 1)
-
-        -- Clamp hi index so we never read past the valid window
-        local hi = math.min(lo + 1, countM1)
-
-        -- Map logical indices into the ring buffer
-        local idxA = ((startIdx - 1 + lo) % HISTORY_SIZE) + 1
-        local idxB = ((startIdx - 1 + hi) % HISTORY_SIZE) + 1
-
-        -- Linear interpolation
-        pts[i] = buf[idxA] + t * (buf[idxB] - buf[idxA])
+        local fi   = (i - 1) / (n - 1) * countM1
+        local lo   = math.floor(fi)
+        local t    = fi - lo
+        local hi   = math.min(lo + 1, countM1)
+        local idxA = (windowStart + lo) % HISTORY_SIZE + 1
+        local idxB = (windowStart + hi) % HISTORY_SIZE + 1
+        pts[i]     = buf[idxA] + t * (buf[idxB] - buf[idxA])
     end
 
     return pts
