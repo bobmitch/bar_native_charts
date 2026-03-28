@@ -141,9 +141,9 @@ local RENDER_POINTS   = 300
 -- Must match the array size declared in the GLSL shaders below.
 local MAX_UNIFORM_POINTS = 300
 
-local MAX_CHART_FPS = 60
+local MAX_CHART_FPS = 30
 
-local BUILD_EFF_TICKS_PER_SAMPLE = 10
+local BUILD_EFF_TICKS_PER_SAMPLE = 12
 local BUILD_EFF_WINDOW_SIZE      = 6
 
 local CHART_WIDTH  = 300
@@ -181,6 +181,15 @@ local COLOR = {
 
 local function snapTo(val)
     return math.floor(val / SNAP_GRID + 0.5) * SNAP_GRID
+end
+
+----
+-- misc helpers
+----
+
+local function clearAllHoverStates()
+    for _, chart in pairs(charts) do chart.isHovered = false end
+    for _, card in pairs(statCards) do card.isHovered = false end
 end
 
 -------------------------------------------------------------------------------
@@ -2143,6 +2152,7 @@ function widget:KeyPress(key, _mods, _isRepeat)
     if key == Spring.GetKeyCode("f9") then
         chartsEnabled = not chartsEnabled
         chromeDirty   = true
+        if not chartsEnabled then clearAllHoverStates() end
         Spring.Echo("BAR Charts: "..(chartsEnabled and "Enabled" or "Disabled"))
         return true
     end
