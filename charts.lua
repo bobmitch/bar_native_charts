@@ -132,6 +132,9 @@ end
 
 local CONFIG_FILE = "bar_charts_config.lua"
 
+-- for less gpu/cpu impact, try 60 for HISTORY_SECONDS, and 100 for RENDER_POINTS, and 5 for MAX_CHART_FPS
+-- also try disabling some charts, the team charts are quite heavy
+
 local GAME_FPS        = 30
 local HISTORY_SECONDS = 120
 local HISTORY_SIZE    = GAME_FPS * HISTORY_SECONDS   -- 18 000 frames
@@ -239,6 +242,7 @@ local vsx, vsy          = Spring.GetViewGeometry()
 local chartsEnabled     = true
 local chartsReady       = false
 local chartsInteractive = false
+local lastDataUpdateFrame = 0
 
 local viewedTeamID = nil
 local myTeamID     = nil
@@ -874,8 +878,14 @@ function Chart:timeWindow()
     local key = s.seriesKey
     if not history[tid][key] then return 0, 0 end
     local _, count = ringRange(tid, key)
-    local nowGameSecs = Spring.GetGameFrame() / GAME_FPS
-    return count / GAME_FPS, nowGameSecs
+    -- Use the last collected frame to determine 'now'
+    local nowGameSecs = lastDataUpdateFrame / GAME_FPS
+    -- Use the window size used by ringSample for consistent scaling
+    local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
+    local windowSecs  = windowCount / GAME_FPS
+    
+    return windowSecs, nowGameSecs
+    -- return count / GAME_FPS, nowGameSecs (old return)
 end
 
 -- ── StatCard ───────────────────────────────────────────────────────────────
@@ -1642,6 +1652,7 @@ end
 -------------------------------------------------------------------------------
 
 local function collectStats(gameFrame)
+    lastDataUpdateFrame = gameFrame
     frameCounter = frameCounter + 1
     if frameCounter >= FULL_SCAN_INTERVAL then
         frameCounter = 0
@@ -1970,6 +1981,7 @@ function widget:Initialize()
     maxMetalUseCache      = {}
     prevStallState        = {}
     linesLastRebuildTime  = nil
+    lastDataUpdateFrame   = 0
     widgetStartTimer      = Spring.GetTimer()
 
     resetBuildEffForTeam(nil)
@@ -2098,6 +2110,7 @@ function widget:GameStart()
     prevStallState        = {}
     linesLastRebuildTime  = nil
     widgetStartTimer      = Spring.GetTimer()
+    lastDataUpdateFrame   = 0
     for _, stats in pairs(allyTeams) do
         stats.armyValue=0; stats.unitCount=0; stats.kills=0; stats.losses=0
         stats.metalLost=0; stats.damageDealt=0; stats.damageTaken=0
