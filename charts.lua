@@ -445,6 +445,15 @@ end
 -- ─────────────────────────────────────────────────────────────────────────────
 local DISPLAY_WINDOW_FRAMES = GAME_FPS * HISTORY_SECONDS  -- can be altered for display purposes
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Sampling method selector
+-- "lttb"   — Largest Triangle Three Buckets (default): single representative
+--             point per bucket, visually stable as new data arrives.
+-- "minmax" — Min/Max envelope: captures every spike but bucket-boundary shifts
+--             can cause one-frame value jumps as the ring window advances.
+-- ─────────────────────────────────────────────────────────────────────────────
+local SAMPLING_METHOD = "lttb"
+
 local function ringSample(tid, key, numPts)
     local startIdx, count = ringRange(tid, key)
     if count <= 0 then return {}, {} end
@@ -517,6 +526,134 @@ local function ringSample(tid, key, numPts)
     end
 
     return ptsMin, ptsMax
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- lttbSample  (Largest Triangle Three Buckets — v3.3)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Downsamples the ring buffer to numPts output points using the LTTB algorithm
+-- (Sveinn Steinarsson, 2013).  Returns two IDENTICAL tables so the result is
+-- drop-in compatible with the (ptsMin, ptsMax) envelope API consumed by
+-- drawShaderLine / drawShaderFill.  When ptsMin == ptsMax the envelope
+-- collapses to a single line, which avoids the vertical-spread "jitter" that
+-- occurs with the min/max method when bucket boundaries shift as new samples
+-- arrive.
+--
+-- Why LTTB is more stable than min/max during animation:
+-- ───────────────────────────────────────────────────────
+-- Min/max sweeps every value in each bucket.  When a spike sits exactly on a
+-- bucket boundary, a single new sample can move the spike from one bucket to
+-- the next, causing both adjacent columns to flip between large and small
+-- values in one frame — a visible "jump".  LTTB instead selects the single
+-- point that maximises the triangle area formed with its two neighbours.
+-- That selection changes smoothly as the window advances: the dominant extreme
+-- never crosses a bucket boundary without intermediate frames showing the
+-- transition, so the rendered line evolves continuously rather than snapping.
+--
+-- Algorithm (O(n) amortised — next-bucket centroid is computed once per step):
+--   1. Always keep the first and last raw samples.
+--   2. Divide the interior into (numPts - 2) equal-sized buckets.
+--   3. For each bucket i: find point B in that bucket that maximises
+--        2 × triangle_area(A, B, avg_next)
+--      where A is the previously-selected point and avg_next is the centroid
+--      of all points in bucket i+1.
+--   4. The ×½ factor is omitted from the area calculation because we only
+--      need the relative order — it cancels in the argmax.
+-- ─────────────────────────────────────────────────────────────────────────────
+local function lttbSample(tid, key, numPts)
+    local startIdx, count = ringRange(tid, key)
+    if count <= 0 then return {}, {} end
+    local buf = history[tid][key]
+
+    local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
+    local windowStart = (startIdx - 1 + (count - windowCount)) % HISTORY_SIZE
+
+    -- Inline ring-buffer accessor; offset is 0-based within the display window
+    local function getVal(offset)
+        return buf[(windowStart + offset) % HISTORY_SIZE + 1]
+    end
+
+    if numPts <= 1 then
+        local v = getVal(0)
+        return { v }, { v }
+    end
+
+    -- Sparse path: fewer raw samples than output points.
+    -- Nearest-neighbour stretch — same behaviour as ringSample sparse path so
+    -- there is no visual difference in the early-game when data is scarce.
+    if windowCount <= numPts then
+        local pts   = {}
+        local scale = (windowCount - 1) / math.max(numPts - 1, 1)
+        for i = 1, numPts do
+            local rawIdx = math.floor((i - 1) * scale + 0.5)
+            rawIdx = math.max(0, math.min(windowCount - 1, rawIdx))
+            pts[i] = getVal(rawIdx)
+        end
+        return pts, pts
+    end
+
+    -- Full LTTB path: windowCount > numPts.
+    local pts  = {}
+    local xSel = {}   -- raw offset (0-based) of each selected point
+
+    -- First point is always the oldest sample in the display window.
+    pts[1]  = getVal(0)
+    xSel[1] = 0
+
+    -- Bucket width for the (numPts - 2) interior output points.
+    -- Indices 0 and windowCount-1 are reserved for the fixed endpoints above/below.
+    local bSize = (windowCount - 2) / math.max(numPts - 2, 1)
+
+    for i = 2, numPts - 1 do
+        -- Current bucket: raw offsets [bLo, bHi] (inclusive, 0-based)
+        -- Offset 0 is the fixed first point, so buckets start at offset 1.
+        local bLo = math.floor((i - 2) * bSize) + 1
+        local bHi = math.min(math.floor((i - 1) * bSize), windowCount - 2)
+        if bHi < bLo then bHi = bLo end
+
+        -- Next-bucket centroid — forms the third vertex of every candidate triangle.
+        local nLo = math.floor((i - 1) * bSize) + 1
+        local nHi = math.min(math.floor(i * bSize), windowCount - 1)
+        if nHi < nLo then nHi = nLo end
+
+        local avgX, avgY, nk = 0, 0, 0
+        for j = nLo, nHi do
+            avgX = avgX + j
+            avgY = avgY + getVal(j)
+            nk   = nk + 1
+        end
+        if nk > 0 then avgX = avgX / nk; avgY = avgY / nk end
+
+        -- Previously selected point A
+        local ax = xSel[i - 1]
+        local ay = pts[i - 1]
+
+        -- Scan current bucket for the point B with maximum 2× triangle area.
+        -- area = |(ax - avgX) * (vy - ay) - (ax - j) * (avgY - ay)|
+        local maxArea = -1
+        local selOff  = bLo
+        local selVal  = getVal(bLo)
+
+        for j = bLo, bHi do
+            local vy   = getVal(j)
+            local area = math.abs((ax - avgX) * (vy - ay) - (ax - j) * (avgY - ay))
+            if area > maxArea then
+                maxArea = area
+                selOff  = j
+                selVal  = vy
+            end
+        end
+
+        pts[i]  = selVal
+        xSel[i] = selOff
+    end
+
+    -- Last point is always the newest sample in the display window.
+    pts[numPts] = getVal(windowCount - 1)
+
+    -- Return the same table for both min and max: the envelope collapses to a
+    -- single line, which is the desired behaviour for LTTB (no spread jitter).
+    return pts, pts
 end
 
 local builderUnits     = {}
@@ -1001,14 +1138,20 @@ function Chart:isMouseOver(mx, my)
        and my >= self.y and my <= self.y + self.height * self.scale
 end
 
--- getSamples now returns TWO tables: ptsMin, ptsMax (v3.2 envelope API).
--- Callers that previously expected a single table must be updated (see below).
+-- getSamples returns TWO tables: ptsMin, ptsMax (v3.2 envelope API).
+-- Dispatches to lttbSample or ringSample depending on SAMPLING_METHOD.
+-- With LTTB both tables are identical (no envelope spread); with minmax they
+-- bracket the full value range within each column bucket.
 function Chart:getSamples(i)
     local s   = self.series[i]
     if not s then return {}, {} end
     local tid = s.teamID or viewedTeamID
     if not tid or not history[tid] or not history[tid][s.seriesKey] then return {}, {} end
-    return ringSample(tid, s.seriesKey, RENDER_POINTS)
+    if SAMPLING_METHOD == "lttb" then
+        return lttbSample(tid, s.seriesKey, RENDER_POINTS)
+    else
+        return ringSample(tid, s.seriesKey, RENDER_POINTS)
+    end
 end
 
 function Chart:hasData()
@@ -2033,8 +2176,9 @@ local function buildChartsAndCards()
         charts.kd.getSamples = function(self, i)
             local tid = viewedTeamID
             if not tid or not history[tid] then return {}, {} end
-            local kMin, kMax = ringSample(tid, "kills",  RENDER_POINTS)
-            local lMin, lMax = ringSample(tid, "losses", RENDER_POINTS)
+            local sampleFn = (SAMPLING_METHOD == "lttb") and lttbSample or ringSample
+            local kMin, kMax = sampleFn(tid, "kills",  RENDER_POINTS)
+            local lMin, lMax = sampleFn(tid, "losses", RENDER_POINTS)
             local n = math.min(#kMax, #lMax)
             local ptsMin, ptsMax = {}, {}
             for j = 1, n do
@@ -2094,6 +2238,7 @@ local function saveConfig()
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         maxChartFps       = MAX_CHART_FPS,
+        samplingMethod    = SAMPLING_METHOD,
         charts            = {},
         cards             = {},
     }
@@ -2135,6 +2280,9 @@ local function loadConfig()
     end
     if result.enabled           ~= nil then chartsEnabled     = result.enabled           end
     if result.chartsInteractive ~= nil then chartsInteractive = result.chartsInteractive end
+    if result.samplingMethod == "lttb" or result.samplingMethod == "minmax" then
+        SAMPLING_METHOD = result.samplingMethod
+    end
     return result.charts or {}, result.cards or {}
 end
 
@@ -2597,6 +2745,18 @@ function widget:TextCommand(command)
         return true
     end
 
+    if command:sub(1, 19) == "barcharts sampling" then
+        local arg = command:sub(21):match("^%s*(.-)%s*$")  -- trim whitespace
+        if arg == "lttb" or arg == "minmax" then
+            SAMPLING_METHOD = arg
+            linesDirty = true
+            Spring.Echo(string.format("BAR Charts: sampling method set to '%s'", SAMPLING_METHOD))
+        else
+            Spring.Echo(string.format("BAR Charts: sampling = '%s'  (options: lttb, minmax)", SAMPLING_METHOD))
+        end
+        return true
+    end
+
     if command == "barcharts save" then
         saveConfig(); return true
     elseif command == "barcharts reset" then
@@ -2620,7 +2780,7 @@ function widget:TextCommand(command)
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
             HISTORY_SIZE, HISTORY_SECONDS, GAME_FPS, RENDER_POINTS))
-        Spring.Echo(string.format("MAX_CHART_FPS=%d", MAX_CHART_FPS))
+        Spring.Echo(string.format("MAX_CHART_FPS=%d  SAMPLING_METHOD=%s", MAX_CHART_FPS, SAMPLING_METHOD))
         Spring.Echo(string.format("dirty flags: chrome=%s  lines=%s  overlay=%s",
             tostring(chromeDirty), tostring(linesDirty), tostring(overlayDirty)))
         Spring.Echo(string.format("shaderLine=%s  shaderFill=%s  shaderGrid=%s",
