@@ -1,7 +1,36 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — SHADER EDITION
-    v3.1 by FilthyMitch  (interpolated ringSample on top of v3.0 shader core)
+    v3.2 by FilthyMitch  (per-chart sampling methods on top of v3.1 core)
+
+    What changed in v3.2 vs v3.1:
+    ─────────────────────────────
+    Each chart can now specify its own downsampling algorithm via a
+    samplingMethod field.  Three methods are available:
+
+    SAMPLE_DEFAULT ("default")
+      The v3.1 uniform linear-interpolation sampler.  Uniformly spaced
+      output points, each lerped between the two nearest raw samples.
+      Fast, jitter-free, and appropriate for most charts.
+
+    SAMPLE_LTTB ("lttb")
+      Largest-Triangle-Three-Buckets.  For each of the n-2 interior output
+      buckets the point that maximises the triangle area formed with the
+      previously-selected point and the average of the next bucket is
+      chosen.  This preserves the visual shape of the signal far better
+      than uniform sampling when the data is noisy or has sharp peaks.
+      Applied by default to the Builder Efficiency chart.
+
+    SAMPLE_MINMAX ("minmax")
+      Each bucket emits its minimum and maximum values (in time order) as
+      two output points.  With n output slots the data is divided into n/2
+      buckets, so no transient spike or trough can be hidden between
+      uniform-sample grid points.  Useful for high-variance rate signals
+      such as metal/energy income where brief spikes matter.
+
+    The samplingMethod is persisted in the config file so it survives
+    widget reloads.  It can also be set at definition time by passing an
+    extra argument to Chart.new().
 
     What changed in v3.1 vs v3.0:
     ─────────────────────────────
@@ -98,7 +127,7 @@
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics — shader-rendered lines & fills (v3.1)",
+        desc      = "Real-time resource and combat statistics — shader-rendered lines & fills (v3.2)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -177,6 +206,13 @@ local COLOR = {
     success   = { 0.188, 0.941, 0.627, 1.00 },
     gold      = { 0.941, 0.753, 0.251, 1.00 },
 }
+
+-- ── Per-chart sampling methods ───────────────────────────────────────────────
+-- Pass one of these as the final argument to Chart.new(), or set it on a chart
+-- object before the first data frame to override the default.
+local SAMPLE_DEFAULT = "default"   -- uniform linear interpolation (v3.1) — fast, jitter-free
+local SAMPLE_LTTB    = "lttb"      -- largest-triangle-three-buckets — best shape fidelity for noisy signals
+local SAMPLE_MINMAX  = "minmax"    -- min/max pairs per bucket — preserves all spikes and troughs
 
 -------------------------------------------------------------------------------
 -- SNAP HELPERS
@@ -351,6 +387,177 @@ local function ringSample(tid, key, numPts)
         local idxA = (windowStart + lo) % HISTORY_SIZE + 1
         local idxB = (windowStart + hi) % HISTORY_SIZE + 1
         pts[i]     = buf[idxA] + t * (buf[idxB] - buf[idxA])
+    end
+
+    return pts
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ringSampleLTTB  (Largest Triangle Three Buckets, v3.2)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Downsamples the ring buffer to `numPts` output points using the LTTB
+-- algorithm (Steinarsson 2013).  For each of the n-2 interior "buckets" the
+-- raw sample whose inclusion maximises the triangle area formed by
+--   A = the previously selected output point
+--   B = the candidate in the current bucket
+--   C = the mean of the next bucket
+-- is chosen as the bucket's representative.  The first and last raw samples
+-- are always kept.
+--
+-- This maximises the perceptual accuracy of the downsampled line by ensuring
+-- that every significant peak or valley is represented in the output, at the
+-- cost of ~2-5× more arithmetic per call vs ringSample.  The extra work is
+-- negligible on any hardware capable of running BAR.
+--
+-- Best for: noisy percentage signals (build efficiency), any series where
+--           retaining peak/valley positions matters more than uniform spacing.
+-- ─────────────────────────────────────────────────────────────────────────────
+local function ringSampleLTTB(tid, key, numPts)
+    local startIdx, count = ringRange(tid, key)
+    if count <= 0 then return {} end
+    local buf = history[tid][key]
+
+    local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
+    local windowStart = (startIdx - 1 + (count - windowCount)) % HISTORY_SIZE
+
+    local n = math.min(numPts, windowCount)
+    -- Not enough raw points for LTTB to add value; fall back to default
+    if n <= 2 or windowCount <= n then
+        return ringSample(tid, key, n)
+    end
+
+    -- Helper: get value at window-relative index j (0-based)
+    local function getVal(j)
+        return buf[(windowStart + j) % HISTORY_SIZE + 1]
+    end
+
+    local pts = {}
+    pts[1] = getVal(0)          -- always keep the first sample
+
+    -- The n-2 interior output points each come from one bucket that covers
+    -- a contiguous slice of the raw data (indices 1 to windowCount-2).
+    local interiorCount = windowCount - 2
+    local bucketSize    = interiorCount / (n - 2)
+
+    local prevX = 0             -- window-relative index of the previously selected point
+    local prevY = pts[1]
+
+    for bucket = 0, n - 3 do   -- produces pts[2] through pts[n-1]
+        -- Current bucket: window-relative indices bStart..bEnd (1-based interior)
+        local bStart = math.floor(bucket       * bucketSize) + 1
+        local bEnd   = math.min(math.floor((bucket + 1) * bucketSize), interiorCount)
+
+        -- Average of the next bucket used as the triangle apex C
+        local avgX, avgY
+        if bucket == n - 3 then
+            -- For the last bucket the apex is the final data point
+            avgX = windowCount - 1
+            avgY = getVal(windowCount - 1)
+        else
+            local nb0 = math.floor((bucket + 1) * bucketSize) + 1
+            local nb1 = math.min(math.floor((bucket + 2) * bucketSize), interiorCount)
+            local sumX, sumY, cnt = 0, 0, 0
+            for j = nb0, nb1 do
+                sumX = sumX + j
+                sumY = sumY + getVal(j)
+                cnt  = cnt  + 1
+            end
+            if cnt > 0 then
+                avgX = sumX / cnt
+                avgY = sumY / cnt
+            else
+                avgX = nb0
+                avgY = getVal(nb0)
+            end
+        end
+
+        -- Find the point in the current bucket that maximises the triangle area
+        -- Area = |ax*(by-cy) + bx*(cy-ay) + cx*(ay-by)| / 2  (skip /2 — comparing only)
+        local ax, ay = prevX, prevY
+        local cx, cy = avgX, avgY
+        local maxArea = -1
+        local maxJ    = bStart
+        local maxY    = getVal(bStart)
+
+        for j = bStart, bEnd do
+            local by   = getVal(j)
+            local area = math.abs(ax * (by - cy) + j * (cy - ay) + cx * (ay - by))
+            if area > maxArea then
+                maxArea = area
+                maxJ    = j
+                maxY    = by
+            end
+        end
+
+        pts[bucket + 2] = maxY
+        prevX = maxJ
+        prevY = maxY
+    end
+
+    pts[n] = getVal(windowCount - 1)    -- always keep the last sample
+    return pts
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ringSampleMinMax  (min/max interleaved per bucket, v3.2)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Divides the window into numPts/2 equal buckets.  Each bucket contributes
+-- two output points: its minimum and maximum values, emitted in their actual
+-- temporal order so the rendered line does not fold backwards in time.
+--
+-- This guarantees that no transient spike or trough can fall entirely between
+-- output grid points and become invisible.  The tradeoff is that the line
+-- will appear "thick" or "jagged" in highly variable sections — which is
+-- precisely the information the method is designed to preserve.
+--
+-- Best for: high-variance rate signals (metal/energy income/usage) where
+--           brief spikes or stalls should always be visible on the chart.
+-- ─────────────────────────────────────────────────────────────────────────────
+local function ringSampleMinMax(tid, key, numPts)
+    local startIdx, count = ringRange(tid, key)
+    if count <= 0 then return {} end
+    local buf = history[tid][key]
+
+    local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
+    local windowStart = (startIdx - 1 + (count - windowCount)) % HISTORY_SIZE
+
+    -- Fall back to default when there isn't enough raw data to fill the buckets
+    if windowCount <= numPts then
+        return ringSample(tid, key, math.min(numPts, windowCount))
+    end
+
+    local function getVal(j)
+        return buf[(windowStart + j) % HISTORY_SIZE + 1]
+    end
+
+    local numBuckets = math.max(1, math.floor(numPts / 2))
+    local bucketSize = windowCount / numBuckets
+    local pts        = {}
+
+    for b = 0, numBuckets - 1 do
+        local bStart = math.floor(b * bucketSize)
+        local bEnd   = math.min(math.floor((b + 1) * bucketSize) - 1, windowCount - 1)
+
+        local minVal = getVal(bStart)
+        local maxVal = minVal
+        local minOff = bStart
+        local maxOff = bStart
+
+        for j = bStart + 1, bEnd do
+            local v = getVal(j)
+            if v < minVal then minVal = v; minOff = j end
+            if v > maxVal then maxVal = v; maxOff = j end
+        end
+
+        -- Emit in temporal order so the line segment runs left-to-right
+        local pi = b * 2 + 1
+        if minOff <= maxOff then
+            pts[pi]     = minVal
+            pts[pi + 1] = maxVal
+        else
+            pts[pi]     = maxVal
+            pts[pi + 1] = minVal
+        end
     end
 
     return pts
@@ -797,25 +1004,26 @@ end
 local Chart = {}
 Chart.__index = Chart
 
-function Chart.new(id, label, icon, x, y, chartType, series, multiTeam)
+function Chart.new(id, label, icon, x, y, chartType, series, multiTeam, samplingMethod)
     local self = setmetatable({}, Chart)
-    self.id         = id
-    self.label      = label
-    self.icon       = icon
-    self.x          = x
-    self.y          = y
-    self.width      = CHART_WIDTH
-    self.height     = CHART_HEIGHT
-    self.scale      = 1.0
-    self.enabled    = true
-    self.visible    = true
-    self.chartType  = chartType
-    self.series     = series
-    self.multiTeam  = multiTeam or false
-    self.isDragging = false
-    self.dragStartX = 0
-    self.dragStartY = 0
-    self.isHovered  = false
+    self.id             = id
+    self.label          = label
+    self.icon           = icon
+    self.x              = x
+    self.y              = y
+    self.width          = CHART_WIDTH
+    self.height         = CHART_HEIGHT
+    self.scale          = 1.0
+    self.enabled        = true
+    self.visible        = true
+    self.chartType      = chartType
+    self.series         = series
+    self.multiTeam      = multiTeam or false
+    self.samplingMethod = samplingMethod or SAMPLE_DEFAULT
+    self.isDragging     = false
+    self.dragStartX     = 0
+    self.dragStartY     = 0
+    self.isHovered      = false
     self._minV = nil; self._maxV = nil; self._range = nil
     return self
 end
@@ -855,7 +1063,14 @@ function Chart:getSamples(i)
     if not s then return {} end
     local tid = s.teamID or viewedTeamID
     if not tid or not history[tid] or not history[tid][s.seriesKey] then return {} end
-    return ringSample(tid, s.seriesKey, RENDER_POINTS)
+    local method = self.samplingMethod or SAMPLE_DEFAULT
+    if method == SAMPLE_LTTB then
+        return ringSampleLTTB(tid, s.seriesKey, RENDER_POINTS)
+    elseif method == SAMPLE_MINMAX then
+        return ringSampleMinMax(tid, s.seriesKey, RENDER_POINTS)
+    else
+        return ringSample(tid, s.seriesKey, RENDER_POINTS)
+    end
 end
 
 function Chart:hasData()
@@ -1762,7 +1977,7 @@ local function buildChartsAndCards()
     charts.buildEfficiency = Chart.new("chart-build-efficiency",
         "BUILDER EFFICIENCY", "🔧", vsx-970, vsy-430, "percent", {
             { label="Efficiency", color=COLOR.gold, seriesKey="buildEfficiency" },
-        })
+        }, false, SAMPLE_LTTB)  -- LTTB preserves efficiency peaks/troughs better than uniform sampling
     charts.allyArmy       = Chart.new("chart-ally-army",       "TEAM ARMY", "⚙",
         vsx-1280, vsy-430, "multi", {}, true)
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧",
@@ -1829,7 +2044,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "3.1",
+        version           = "3.2",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         maxChartFps       = MAX_CHART_FPS,
@@ -1840,6 +2055,7 @@ local function saveConfig()
         config.charts[chart.id] = {
             x=chart.x, y=chart.y, scale=chart.scale,
             visible=chart.visible, enabled=chart.enabled,
+            samplingMethod=chart.samplingMethod,
         }
     end
     for id, card in pairs(statCards) do
@@ -1884,8 +2100,9 @@ local function applyConfig(chartCfg, cardCfg)
         local c = byId[id]
         if c and type(cfg) == "table" then
             c.x = cfg.x or c.x; c.y = cfg.y or c.y; c.scale = cfg.scale or c.scale
-            if cfg.visible ~= nil then c.visible = cfg.visible end
-            if cfg.enabled ~= nil then c.enabled = cfg.enabled end
+            if cfg.visible        ~= nil then c.visible        = cfg.visible        end
+            if cfg.enabled        ~= nil then c.enabled        = cfg.enabled        end
+            if cfg.samplingMethod ~= nil then c.samplingMethod = cfg.samplingMethod end
         end
     end
     for id, cfg in pairs(cardCfg) do
