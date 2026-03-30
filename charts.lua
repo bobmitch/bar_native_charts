@@ -1,206 +1,104 @@
 --[[
 ═══════════════════════════════════════════════════════════════════════════
     BAR CHARTS WIDGET — SHADER EDITION
-    v3.5 by FilthyMitch  (polyline ribbon AA — correct fix for chunky line artefact)
+    v3.1 by FilthyMitch  (interpolated ringSample on top of v3.0 shader core)
 
-    What changed in v3.5 vs v3.4:
+    What changed in v3.1 vs v3.0:
     ─────────────────────────────
-    Fixed the "extremely chunky / aliased" line rendering introduced by the
-    v3.3/v3.4 per-column vertical bar geometry.
+    ringSample now uses bilinear interpolation between adjacent ring-buffer
+    samples instead of floor-snapping to the nearest index.
 
-    Root cause: at RENDER_POINTS=300 across a ~245 px chart content area,
-    column pitch is 245/299 ≈ 0.82 px — sub-pixel.  Every per-column bar
-    approach degenerates: bars narrower than 1 px are rasterised as isolated
-    dots by the GPU.  v3.4's silhouette ribbons had the same flaw — they
-    connected sub-pixel column tops, producing the same dots drawn twice.
+    The old code:
+        local fi  = math.floor((i-1)/(n-1) * (count-1) + 0.5)
+        local idx = ((startIdx-1 + fi) % HISTORY_SIZE) + 1
+        pts[i]    = buf[idx]
 
-    Fix: abandon per-column bars entirely.  Instead treat the ptsMax and
-    ptsMin arrays as polylines and draw each as a perpendicular-expanded
-    ribbon (the original v3.1 technique), extended for the envelope:
+    computed a floating-point position in the ring buffer and then rounded
+    it to the nearest integer index.  Two problems resulted:
 
-      Pass A — envelope fill (normal blend, plain polygon):
-        Triangle strip between ptsMin and ptsMax profiles.  Only emitted when
-        the envelope has meaningful spread (dense source data).
+      1. Quantisation jitter — as new data arrives, `count` grows by 1 and
+         every output slot's source index shifts slightly.  With floor-rounding
+         some slots snap to a different raw sample, causing single-frame jumps
+         in individual rendered points even when the underlying data did not
+         change.  This produced a characteristic "wobble" on otherwise stable
+         lines.
 
-      Pass B — top ribbon (additive blend, line shader):
-        ptsMax profile drawn as an AA ribbon.  The perpendicular expansion
-        uses the true segment normal so the smoothstep fringe follows the
-        actual slope — this is angle-correct AA at every line direction.
+      2. Staircase appearance — downsampling 18 000 frames to 300 render
+         points with nearest-neighbour means each output pixel can only take
+         one of 60 discrete real values (18000/300).  On steep-ish parts of the
+         line this creates visible steps.
 
-      Pass C — bottom ribbon (additive blend, line shader):
-        ptsMin profile, only when envelope has spread.
+    The fix:
+        local fi  = (i-1) / math.max(n-1, 1) * math.max(count-1, 0)
+        local lo  = math.floor(fi)
+        local t   = fi - lo                          -- fractional part [0,1)
+        local idxA = ((startIdx-1 + lo)              % HISTORY_SIZE) + 1
+        local idxB = ((startIdx-1 + math.min(lo+1, count-1)) % HISTORY_SIZE) + 1
+        pts[i]   = buf[idxA] + t * (buf[idxB] - buf[idxA])
 
-    The ribbon half-width is a fixed LINE_HALF_WIDTH pixels regardless of
-    column pitch, always ≥ 1 px, always producing a smooth continuous line.
+    Because `fi` is now a true float position, and we lerp between the two
+    neighbours, the output value changes *continuously* as `count` grows —
+    no snapping.  The staircase is replaced by a smooth curve that passes
+    through every raw sample.
 
+    For series that are genuinely step-function data (army value, kills) the
+    lerp produces a short diagonal ramp between each step.  That is visually
+    indistinguishable from the true step at the render scale (1 step ≈ 1-3px
+    of horizontal screen space) but eliminates the jitter.
 
-    What changed in v3.4 vs v3.3:
-    ─────────────────────────────
-    Re-introduced anti-aliased edges on the line profile.
-
-    The v3.3 geometry drew one axis-aligned vertical quad per column
-    (edge-to-edge), giving a continuous filled band.  However the top and
-    bottom silhouette edges were perfectly horizontal hard cuts — the
-    fragment shader's vDist only measured horizontal distance from the
-    column centre, so it had no information about the vertical/diagonal edges
-    where jaggies actually appear.
-
-    v3.4 uses a two-pass strategy:
-
-    Pass 1 — Solid body quads (no shader):
-      Same axis-aligned vertical quads as v3.3, drawn as a plain opaque
-      solid so the interior is fully filled.  No edge shader applied here.
-
-    Pass 2 — AA silhouette ribbons (line shader):
-      For each consecutive column pair, a perpendicularly-expanded ribbon
-      quad is emitted along the top (ptsMax) and bottom (ptsMin) profiles.
-      The ribbon is expanded in the true normal direction of each segment
-      (not axis-aligned), so vDist is the genuine perpendicular distance from
-      the slanted centreline.  The fragment shader's smoothstep + glow then
-      fires along the actual angle of the line — identical to the v3.1
-      ribbon AA, but now layered on top of the solid body fill.
-
-    Result: solid filled body with smooth, angle-correct AA edges and glow,
-    at all line angles including horizontal flat sections and steep spikes.
-
-
-    What changed in v3.3 vs v3.2:
-    ─────────────────────────────
-    Fixed the early-game “dots / dashes instead of a continuous line” artefact.
-
-    Two compounding bugs were responsible:
-
-    Bug 1 — ringSample returned fewer columns than numPts in sparse conditions.
-    The old code clamped n = min(numPts, windowCount).  With e.g. 50 raw samples
-    and 300 render points, only 50 columns were emitted but spread across the
-    full 300 px chart width — producing ~5 px gaps between adjacent bars.
-
-    Fix: always return exactly numPts columns.  Sparse columns (early game) map
-    to the same raw sample, so ptsMin == ptsMax and they render as a flat band —
-    correct, because there is genuinely only one known value for that time range.
-
-    Bug 2 — barHW used `colW * 0.5 - 0.5` (a deliberate sub-pixel gutter).
-    At typical column widths of 1 px this collapsed barHW to ~0, making bars
-    invisible or single-pixel dots.
-
-    Fix: barHW = colPitch * 0.5 — bars touch exactly edge-to-edge with no
-    gutter.  The uHalfWidth uniform now receives barHW so the fragment shader’s
-    AA smoothstep fires at the correct geometric edge regardless of zoom level.
-
-    What changed in v3.2 vs v3.1:
-    ─────────────────────────────
-    ringSample now uses per-column min/max envelope downsampling instead of
-    linear interpolation between adjacent ring-buffer samples.
-
-    The v3.1 code lerped between two neighbours:
-        pts[i] = buf[idxA] + t * (buf[idxB] - buf[idxA])
-
-    This was smoother than the original nearest-neighbour (v3.0), but still
-    had two residual problems:
-
-      1. Spike erasure — when many raw samples map to one output column,
-         lerp picks a single representative point.  A one-frame spike that
-         falls between the two lerp neighbours can still be missed or
-         attenuated, especially at high RENDER_POINTS vs HISTORY_SIZE ratios.
-
-      2. Density-dependent appearance — as the ring buffer fills up and
-         more raw samples map to each output column, the lerp trajectory
-         shifts, causing a subtle "settling" drift in the line shape that is
-         not driven by new data.
-
-    The fix (min/max envelope, used by oscilloscopes, financial charts, DAWs):
-    ──────────────────────────────────────────────────────────────────────────
-    For each output column i, compute the exact span [lo_raw, hi_raw) of raw
-    sample indices that fall inside it.  Sweep that span and record both the
-    minimum and maximum value.  Return two parallel tables:
-
-        ptsMin[i]  = minimum raw value in column i's span
-        ptsMax[i]  = maximum raw value in column i's span
-
-    This guarantees:
-
-      • Every spike is represented regardless of where fi lands, because the
-        full span is swept rather than a single point picked.
-
-      • The output is frame-stable: min/max of a range is invariant to the
-        number of new samples as long as no sample enters or exits the column's
-        span.  The span boundaries only shift when the window advances past a
-        column boundary — which is rare and smooth.
-
-      • No aliasing oscillation because we never pick one point from a
-        multi-sample range.
-
-    Degradation:
-        When source sample count < output columns (early game), each column
-        maps to at most one raw sample, so ptsMin == ptsMax and the output is
-        identical to the old point-to-point line.
-
-    Rendering impact (v3.2 changes):
-    ─────────────────────────────────
-    • ringSample() now returns TWO tables: ptsMin, ptsMax  (breaking change
-      internal to this file — WG.BarCharts.getSamples still returns a single
-      table of the max values for API consumers, matching v3.1 behaviour).
-
-    • drawShaderLine() now takes ptsMin and ptsMax.  It draws a vertical quad
-      per output column whose height spans [minY, maxY].  When ptsMin==ptsMax
-      the quad degenerates to the same ribbon as before.
-
-    • drawShaderFill() uses ptsMax (the "high" envelope) as the upper boundary
-      so the fill correctly covers the full spike height.
-
-    • Chart.getSamples() updated to return the envelope pair.
-
-    • computeRange() updated to find global min/max across both envelopes.
-
-    All other rendering (chrome, grid, overlay, stat cards) is unchanged.
-
-    Rendering pipeline (unchanged from v3.0/v3.1):
-    ─────────────────────────────────────────────
+    Rendering pipeline (unchanged from v3.0):
+    ─────────────────────────────────────────
     Three GLSL programs replace all raw gl.LineWidth / GL.LINE_STRIP calls:
 
     lineShader
-      Converts each data series into a screen-space quad strip.  In v3.2 the
-      quads span [minY, maxY] per column rather than being uniform-width
-      ribbons, so spikes always have non-zero height.  The fragment shader
-      applies a smooth SDF-based coverage value for anti-aliasing.
+      Converts each data series into a screen-space quad strip.  A vertex
+      shader expands the centre-line into a ribbon of configurable half-width;
+      the fragment shader applies a smooth SDF-based coverage value so the
+      line is pixel-perfect anti-aliased at any scale.  A configurable
+      glowRadius adds a soft outer bloom using the same signed distance.
 
     fillShader
-      Draws the filled area beneath each line as a TRIANGLE_STRIP using the
-      max envelope.  The fragment shader applies a two-stop vertical gradient
-      with an animated horizontal shimmer band.
+      Draws the filled area beneath each line as a TRIANGLE_STRIP.  The
+      fragment shader applies a two-stop vertical gradient (opaque at the
+      line, transparent at the baseline) with an animated horizontal shimmer
+      band — a sine wave that drifts rightward over time, giving the fill a
+      subtle pulse without any extra geometry.
 
     gridShader
       Renders the background panel's grid lines with a low-frequency
-      animating "scan-pulse".
+      animating "scan-pulse" — a bright ring that sweeps upward over ~4 s,
+      giving the otherwise static grid a hint of life.
 
     All three programs are compiled once in widget:Initialize and reused for
-    every chart, every frame.
+    every chart, every frame.  Data is uploaded to the GPU as a 1-D float
+    uniform array (up to MAX_UNIFORM_POINTS floats) so the vertex shader can
+    position each sample without any Lua-side geometry loop.
 
-    Display-list strategy (same as v2.6/v3.0/v3.1):
-    ──────────────────────────────────────────────
+    Display-list strategy (same as v2.6/v3.0):
+    ──────────────────────────────────────────
     chromeList  — bg panels, borders, Y-axis labels, titles  (dirty on layout)
     linesList   — all shader-drawn line+fill geometry        (dirty on new data)
     overlayList — stall warnings, hover highlights, cards    (dirty on state)
 
     Backwards-compatible public API:
     ──────────────────────────────────
-    WG.BarCharts.getSamples() still returns a single table (the max envelope)
-    so external consumers are unaffected.
+    WG.BarCharts is still published with identical fields to v2.6/v3.0.
 
     Performance notes:
     ──────────────────
-    • The inner sweep loop in ringSample runs at most HISTORY_SIZE iterations
-      spread across RENDER_POINTS columns — identical total work to before.
-    • Vertical quad geometry per column is the same vertex count as the
-      ribbon quads in v3.1.
+    • MAX_CHART_FPS still gates linesList rebuilds (default 30).
+    • RENDER_POINTS defaults to 300; shader path is O(n) vertex uploads.
     • Shader compilation happens once at init; no per-frame recompile.
+    • Uniform upload of 300 floats ≈ 1.2 KB/frame per series — negligible.
+    • The lerp in ringSample adds ~300 multiply-adds per series call —
+      completely invisible on any hardware capable of running BAR.
 ═══════════════════════════════════════════════════════════════════════════
 ]]
 
 function widget:GetInfo()
     return {
         name      = "BAR Stats Charts",
-        desc      = "Real-time resource and combat statistics — shader-rendered lines & fills (v3.5)",
+        desc      = "Real-time resource and combat statistics — shader-rendered lines & fills (v3.1)",
         author    = "FilthyMitch",
         date      = "2026",
         license   = "MIT",
@@ -246,7 +144,7 @@ local RENDER_POINTS   = 300
 -- Must match the array size declared in the GLSL shaders below.
 local MAX_UNIFORM_POINTS = 300
 
-local MAX_CHART_FPS = 30 -- change this for biggest impact on CPU/GPU (e.g. 5 for low impact to FPS)
+local MAX_CHART_FPS = 30
 
 local BUILD_EFF_TICKS_PER_SAMPLE = 12
 local BUILD_EFF_WINDOW_SIZE      = 6
@@ -263,12 +161,8 @@ local BASE_TICK_SECS = 30
 local MIN_TICK_PX    = 44
 
 -- Line rendering parameters
--- In v3.2 the "line" is a vertical envelope bar per output column.
--- LINE_HALF_WIDTH controls the minimum half-width of the bar when min==max
--- (i.e. when source density is low and it degenerates to the old ribbon).
--- LINE_GLOW_RADIUS is unchanged.
-local LINE_HALF_WIDTH = 0.1   -- min core half-width in pixels (~1px rendered line, low-density case)
-local LINE_GLOW_RADIUS = 0.6  -- outer glow radius in pixels (additive bloom only)
+local LINE_HALF_WIDTH = 0.2   -- core half-width in pixels — ~1px rendered line
+local LINE_GLOW_RADIUS = 1.5  -- outer glow radius in pixels (additive bloom only)
 
 local COLOR = {
     bg        = { 0.031, 0.047, 0.078, 0.72 },
@@ -398,125 +292,68 @@ local function ringRange(tid, key)
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- ringSample  (v3.2 — min/max envelope downsampling)
+-- ringSample  (v3.1 — interpolated)
 -- ─────────────────────────────────────────────────────────────────────────────
--- Returns TWO tables: ptsMin, ptsMax, each of length numPts.
+-- Downsamples the ring buffer to `numPts` output points using linear
+-- interpolation between adjacent raw samples.
 --
--- For each output column i, the function identifies the contiguous span of
--- raw ring-buffer indices [spanLo, spanHi] that map to that column, then
--- sweeps the span to record the minimum and maximum raw value.
+-- Why this eliminates jitter
+-- ──────────────────────────
+-- The old implementation computed a floating-point source position fi and then
+-- rounded it with math.floor(fi + 0.5) (nearest-neighbour).  When `count`
+-- incremented by 1 (one new frame of data) the mapping changed slightly, and
+-- some output slots snapped to a different raw sample — causing visible single-
+-- frame jumps even when the underlying stat value was constant.
 --
--- Why this is better than interpolation (v3.1):
--- ─────────────────────────────────────────────
--- Lerp (v3.1) picks a single weighted-average point per output column.
--- When many raw samples map to one column (high source density), spikes can
--- still be missed if they happen to fall between the two lerp neighbours that
--- were chosen.
+-- The new implementation keeps fi as a true float, splits it into an integer
+-- part `lo` and a fractional part `t`, and returns:
 --
--- Min/max envelope sweeps the *entire* column span, so every spike is
--- represented regardless of its exact position within the column.  This is
--- how professional time-series renderers work (oscilloscopes, trading charts,
--- audio DAW waveforms, browser devtools flame charts).
+--     buf[lo] * (1-t) + buf[lo+1] * t
 --
--- Stability guarantee:
--- ────────────────────
--- min() and max() of a fixed set of samples are invariant to the number of
--- additional samples outside that set.  As long as the window does not shift
--- enough to move a raw sample across a column boundary, the envelope value for
--- that column does not change — even when new frames arrive.  In practice,
--- a column boundary shifts by exactly 1 raw sample per new frame pushed into
--- the ring, and the shift is monotone, so the envelope is as stable as the
--- underlying data.
+-- Because t changes *continuously* as count grows, output values drift
+-- smoothly rather than snapping.  The visual result is a stable line that
+-- only moves when the underlying data genuinely changes.
 --
--- Degradation to point-to-point:
--- ───────────────────────────────
--- When source sample count ≤ output columns (early game), each column maps to
--- at most one raw sample, so ptsMin[i] == ptsMax[i] for all i and the result
--- is identical to a normal point-to-point line.
---
--- Span boundary arithmetic:
--- ─────────────────────────
--- Column i covers the half-open raw-index range [fi_lo, fi_hi) where:
---     fi_lo = (i-1) / numPts * windowCount
---     fi_hi = i     / numPts * windowCount
--- We floor fi_lo to get the first raw index and ceil fi_hi - epsilon to get
--- the last (ensuring at least one sample per column and avoiding double-
--- counting on exact boundaries).
+-- Edge cases handled
+-- ──────────────────
+-- • count == 1  → n clamped to 1, single repeated value (no lerp neighbour).
+-- • lo+1 > count-1 → clamped to count-1 to avoid reading beyond valid data.
+-- • NaN / nil raw samples → guarded by the (v and not (v ~= v)) check in
+--   computeRange; ringSample itself trusts the buffer is clean (ringPush only
+--   ever writes real numbers).
 -- ─────────────────────────────────────────────────────────────────────────────
 local DISPLAY_WINDOW_FRAMES = GAME_FPS * HISTORY_SECONDS  -- can be altered for display purposes
 
 local function ringSample(tid, key, numPts)
     local startIdx, count = ringRange(tid, key)
-    if count <= 0 then return {}, {} end
+    if count <= 0 then return {} end
     local buf = history[tid][key]
 
-    -- Clamp to the display window so the x-axis scale is consistent
+    -- Use a fixed window so the mapping doesn't drift as count grows
     local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
-    -- windowStart is the ring index of the oldest sample in the window
     local windowStart = (startIdx - 1 + (count - windowCount)) % HISTORY_SIZE
 
-    -- Always return exactly numPts columns regardless of how many raw samples
-    -- exist.  This is the key fix for the early-game dot/segment artefact:
-    --
-    -- The old code clamped n = min(numPts, windowCount), which meant that with
-    -- e.g. 50 raw samples and 300 render points only 50 columns were emitted.
-    -- The geometry code spread those 50 bars across the full chart width, leaving
-    -- large gaps between them — visible as separate dots or dashes.
-    --
-    -- By always emitting numPts columns we guarantee the bars are packed
-    -- edge-to-edge across the full chart width at every stage of the game.
-    -- When windowCount < numPts (sparse / early game) multiple adjacent output
-    -- columns will map to the same raw sample (lo==hi for all of them), so
-    -- ptsMin==ptsMax and they render as flat-topped bars — correct behaviour
-    -- because there genuinely is only one known value for that time range.
-    -- When windowCount >= numPts (dense / late game) this is identical to
-    -- before: each column sweeps a span of raw samples for the true envelope.
-    local n = numPts  -- always full resolution
-
+    local n = math.min(numPts, windowCount)
     if n <= 1 then
         local idx = (windowStart % HISTORY_SIZE) + 1
-        local v   = buf[idx]
-        return { v }, { v }
+        pts = { buf[idx] }
+        return pts
     end
 
-    local ptsMin = {}
-    local ptsMax = {}
-
-    -- Scale factor: how many raw samples map to one output column.
-    -- When windowCount < n this is < 1 (sparse), meaning each raw sample is
-    -- "stretched" across multiple output columns.  The floor/ceil arithmetic
-    -- below handles both cases correctly.
-    local scale = (windowCount - 1) / math.max(n - 1, 1)
+    local pts    = {}
+    local countM1 = windowCount - 1
 
     for i = 1, n do
-        -- Floating-point position in raw-sample space for column i.
-        local fi = (i - 1) * scale
-
-        -- Column i sweeps raw offsets [lo, hi] (inclusive).
-        -- In the sparse case lo == hi (single sample per column).
-        -- In the dense case hi > lo (multiple samples per column).
-        local lo = math.floor(fi)
-        local hi = math.min(math.floor((i) * scale - 1e-9), windowCount - 1)
-        if hi < lo then hi = lo end  -- guard: always include at least one sample
-
-        -- Sweep [lo, hi] in the ring buffer and accumulate min/max.
-        local idxA  = (windowStart + lo) % HISTORY_SIZE + 1
-        local vA    = buf[idxA]
-        local minV  = vA
-        local maxV  = vA
-
-        for offset = lo + 1, hi do
-            local idx = (windowStart + offset) % HISTORY_SIZE + 1
-            local v   = buf[idx]
-            if v < minV then minV = v end
-            if v > maxV then maxV = v end
-        end
-
-        ptsMin[i] = minV
-        ptsMax[i] = maxV
+        local fi   = (i - 1) / (n - 1) * countM1
+        local lo   = math.floor(fi)
+        local t    = fi - lo
+        local hi   = math.min(lo + 1, countM1)
+        local idxA = (windowStart + lo) % HISTORY_SIZE + 1
+        local idxB = (windowStart + hi) % HISTORY_SIZE + 1
+        pts[i]     = buf[idxA] + t * (buf[idxB] - buf[idxA])
     end
 
-    return ptsMin, ptsMax
+    return pts
 end
 
 local builderUnits     = {}
@@ -553,7 +390,7 @@ local widgetStartTimer = nil
 -- ═══════════════════════════════════════════════════════════════════════════
 -------------------------------------------------------------------------------
 
-local shaderLine = nil   -- AA line / envelope bar shader
+local shaderLine = nil   -- AA line ribbon shader
 local shaderFill = nil   -- animated area fill shader
 local shaderGrid = nil   -- animated grid / scan-pulse shader
 
@@ -564,15 +401,26 @@ local uGrid = {}
 
 -- ── GLSL sources ────────────────────────────────────────────────────────────
 
--- lineVS / lineFS:
--- In v3.2 the geometry emitted by Lua is a vertical quad per output column
--- whose height spans [minY, maxY].  The per-vertex signed distance (vDist)
--- is measured perpendicular to the column's long axis, i.e. horizontally.
--- The fragment shader is identical to v3.1 — it applies SDF-based AA and
--- additive glow — so the GLSL source is unchanged.
+-- lineVS: expands each sample pair into a screen-space quad.
+-- Each "vertex" in Lua is actually the LEFT endpoint of a segment;
+-- we emit 4 verts per segment (quad) and let the GS… wait, BAR's Spring
+-- version may not support geometry shaders reliably.  Instead we use a
+-- classic "fat line" trick: upload ALL sample Y-values as a uniform array
+-- and draw 2*(N-1) triangles by encoding segment index + side in gl_VertexID.
+-- Since Spring's widget GL doesn't expose gl_VertexID we fall back to passing
+-- the quad corners as explicit geometry from Lua — but we do it ONCE per
+-- display-list rebuild and let the fragment shader own the AA math.
 --
--- aDist is packed into gl_Color.r (the fixed-function colour channel).
+-- Vertex layout per quad corner:
+--   attrib 0 (vec2) = screen position
+--   attrib 1 (float) = signed perpendicular distance from line centre (pixels)
+--
+-- The fragment shader turns that distance into smooth coverage.
 
+-- aDist is packed into gl_Color.r (the fixed-function colour channel),
+-- which is the only reliable per-vertex data channel available in Spring's
+-- immediate-mode Lua GL binding.  The actual line colour is passed as a
+-- uniform so it is independent of this carrier.
 local LINE_VS = [[
 #version 120
 varying float vDist;
@@ -582,12 +430,6 @@ void main() {
 }
 ]]
 
--- LINE_FS (v3.4):
--- vDist carries the signed perpendicular distance from either:
---   (a) the column centre (horizontal body quads — left/right edge AA), or
---   (b) the slanted segment centreline (silhouette ribbons — diagonal AA).
--- The same smoothstep + glow formula handles both cases correctly because
--- in both cases vDist is a true pixel-space perpendicular distance.
 local LINE_FS = [[
 #version 120
 uniform vec4  uColor;
@@ -598,27 +440,35 @@ varying float vDist;
 void main() {
     float d = abs(vDist);
 
-    // ── Core coverage with 1 px AA fringe each side ────────────────────
+    // ── Core line ──────────────────────────────────────────────────────
+    // AA fringe is exactly ±1px around the edge — tight enough to look
+    // sharp, wide enough to prevent aliasing on any angle.
     float core = 1.0 - smoothstep(uHalfWidth - 1.0, uHalfWidth + 1.0, d);
 
-    // ── Additive glow bloom ────────────────────────────────────────────
+    // ── Glow bloom ────────────────────────────────────────────────────
+    // Gaussian falloff outside the core edge.  This is combined additively
+    // in the Lua draw call (GL_ONE dest blend) so it brightens rather than
+    // thickening the line.
     float outerDist = max(0.0, d - uHalfWidth);
     float bloom     = exp(-outerDist * outerDist / (uGlowRadius * 0.5)) * 0.4;
 
+    // Core alpha uses normal src-alpha blend (set before this draw call).
+    // Bloom is baked into the alpha here; the Lua side switches blend modes
+    // between the two passes.
     float alpha = clamp(core + bloom, 0.0, 1.0);
 
-    // Subtle centre brightening
-    float centreBright = max(0.0, 1.0 - d / max(uHalfWidth, 0.001)) * 0.15;
+    // Tint core slightly brighter at centre
+    float centreBright = max(0.0, 1.0 - d / uHalfWidth) * 0.15;
     vec3  col = uColor.rgb + centreBright;
 
     gl_FragColor = vec4(col, uColor.a * alpha);
 }
 ]]
 
--- Fill shader: triangle strip from baseline to the MAX envelope line, with a
--- vertical gradient and animated horizontal shimmer band.
--- aT (0=baseline, 1=line) is packed into gl_Color.r — unchanged from v3.1.
+-- Fill shader: triangle strip from baseline to line, with a vertical gradient
+-- and a slow horizontal shimmer band animated by time.
 
+-- aT (0=baseline, 1=line) is packed into gl_Color.r
 local FILL_VS = [[
 #version 120
 varying float vT;
@@ -652,7 +502,6 @@ void main() {
 ]]
 
 -- Grid shader: draws horizontal grid lines with an upward-sweeping scan pulse.
--- Unchanged from v3.1.
 
 local GRID_VS = [[
 #version 120
@@ -693,7 +542,7 @@ local function compileShader(vsSrc, fsSrc)
     })
     if not shader then
         local log = gl.GetShaderLog() or "(no log)"
-        Spring.Echo("BAR Charts v3.5: Shader compile FAILED — " .. log)
+        Spring.Echo("BAR Charts v3.1: Shader compile FAILED — " .. log)
         return nil, {}
     end
     return shader, {}
@@ -709,7 +558,7 @@ local function initShaders()
         uLine.color      = getUniformLoc(shaderLine, "uColor")
         uLine.halfWidth  = getUniformLoc(shaderLine, "uHalfWidth")
         uLine.glowRadius = getUniformLoc(shaderLine, "uGlowRadius")
-        Spring.Echo("BAR Charts v3.5: Line shader compiled OK")
+        Spring.Echo("BAR Charts v3.1: Line shader compiled OK")
     end
 
     shaderFill, uFill = compileShader(FILL_VS, FILL_FS)
@@ -718,7 +567,7 @@ local function initShaders()
         uFill.time    = getUniformLoc(shaderFill, "uTime")
         uFill.chartX  = getUniformLoc(shaderFill, "uChartX")
         uFill.chartW  = getUniformLoc(shaderFill, "uChartW")
-        Spring.Echo("BAR Charts v3.5: Fill shader compiled OK")
+        Spring.Echo("BAR Charts v3.1: Fill shader compiled OK")
     end
 
     shaderGrid, uGrid = compileShader(GRID_VS, GRID_FS)
@@ -727,7 +576,7 @@ local function initShaders()
         uGrid.time    = getUniformLoc(shaderGrid, "uTime")
         uGrid.chartY  = getUniformLoc(shaderGrid, "uChartY")
         uGrid.chartH  = getUniformLoc(shaderGrid, "uChartH")
-        Spring.Echo("BAR Charts v3.5: Grid shader compiled OK")
+        Spring.Echo("BAR Charts v3.1: Grid shader compiled OK")
     end
 end
 
@@ -1001,13 +850,11 @@ function Chart:isMouseOver(mx, my)
        and my >= self.y and my <= self.y + self.height * self.scale
 end
 
--- getSamples now returns TWO tables: ptsMin, ptsMax (v3.2 envelope API).
--- Callers that previously expected a single table must be updated (see below).
 function Chart:getSamples(i)
     local s   = self.series[i]
-    if not s then return {}, {} end
+    if not s then return {} end
     local tid = s.teamID or viewedTeamID
-    if not tid or not history[tid] or not history[tid][s.seriesKey] then return {}, {} end
+    if not tid or not history[tid] or not history[tid][s.seriesKey] then return {} end
     return ringSample(tid, s.seriesKey, RENDER_POINTS)
 end
 
@@ -1036,8 +883,9 @@ function Chart:timeWindow()
     -- Use the window size used by ringSample for consistent scaling
     local windowCount = math.min(count, DISPLAY_WINDOW_FRAMES)
     local windowSecs  = windowCount / GAME_FPS
-
+    
     return windowSecs, nowGameSecs
+    -- return count / GAME_FPS, nowGameSecs (old return)
 end
 
 -- ── StatCard ───────────────────────────────────────────────────────────────
@@ -1085,22 +933,14 @@ local function freeLists()
 end
 
 -- ── computeRange ──────────────────────────────────────────────────────────
--- Updated for v3.2: getSamples now returns (ptsMin, ptsMax).
--- We search both envelopes so the Y axis always fits the full spike range.
 
 local function computeRange(chart)
     local mn, mx
     for i = 1, #chart.series do
-        local ptsMin, ptsMax = chart:getSamples(i)
-        -- Scan the min envelope for the global low
-        for _, v in ipairs(ptsMin) do
+        local pts = chart:getSamples(i)
+        for _, v in ipairs(pts) do
             if v and not (v ~= v) then
                 if mn == nil or v < mn then mn = v end
-            end
-        end
-        -- Scan the max envelope for the global high
-        for _, v in ipairs(ptsMax) do
-            if v and not (v ~= v) then
                 if mx == nil or v > mx then mx = v end
             end
         end
@@ -1128,175 +968,78 @@ end
 -------------------------------------------------------------------------------
 -- SHADER-BASED LINE DRAWING HELPERS
 -- These helpers are called INSIDE a gl.CreateList() call.
+-- They emit GL geometry that references the compiled shader programs.
 -------------------------------------------------------------------------------
 
--- drawShaderLine (v3.2 — min/max envelope bars):
--- Emits one vertical quad per output column.  The quad's height spans
--- [minY, maxY] derived from ptsMin and ptsMax.
---
--- When ptsMin[i] == ptsMax[i] (low source density / early game), the quad
--- height collapses to zero and we fall back to a horizontal ribbon of
--- half-width LINE_HALF_WIDTH — identical to the v3.1 behaviour.
---
--- The horizontal extent of each column's quad is (cW / n), matching the
--- right-pinned spacing used for the fill.
---
--- The signed horizontal distance from the column centreline is packed into
--- gl_Color.r for the fragment shader's SDF AA calculation.
---
--- Parameters:
---   ptsMin, ptsMax  — parallel tables from ringSample() (length n)
---   cX, cY          — chart content area origin
---   cW, cH          — chart content area size
---   mn, r           — data range (minV, range)
---   color           — {r,g,b,a}
---   halfW           — minimum horizontal half-width of the bar (pixels after scale)
---   glowR           — glow radius (pixels)
+-- drawShaderLine: emits a fat-quad ribbon for a single data series.
+-- pts   : array of Y values (already sampled, length >= 2)
+-- cX,cY : chart content area origin (pixels)
+-- cW,cH : chart content area size (pixels)
+-- mn,r  : data range (minV, range)
+-- color : {r,g,b,a}
+-- halfW : ribbon half-width in pixels (after chart scale is applied)
+-- glowR : glow radius in pixels
 
--- drawShaderLine (v3.5 — polyline ribbon with envelope fill):
--- ─────────────────────────────────────────────────────────────────────────────
--- Root-cause analysis of the "chunky / aliased" problem in v3.3 / v3.4:
---
--- At RENDER_POINTS=300 across a 245 px chart content area, column pitch is
--- 245/299 ≈ 0.82 px — sub-pixel.  Every geometry approach based on per-column
--- vertical bars degenerates: bars are less than 1 pixel wide and the GPU
--- rasterises them as isolated dots.  The v3.4 "silhouette ribbon" pass had the
--- same problem — it connected the tops of sub-pixel columns, producing ribbons
--- that were effectively the same broken dots just drawn twice.
---
--- The correct approach for a dense polyline in screen space is to:
---
---   1. Pre-compute screen (X, Y) for every point in the profile.
---   2. For each consecutive pair of points, emit a perpendicular-expanded
---      ribbon quad whose width is a fixed number of *pixels* (not column pitch).
---      The perpendicular direction is the true segment normal, so the AA fringe
---      follows the actual angle of the line at every slope.
---   3. Where the envelope has a non-trivial spread (ptsMin ≠ ptsMax), fill the
---      area between the two profiles first (plain polygon, no shader), then
---      draw the top and bottom profiles as separate ribbons.
---
--- This is exactly what v3.1 did, extended to handle the min/max envelope.
--- The ribbon half-width is a fixed LINE_HALF_WIDTH pixels regardless of column
--- pitch, so it is always ≥ 1 px and always produces a visible, smooth line.
---
--- Blend strategy (self-contained — caller sets normal blend before calling):
---   Pass A — envelope fill  (normal blend, no shader): fills [ptsMin..ptsMax]
---   Pass B — top ribbon     (additive blend, line shader): ptsMax profile AA
---   Pass C — bottom ribbon  (additive blend, line shader): ptsMin profile AA
---                            skipped when envelope is flat (ptsMin ≈ ptsMax)
--- ─────────────────────────────────────────────────────────────────────────────
-local function drawShaderLine(ptsMin, ptsMax, cX, cY, cW, cH, mn, r, color, halfW, glowR)
+local function drawShaderLine(pts, cX, cY, cW, cH, mn, r, color, halfW, glowR)
     if not shaderLine then return end
-    local n = #ptsMax
+    local n = #pts
     if n < 2 then return end
 
-    -- ── Pre-compute screen positions for both profiles ──────────────────────
-    local sx   = {}
-    local syMax = {}
-    local syMin = {}
-    local margin = glowR + halfW + 2.0  -- clamp margin: keep geometry inside chart + bloom overhang
-
-    for i = 1, n do
-        -- Right-pinned: point i=n lands at cX+cW, point i=1 at cX
-        sx[i]    = cX + ((i - 1) / (n - 1)) * cW
-        local vx = ptsMax[i] or 0
-        local vn = ptsMin[i] or 0
-        syMax[i] = cY + ((vx - mn) / r) * cH
-        syMin[i] = cY + ((vn - mn) / r) * cH
-        -- Clamp both to chart area + margin (allows glow to bleed slightly)
-        syMax[i] = math.max(cY - margin, math.min(cY + cH + margin, syMax[i]))
-        syMin[i] = math.max(cY - margin, math.min(cY + cH + margin, syMin[i]))
-        -- Guard inversion
-        if syMin[i] > syMax[i] then syMin[i], syMax[i] = syMax[i], syMin[i] end
-    end
-
-    -- ── Detect whether there is a meaningful envelope spread ────────────────
-    -- If every point has syMax ≈ syMin the series is flat (early game or
-    -- step-constant data) and we skip the fill + bottom ribbon.
-    local hasEnvelope = false
-    for i = 1, n do
-        if syMax[i] - syMin[i] > 1.5 then hasEnvelope = true; break end
-    end
-
-    -- ── Ribbon emission helper ───────────────────────────────────────────────
-    -- Emits perpendicular-expanded ribbon quads for a connected polyline.
-    -- sy[] is the array of screen Y values; sx[] is shared.
-    -- ribbonHW is the total half-width of the geometry quad (core + glow + AA).
-    -- vDist at the outer edge = ±ribbonHW (passed via gl_Color.r).
-    local function emitPolylineRibbon(sy, ribbonHW)
-        gl.BeginEnd(GL.TRIANGLES, function()
-            for i = 1, n - 1 do
-                local x0, y0 = sx[i],   sy[i]
-                local x1, y1 = sx[i+1], sy[i+1]
-
-                local dx  = x1 - x0
-                local dy  = y1 - y0
-                local len = math.sqrt(dx*dx + dy*dy)
-                if len < 0.0001 then len = 0.0001 end
-
-                -- Perpendicular unit vector × ribbonHW
-                local px = (-dy / len) * ribbonHW
-                local py = ( dx / len) * ribbonHW
-
-                -- Quad corners (two triangles):
-                --   outer edge: vDist = +ribbonHW  (→ fragment AA fires here)
-                --   inner edge: vDist = -ribbonHW
-                gl.Color( ribbonHW, 0, 0, 1); gl.Vertex(x0 + px, y0 + py)
-                gl.Color(-ribbonHW, 0, 0, 1); gl.Vertex(x0 - px, y0 - py)
-                gl.Color( ribbonHW, 0, 0, 1); gl.Vertex(x1 + px, y1 + py)
-
-                gl.Color(-ribbonHW, 0, 0, 1); gl.Vertex(x0 - px, y0 - py)
-                gl.Color(-ribbonHW, 0, 0, 1); gl.Vertex(x1 - px, y1 - py)
-                gl.Color( ribbonHW, 0, 0, 1); gl.Vertex(x1 + px, y1 + py)
-            end
-        end)
-    end
-
-    -- Total geometry half-width: core halfW + glow radius + 1 px AA fringe
-    local ribbonTotal = halfW + glowR + 1.0
-
-    -- ── Pass A: Envelope fill (normal blend, no shader) ─────────────────────
-    -- When the envelope has spread, fill the polygon between ptsMin and ptsMax
-    -- so the interior is opaque.  This is a plain triangle strip; no AA needed
-    -- because the ribbon passes B/C sit exactly on top of these edges.
-    if hasEnvelope then
-        gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
-        gl.UseShader(0)
-        gl.Color(color[1], color[2], color[3], color[4] or 1)
-        gl.BeginEnd(GL.TRIANGLE_STRIP, function()
-            for i = 1, n do
-                gl.Vertex(sx[i], syMin[i])
-                gl.Vertex(sx[i], syMax[i])
-            end
-        end)
-    end
-
-    -- ── Pass B: Top profile ribbon (additive blend, line shader) ────────────
-    -- Draws the ptsMax polyline as an AA ribbon.  The perpendicular expansion
-    -- is in the true segment-normal direction so the smoothstep AA fringe fires
-    -- along the actual slope of the line — not axis-aligned.
-    gl.BlendFunc(GL.SRC_ALPHA, GL.ONE)
     gl.UseShader(shaderLine)
     if uLine.color      then gl.Uniform(uLine.color,      color[1], color[2], color[3], color[4] or 1) end
-    if uLine.halfWidth  then gl.Uniform(uLine.halfWidth,  halfW) end   -- core half-width for smoothstep
+    if uLine.halfWidth  then gl.Uniform(uLine.halfWidth,  halfW) end
     if uLine.glowRadius then gl.Uniform(uLine.glowRadius, glowR) end
 
-    emitPolylineRibbon(syMax, ribbonTotal)
+    -- 1px padding beyond glow radius is enough for the tighter AA fringe.
+    local totalHalfW = halfW + glowR + 1.0
 
-    -- ── Pass C: Bottom profile ribbon (additive blend, line shader) ─────────
-    -- Only emitted when the envelope has spread; otherwise ptsMin == ptsMax
-    -- and the bottom ribbon would exactly duplicate the top one.
-    if hasEnvelope then
-        emitPolylineRibbon(syMin, ribbonTotal)
+    -- Pre-compute all screen-space positions so we can derive true
+    -- segment-perpendicular directions rather than always expanding in Y.
+    local sx, sy = {}, {}
+    for i = 1, n do
+        -- RIGHT-PINNED: sample i=n maps to cX+cW, i=1 maps leftward.
+        -- This keeps the right edge anchored so that as new data arrives
+        -- and points shift left, the rendered line doesn't appear to crawl.
+        sx[i] = cX + cW - ((n - i) / (n - 1)) * cW
+        sy[i] = cY + ((pts[i] - mn) / r) * cH
+        sy[i] = math.max(cY - totalHalfW, math.min(cY + cH + totalHalfW, sy[i]))
     end
 
-    -- Restore caller state
-    gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
+    -- gl.Color.r carries the signed perpendicular distance from the centreline.
+    gl.BeginEnd(GL.TRIANGLES, function()
+        for i = 1, n - 1 do
+            local x0, y0 = sx[i],   sy[i]
+            local x1, y1 = sx[i+1], sy[i+1]
+
+            -- Segment direction, normalised
+            local dx = x1 - x0
+            local dy = y1 - y0
+            local len = math.sqrt(dx*dx + dy*dy)
+            if len < 0.0001 then len = 0.0001 end
+            -- Perpendicular (rotate 90°): (-dy, dx) / len
+            local px = (-dy / len) * totalHalfW
+            local py = ( dx / len) * totalHalfW
+
+            -- Six vertices (two triangles) forming the quad.
+            -- gl.Color.r = +totalHalfW on one side, -totalHalfW on the other.
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x0 - px, y0 - py)
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x0 + px, y0 + py)
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x1 - px, y1 - py)
+
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x1 + px, y1 + py)
+            gl.Color(-totalHalfW, 0, 0, 1);  gl.Vertex(x1 - px, y1 - py)
+            gl.Color( totalHalfW, 0, 0, 1);  gl.Vertex(x0 + px, y0 + py)
+        end
+    end)
+
     gl.UseShader(0)
 end
-local function drawShaderFill(ptsMax, cX, cY, cW, cH, mn, r, color, time, isMulti)
+
+-- drawShaderFill: emits the area-fill triangle strip using the fill shader.
+
+local function drawShaderFill(pts, cX, cY, cW, cH, mn, r, color, time, isMulti)
     if not shaderFill then return end
-    local n = #ptsMax
+    local n = #pts
     if n < 2 then return end
     if isMulti then return end
 
@@ -1312,7 +1055,7 @@ local function drawShaderFill(ptsMax, cX, cY, cW, cH, mn, r, color, time, isMult
     gl.BeginEnd(GL.TRIANGLE_STRIP, function()
         for i = 1, n do
             local x    = cX + cW - ((n - i) / (n - 1)) * cW
-            local y    = cY + ((ptsMax[i] - mn) / r) * cH
+            local y    = cY + ((pts[i] - mn) / r) * cH
             y = math.max(cY, math.min(cY + cH, y))
             local tVal = math.max(0, (y - cY) / math.max(cH, 1))
 
@@ -1324,8 +1067,7 @@ local function drawShaderFill(ptsMax, cX, cY, cW, cH, mn, r, color, time, isMult
     gl.UseShader(0)
 end
 
--- drawShaderGridLine: draws a single grid line with the scan-pulse fragment
--- shader.  Unchanged from v3.1.
+-- drawShaderGrid: draws a single grid line with the scan-pulse fragment shader.
 
 local function drawShaderGridLine(x0, y0, x1, y1, cY, cH, color, time)
     if not shaderGrid then
@@ -1355,9 +1097,16 @@ end
 -------------------------------------------------------------------------------
 -- CHROME DISPLAY LIST
 -- Background panels, grid lines, Y-axis labels, chart titles, card frames.
--- Grid lines are drawn LIVE in DrawScreen (outside any display list) so their
--- time-based animation can be updated every frame cheaply.
--- Unchanged from v3.1 except version strings.
+-- NOTE: grid lines here call drawShaderGridLine — the shader is baked into
+-- the display list commands at the time of rebuild.  Because display lists
+-- record raw GL calls, time-uniform updates happen in DrawScreen by calling
+-- gl.Uniform BEFORE gl.CallList (see the shader-time-patch pattern below).
+--
+-- IMPORTANT: Spring display lists DO replay gl.UseShader and gl.Uniform calls,
+-- so the animation-time must be updated externally each frame.  We work around
+-- this by NOT baking grid lines into the chrome display list — instead we draw
+-- animated grid lines live in DrawScreen (outside any display list).
+-- This is a deliberate trade-off: grid lines are cheap geometry.
 -------------------------------------------------------------------------------
 
 local function rebuildChromeList()
@@ -1469,9 +1218,10 @@ local function rebuildChromeList()
 end
 
 -------------------------------------------------------------------------------
--- LINES DISPLAY LIST  (shader-rendered, v3.2 envelope API)
+-- LINES DISPLAY LIST  (shader-rendered)
 -- Rebuilds fill + line geometry for every chart using the GLSL programs.
--- Grid lines are drawn LIVE in DrawScreen so their animation updates freely.
+-- Grid lines are drawn LIVE in DrawScreen (outside any display list) so their
+-- time-based animation can be updated every frame cheaply.
 -------------------------------------------------------------------------------
 
 local function rebuildLinesList()
@@ -1505,27 +1255,23 @@ local function rebuildLinesList()
                     gl.Scale(scl, scl, 1)
 
                     for si, s in ipairs(chart.series) do
-                        -- v3.2: getSamples returns (ptsMin, ptsMax)
-                        local ptsMin, ptsMax = chart:getSamples(si)
-                        local nPts = #ptsMax
-                        if nPts >= 1 then
+                        local pts  = chart:getSamples(si)
+                        local nPts = #pts
+                        if nPts >= 2 then
                             local clr = { s.color[1], s.color[2], s.color[3], am }
 
-                            -- 1. Area fill (uses ptsMax — the high envelope)
-                            -- Normal alpha blend
+                            -- 1. Area fill — normal alpha blend
                             gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
-                            drawShaderFill(ptsMax, cX, cY, cW, cH, mn, r, clr, t, isMulti)
+                            drawShaderFill(pts, cX, cY, cW, cH, mn, r, clr, t, isMulti)
 
-                            -- 2. Line envelope — body fill + AA silhouette ribbons.
-                            -- drawShaderLine manages blend modes internally:
-                            --   pass 1 (body) uses normal alpha blend,
-                            --   pass 2 (silhouette ribbons + glow) uses additive blend.
-                            -- Caller must restore normal blend after this call.
+                            -- 2. Line — additive blend so the glow brightens
+                            --    surrounding pixels without widening the core.
+                            gl.BlendFunc(GL.SRC_ALPHA, GL.ONE)
+                            drawShaderLine(pts, cX, cY, cW, cH, mn, r, clr, halfW, glowR)
+
+                            -- 3. Endpoint dot — restore normal blend first
                             gl.BlendFunc(GL.SRC_ALPHA, GL.ONE_MINUS_SRC_ALPHA)
-                            drawShaderLine(ptsMin, ptsMax, cX, cY, cW, cH, mn, r, clr, halfW, glowR)
-
-                            -- 3. Endpoint dot at the last max value (normal blend already restored)
-                            local last = ptsMax[nPts]
+                            local last = pts[nPts]
                             if last and not (last ~= last) then
                                 local dotY = cY + ((last - mn) / r) * cH
                                 dotY = math.max(cY, math.min(cY + cH, dotY))
@@ -1559,8 +1305,8 @@ end
 
 -------------------------------------------------------------------------------
 -- LIVE GRID DRAWING  (called every DrawScreen frame, outside display lists)
--- Cheap horizontal lines drawn live so the scan-pulse animation runs at full
--- monitor refresh rate.  Unchanged from v3.1.
+-- These are cheap horizontal lines; drawing them live lets the scan-pulse
+-- animation update at full monitor refresh rate.
 -------------------------------------------------------------------------------
 
 local function drawLiveGridLines()
@@ -1569,6 +1315,8 @@ local function drawLiveGridLines()
     for _, chart in pairs(charts) do
         local show = (chart.enabled and chart.visible) or (not chart.enabled and chartsInteractive)
         if show and chart.enabled and chart:hasData() and chart._range then
+            local mn  = chart._minV
+            local r   = chart._range
             local w   = chart.width
             local h   = chart.height
             local cX  = PADDING.left
@@ -1594,7 +1342,6 @@ end
 
 -------------------------------------------------------------------------------
 -- OVERLAY DISPLAY LIST
--- Unchanged from v3.1 (card values, stall warnings, hover highlights, edit badge).
 -------------------------------------------------------------------------------
 
 local function rebuildOverlayList()
@@ -2021,31 +1768,23 @@ local function buildChartsAndCards()
     charts.allyBuildPower = Chart.new("chart-ally-buildpower", "TEAM BP",   "🔧",
         vsx-1280, vsy-230, "multi", {}, true)
 
-    -- K/D override: compute the ratio from raw kills/losses envelopes.
-    -- v3.2: getSamples returns (ptsMin, ptsMax) so we get both envelopes for
-    -- kills and losses and derive a ratio envelope pair.
-    -- For the ratio we use:
-    --   maxRatio[i] = max(kills) / max(1, min(losses))  — highest possible ratio
-    --   minRatio[i] = min(kills) / max(1, max(losses))  — lowest possible ratio
-    -- This correctly captures "ratio spike" events (sudden large kills with
-    -- few losses) in the envelope without distorting the baseline.
+    -- K/D override: compute ratio from raw kills/losses samples, then the
+    -- interpolation in ringSample handles the smoothing automatically since
+    -- each underlying series is already interpolated before the ratio is taken.
     do
         charts.kd.getSamples = function(self, i)
             local tid = viewedTeamID
-            if not tid or not history[tid] then return {}, {} end
-            local kMin, kMax = ringSample(tid, "kills",  RENDER_POINTS)
-            local lMin, lMax = ringSample(tid, "losses", RENDER_POINTS)
-            local n = math.min(#kMax, #lMax)
-            local ptsMin, ptsMax = {}, {}
+            if not tid or not history[tid] then return {} end
+            local kPts = ringSample(tid, "kills",  RENDER_POINTS)
+            local lPts = ringSample(tid, "losses", RENDER_POINTS)
+            local n    = math.min(#kPts, #lPts)
+            local pts  = {}
             for j = 1, n do
-                local km = kMax[j] or 0
-                local kl = kMin[j] or 0
-                local lm = lMax[j] or 0
-                local ll = lMin[j] or 0
-                ptsMax[j] = ll == 0 and (km > 0 and 5 or 0) or math.min(5, km / math.max(ll, 0.001))
-                ptsMin[j] = lm == 0 and ptsMax[j]           or math.min(5, kl / math.max(lm, 0.001))
+                local k = kPts[j] or 0
+                local l = lPts[j] or 0
+                pts[j]  = l == 0 and (k > 0 and 5 or 0) or math.min(5, k / l)
             end
-            return ptsMin, ptsMax
+            return pts
         end
         charts.kd.hasData = function(self)
             local tid = viewedTeamID
@@ -2090,7 +1829,7 @@ end
 
 local function saveConfig()
     local config = {
-        version           = "3.5",
+        version           = "3.1",
         enabled           = chartsEnabled,
         chartsInteractive = chartsInteractive,
         maxChartFps       = MAX_CHART_FPS,
@@ -2222,7 +1961,7 @@ end
 -------------------------------------------------------------------------------
 
 function widget:Initialize()
-    Spring.Echo("BAR Charts v3.3 (Min/Max Envelope Sampling): Initialize")
+    Spring.Echo("BAR Charts v3.1 (Interpolated Sampling): Initialize")
     vsx, vsy = Spring.GetViewGeometry()
 
     local spec = Spring.GetSpectatingState()
@@ -2256,11 +1995,9 @@ function widget:Initialize()
     linesDirty   = true
     overlayDirty = true
 
-    -- Public API (backwards-compatible with v2.6 / v3.0 / v3.1)
-    -- WG.BarCharts.getSamples() returns only the MAX envelope table so that
-    -- external consumers written against v3.1 continue to work unchanged.
+    -- Public API (backwards-compatible with v2.6 / v3.0)
     WG.BarCharts = {
-        version            = "3.5",
+        version            = "3.1",
         getTrackedTeams    = function()
             local out = {}
             for tid in pairs(allyTeams) do out[#out+1] = tid end
@@ -2272,18 +2009,9 @@ function widget:Initialize()
         getTeamStats       = function(teamID) return allyTeams[teamID] end,
         getViewedTeamStats = function() return allyTeams[viewedTeamID] end,
         seriesKeys         = SERIES_KEYS,
-        -- Returns (ptsMax) for backwards compatibility; use getSamplesEnvelope
-        -- for access to both min and max envelopes.
         getSamples         = function(teamID, seriesKey, numPoints)
             numPoints = numPoints or RENDER_POINTS
             if not history[teamID] or not history[teamID][seriesKey] then return nil end
-            local _, ptsMax = ringSample(teamID, seriesKey, numPoints)
-            return ptsMax
-        end,
-        -- v3.2 addition: returns both envelopes for consumers that want them.
-        getSamplesEnvelope = function(teamID, seriesKey, numPoints)
-            numPoints = numPoints or RENDER_POINTS
-            if not history[teamID] or not history[teamID][seriesKey] then return nil, nil end
             return ringSample(teamID, seriesKey, numPoints)
         end,
         getBufferInfo      = function(teamID, seriesKey)
@@ -2306,7 +2034,7 @@ function widget:Initialize()
     }
 
     Spring.Echo(string.format(
-        "BAR Charts v3.5: Initialized%s, MAX_CHART_FPS=%d, RENDER_POINTS=%d, waiting…",
+        "BAR Charts v3.1: Initialized%s, MAX_CHART_FPS=%d, RENDER_POINTS=%d, waiting…",
         isSpectator and " (SPECTATOR)" or "", MAX_CHART_FPS, RENDER_POINTS))
 end
 
@@ -2349,7 +2077,7 @@ function widget:GameFrame(n)
                 local teamCount = 0
                 for _ in pairs(allyTeams) do teamCount = teamCount + 1 end
                 Spring.Echo(string.format(
-                    "BAR Charts v3.5: Ready — %s, buffering %d active team(s)",
+                    "BAR Charts v3.1: Ready — %s, buffering %d active team(s)",
                     isSpectator and "SPECTATOR" or "player", teamCount))
             end
         end
@@ -2391,7 +2119,7 @@ function widget:GameStart()
     chromeDirty  = true
     linesDirty   = true
     overlayDirty = true
-    Spring.Echo("BAR Charts v3.5: Game started")
+    Spring.Echo("BAR Charts v3.1: Game started")
 end
 
 -------------------------------------------------------------------------------
@@ -2615,7 +2343,7 @@ function widget:TextCommand(command)
     elseif command == "barcharts showpill" then
         setPillVisible(true);  return true
     elseif command == "barcharts debug" then
-        Spring.Echo("=== BAR Charts v3.3 Debug ===")
+        Spring.Echo("=== BAR Charts v3.1 Debug ===")
         Spring.Echo(string.format("vsx=%d vsy=%d  enabled=%s ready=%s interactive=%s",
             vsx, vsy, tostring(chartsEnabled), tostring(chartsReady), tostring(chartsInteractive)))
         Spring.Echo(string.format("HISTORY_SIZE=%d (%.0fs @ %dfps)  RENDER_POINTS=%d",
@@ -2665,5 +2393,5 @@ function widget:Shutdown()
     shutdownRmlToggle()
     freeLists()
     deleteShaders()
-    Spring.Echo("BAR Charts v3.5: Shutdown")
+    Spring.Echo("BAR Charts v3.1: Shutdown")
 end
